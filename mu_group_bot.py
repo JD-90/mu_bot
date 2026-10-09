@@ -56,21 +56,28 @@ ROUTE = [
 ]
 
 # ── when to switch to an alternate spot ──
-EXP_WINDOW_SEC      = 180   # measure the leader's EXP gain over this window
-EXP_LOW_RATIO       = 0.25  # switch if EXP/min < 25% of the best rate seen in this level range
-SETTLE_SEC          = 240   # give a new spot this long before judging its EXP rate
-SWITCH_ON_CROWD     = False # True = also leave a spot when other players stand on it (EXP rule still applies)
+# A spot is judged by LEVELS PER MINUTE of the slowest character still below the reset level
+# (raw EXP grows with level, so it can't compare spots). Every spot's rate is remembered across
+# resets and restarts in spot_stats.json, and spots are ranked by it (best first).
+LOW_RATE_RATIO      = 0.5   # switch if levels/min < 50% of the best known rate of another spot in this range
+SETTLE_SEC          = 240   # give a new spot this long before judging its rate
+STATS_MIN_MINUTES   = 5     # a spot needs this many measured minutes before its rate is trusted
+STATS_HALF_LIFE_MIN = 120   # older measurements fade out (half weight after this many measured minutes)
+SWITCH_ON_CROWD     = False # True = also leave a spot when other players stand on it (rate rule still applies)
 CROWD_RADIUS        = 8     # tiles around the spot
 CROWD_SEC           = 60    # outsiders standing at the spot this long -> switch
-DEATHS_TO_SWITCH    = 3     # party deaths at one spot ...
-DEATH_WINDOW_SEC    = 600   # ... within this many seconds -> switch
+DEATHS_TO_SWITCH    = 6     # party deaths at one spot ...
+DEATH_WINDOW_SEC    = 600   # ... within this many seconds ...
+DEATH_MIN_CHARS     = 2     # ... by at least this many different characters -> switch
+DEATH_KEEP_BEST     = True  # on the best-ranked spot, deaths alone never move the group (the rate rule still can)
+DEATH_IGNORE        = []    # character names whose deaths never count, e.g. ["cucaracha"]
 BAD_SPOT_COOLDOWN   = 900   # a spot we left is skipped for this long
-RECHECK_MAIN_SEC    = 1200  # on an alternate this long -> try the main spot again
+RECHECK_MAIN_SEC    = 1200  # not on the best-ranked spot this long -> try it again
 
 # ── scouting: on entering a new level range, the main character checks the spots alone ──
-# He walks to each spot of that range (main spot first) and looks for other players within
+# He walks to each spot of that range (best-ranked first) and looks for other players within
 # CROWD_RADIUS. The first empty spot is chosen; the alts wait at the warp point meanwhile.
-# If every spot is taken, the one with the fewest players is used. Then the usual rules apply.
+# If every spot is taken, the pick weighs each spot's known rate against how many players are on it.
 SCOUT_ON_NEW_ZONE   = True
 SCOUT_LOOK_SEC      = 4     # seconds standing at a spot before counting players (let them load)
 SCOUT_STUCK_SEC     = 30    # can't get closer to a spot this long -> skip it
@@ -81,12 +88,14 @@ RESET_LEVEL      = None     # None = auto-detect with /resetinfo, otherwise e.g.
 HELPER_KEY       = "Equal"  # "=" toggles MU Helper
 ARRIVE_RADIUS    = 3        # tiles: close enough to start the helper / invite to party
 FOLLOW_EVERY     = 10       # seconds: alts check where the main character is this often
-FOLLOW_RADIUS    = 5        # tiles: alt further than this from the main -> walk back next to him
+FOLLOW_RADIUS    = 8        # tiles: alt further than this from the main ...
+FOLLOW_STRIKES   = 2        # ... on this many checks in a row -> walk back next to him
 FOLLOW_GIVE_UP   = 30       # seconds: stop trying to reach the main (he moved / path blocked)
 LEASH_RADIUS     = 25       # tiles: helper drifted further than this -> walk back
 STUCK_SECONDS    = 45       # no walking progress this long -> re-warp
 DISCONNECT_RELOAD_SECONDS = 60  # out of game this long with no progress -> reload the page
 SELECT_TRIES     = 3        # character-select attempts before falling back to a page reload
+HELPER_FAILS_RELOAD = 3     # MU Helper toggle failed this many times in a row -> reload that window
 INVITE_EVERY     = 10       # seconds between party invites to the same member
 TICK             = 1.0      # seconds between group checks
 PAUSE_KEY        = "p"      # press in the console window to pause / resume the bot
@@ -171,6 +180,101 @@ CHAT_LINES_JS = """
   typeof l === 'string' ? l : [l.text, l.message, l.msg, l.content].filter(Boolean).join(' ') || JSON.stringify(l))
 """
 
+# names of client UI flags that look like an open window (diagnostic for "Cannot do reset with any windows opened")
+OPEN_WINDOWS_JS = """
+() => {
+  const s = window.__store, out = [];
+  for (const k of Object.keys(s)) {
+    if (k === 'minimapEnabled' || typeof s[k] === 'function') continue;
+    if (/(Enabled|Open|Opened|Visible|Win|Window)$/.test(k) && s[k]) out.push(k);
+  }
+  if (s.npcShop) out.push('npcShop');
+  if (window.__commands && window.__commands.windowOpen) out.push('commands.windowOpen=' + window.__commands.windowOpen);
+  return out;
+}
+"""
+
+
+class SpotStats:
+    """Levels/min per farming spot, remembered across resets and restarts (spot_stats.json).
+    Key: "<alias> x,y". Value: {"levels": decayed levels gained, "minutes": decayed minutes measured}."""
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            self.data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.data = {}
+
+    @staticmethod
+    def key(alias, spot):
+        return f"{alias} {spot[0]},{spot[1]}"
+
+    def add(self, alias, spot, levels, minutes):
+        if minutes <= 0 or levels < 0:
+            return
+        d = self.data.setdefault(self.key(alias, spot), {"levels": 0.0, "minutes": 0.0})
+        keep = 0.5 ** (minutes / STATS_HALF_LIFE_MIN)
+        d["levels"] = d["levels"] * keep + levels
+        d["minutes"] = d["minutes"] * keep + minutes
+        try:
+            self.path.write_text(json.dumps(self.data, indent=1, sort_keys=True), encoding="utf-8")
+        except OSError:
+            pass
+
+    def rate(self, alias, spot):
+        """Known levels/min, or None if the spot hasn't been measured long enough."""
+        d = self.data.get(self.key(alias, spot))
+        if not d or d["minutes"] < STATS_MIN_MINUTES:
+            return None
+        return d["levels"] / d["minutes"]
+
+    def estimates(self, alias, spots):
+        """Rate per spot index; unmeasured spots get the median of the measured ones (so they get tried)."""
+        known = {i: self.rate(alias, s) for i, s in enumerate(spots)}
+        vals = sorted(v for v in known.values() if v is not None)
+        fill = vals[len(vals) // 2] if vals else 1.0
+        return {i: (v if v is not None else fill) for i, v in known.items()}
+
+    def ranked(self, alias, spots):
+        """Spot indexes, best known rate first (list order breaks ties)."""
+        est = self.estimates(alias, spots)
+        return sorted(range(len(spots)), key=lambda i: (-est[i], i))
+
+
+def set_helpers(chars, on):
+    """Turn MU Helper on/off for several characters at once: press the key in every window,
+    then wait ONCE for all of them (instead of up to 8 s per character, one after the other)."""
+    todo = [c for c in chars if c.s.get("helper") != on]
+    if not todo:
+        return
+    word = "ON" if on else "OFF"
+
+    def wait(cs):
+        for _ in range(8):  # up to 4 s for the server to confirm
+            time.sleep(0.5)
+            cs = [c for c in cs if c.refresh().get("helper") != on]
+            if not cs:
+                break
+        return cs
+
+    for c in todo:
+        c.log(f"helper -> {word}")
+        c.page.evaluate("() => { const c=document.querySelector('canvas'); c && c.focus(); }")
+        c.page.keyboard.press(HELPER_KEY)
+    todo = wait(todo)
+    for c in todo:
+        c.page.evaluate("() => window.__store.toggleMuHelper()")
+    todo = wait(todo)
+    for c in chars:
+        if c in todo:
+            c.helper_fails += 1
+            c.log(f"helper did not turn {word.lower()} ({c.helper_fails}x in a row)")
+            if c.helper_fails >= HELPER_FAILS_RELOAD:
+                c.reload_page(f"MU Helper stuck after {c.helper_fails} tries")
+        else:
+            c.helper_fails = 0
+
 
 class Char:
     def __init__(self, acc, page, is_leader):
@@ -198,7 +302,9 @@ class Char:
         self.following = False      # alt walking back to the main character
         self.follow_since = 0
         self.last_follow_check = 0
-        self.known = (-1, 0)        # (resets, highest level seen at that reset count)
+        self.follow_strikes = 0     # consecutive follow checks too far from the main
+        self.helper_fails = 0       # consecutive failed MU Helper toggles
+        self.known = (-1, 0)       # (resets, highest level seen at that reset count)
         self.stale_logged = False
         self.minimized = False
         self.bc = None              # Blood Castle per-character state (mu_bc.py)
@@ -259,21 +365,27 @@ class Char:
         time.sleep(1.2)
 
     def set_helper(self, on):
-        if self.s.get("helper") == on:
-            return
-        self.log(f"helper -> {'ON' if on else 'OFF'}")
-        self.page.evaluate("() => { const c=document.querySelector('canvas'); c && c.focus(); }")
-        self.page.keyboard.press(HELPER_KEY)
-        for _ in range(8):  # up to 4 s for the server to confirm
-            time.sleep(0.5)
-            if self.refresh().get("helper") == on:
-                return
-        self.page.evaluate("() => window.__store.toggleMuHelper()")
-        for _ in range(8):
-            time.sleep(0.5)
-            if self.refresh().get("helper") == on:
-                return
-        self.log(f"helper did not turn {'on' if on else 'off'}")
+        set_helpers([self], on)
+
+    def reload_page(self, reason):
+        """Reload this game window; the next ticks log in and select the character again."""
+        if self.page.is_closed():
+            raise RuntimeError(f"{self.name} window has been closed")
+        self.log(f"reloading page ({reason})")
+        try:
+            self.page.reload(wait_until="domcontentloaded", timeout=120_000)
+        except PWError as e:
+            if "has been closed" in str(e) or self.page.is_closed():
+                raise  # the window is gone: let main() stop instead of retrying forever
+            self.log(f"reload error: {e}")
+        self.s = {"ready": False}
+        self.last_ingame = time.time()
+        self.select_tries = 0
+        self.autoparty_sent = False
+        self.gfx_done = False
+        self.helper_fails = 0
+        self.walk_target = None
+        self.following = False
 
     def set_low_graphics(self):
         """Option -> VIDEO / Quality -> Preset -> Low. Done once per session."""
@@ -459,15 +571,7 @@ class Char:
             time.sleep(5)
             return
         if s.get("connectionLost") or time.time() - self.last_ingame > DISCONNECT_RELOAD_SECONDS:
-            self.log("reloading page")
-            try:
-                self.page.reload(wait_until="domcontentloaded", timeout=120_000)
-            except PWError as e:
-                self.log(f"reload error: {e}")
-            self.last_ingame = time.time()
-            self.select_tries = 0
-            self.autoparty_sent = False
-            self.gfx_done = False
+            self.reload_page("connection lost" if s.get("connectionLost") else "out of game too long")
             return
         if not s.get("ready") or s.get("sceneLoading"):
             return
@@ -530,21 +634,22 @@ class Char:
             self.log(f"party invite {m.name}: {res}")
 
     # ── reset ──
-    def try_reset(self):
-        if time.time() - self.last_reset_try < 20:
+    def check_reset_refused(self):
+        """Called a few seconds after /reset. A successful /reset sends us to character select
+        (confirmed later by the reset counter). Still in game -> the server refused; show why."""
+        if not self.refresh().get("inGame"):
             return
-        self.last_reset_try = time.time()
-        self.set_helper(False)
-        self.close_windows()
-        time.sleep(1)
-        self.chat("/reset")
-        self.last_ingame = time.time()  # going to character select now is expected, not a disconnect
-        time.sleep(3)
-        # A successful /reset sends us to character select (confirmed later by the reset counter).
-        # Still in game -> the server refused; show why.
-        if self.refresh().get("inGame"):
-            for line in self.page.evaluate(CHAT_LINES_JS)[-4:]:
-                self.log(f"  server: {line}")
+        lines = self.page.evaluate(CHAT_LINES_JS)[-4:]
+        for line in lines:
+            self.log(f"  server: {line}")
+        if any("windows opened" in l for l in lines):
+            try:
+                opened = self.page.evaluate(OPEN_WINDOWS_JS)
+            except PWError:
+                opened = []
+            self.log(f"reset refused: open windows -> {opened or 'none visible in the client'}; closing and retrying soon")
+            self.close_windows()
+            self.last_reset_try = time.time() - 15   # retry in ~5 s instead of 20
 
     # ── movement toward the group spot ──
     def move_tick(self, step, follow=None):
@@ -568,9 +673,10 @@ class Char:
             now = time.time()
             if not self.following and now - self.last_follow_check >= FOLLOW_EVERY:
                 self.last_follow_check = now
-                if fdist > FOLLOW_RADIUS:
+                self.follow_strikes = self.follow_strikes + 1 if fdist > FOLLOW_RADIUS else 0
+                if self.follow_strikes >= FOLLOW_STRIKES:
                     self.log(f"{fdist:.0f} tiles from main -> walking back to ({fx},{fy})")
-                    self.following, self.follow_since = True, now
+                    self.following, self.follow_since, self.follow_strikes = True, now, 0
             if self.following:
                 if fdist <= 2 or now - self.follow_since > FOLLOW_GIVE_UP:
                     self.following = False
@@ -617,17 +723,18 @@ class Group:
         self.spot_idx = 0          # which spot of that entry we use
         self.spot_since = time.time()
         self.bad_until = {}        # (step_key, spot_idx) -> time it may be used again
-        self.best_rate = 0.0       # best leader EXP/min seen in this ROUTE entry
-        self.exp_samples = []      # (time, leader exp) while farming at the current spot
+        self.stats = SpotStats(BASE_DIR / STATS_FILE)
+        self.lvl_samples = []      # (time, slowest level) while farming at the current spot
+        self.stat_point = None     # (time, slowest level) last point added to spot_stats.json
         self.crowd_since = None
-        self.deaths = []           # times of party deaths at the current spot
-        self.exp_total = 0.0       # EXP gained by non-capped members (running sum)
-        self.last_exp = {}
+        self.deaths = []           # (time, name) of party deaths at the current spot
+        self.arrived = False
         self.paused = False
         self.key_paused = False
         # scouting (see SCOUT_* config)
         self.scouting = False
-        self.scout_i = 0           # spot being checked
+        self.scout_i = 0           # position in scout_order of the spot being checked
+        self.scout_order = []      # spot indexes in the order to check them (best-ranked first)
         self.scout_seen = {}       # spot index -> players counted there
         self.scout_started = 0
         self.scout_arrived_at = None
@@ -677,8 +784,8 @@ class Group:
             c.walk_progress_at = now
             if c.shop_pending:
                 c.shop_started = now     # pause time doesn't count toward the shop give-up timer
-        self.exp_samples = []            # EXP from manual play must not judge the spot
-        self.last_exp = {}
+        self.lvl_samples = []            # levels from manual play must not judge the spot
+        self.stat_point = None
         self.spot_since = now
         self.arrived = False
         self.crowd_since = None
@@ -692,34 +799,50 @@ class Group:
     def current_step(self, level):
         key = next((i for i, st in enumerate(ROUTE) if st[0] <= level < st[1]), len(ROUTE) - 1)
         if key != self.step_key:
-            self.step_key, self.spot_idx, self.best_rate = key, 0, 0.0
+            self.step_key = key
+            alias, spots = ROUTE[key][2], ROUTE[key][4]
+            self.spot_idx = self.stats.ranked(alias, spots)[0]   # best known spot first
             self._arrived_new_spot()
-            if SCOUT_ON_NEW_ZONE and len(ROUTE[key][4]) > 1:
+            if SCOUT_ON_NEW_ZONE and len(spots) > 1:
                 self.start_scouting()
         frm, to, alias, map_idx, spots = ROUTE[key]
         x, y = spots[self.spot_idx]
         return (frm, to, alias, map_idx, x, y), spots
 
+    def rate_text(self, alias, spot):
+        r = self.stats.rate(alias, spot)
+        return f"{r:.1f}" if r is not None else "?"
+
     # ── scouting: the main character finds an empty spot before the group settles ──
     def start_scouting(self):
         now = time.time()
+        alias, spots = ROUTE[self.step_key][2], ROUTE[self.step_key][4]
+        self.scout_order = self.stats.ranked(alias, spots)
         self.scouting, self.scout_i, self.scout_seen = True, 0, {}
         self.scout_started, self.scout_arrived_at = now, None
         self.scout_best, self.scout_progress_at = 999.0, now
-        log(f"SCOUTING {ROUTE[self.step_key][2]}: {self.leader.name} checks the spots for other players")
+        order = ", ".join(f"{spots[i]} {self.rate_text(alias, spots[i])} lvl/min" for i in self.scout_order)
+        log(f"SCOUTING {alias}: {self.leader.name} checks the spots for other players (order: {order})")
 
     def finish_scouting(self, spots, reason):
+        alias = ROUTE[self.step_key][2]
         if self.scout_seen:
-            # fewest players; on a tie, the earlier spot in the list (main spot first)
-            best = min(self.scout_seen, key=lambda i: (self.scout_seen[i], i))
+            # every checked spot is taken: weigh the spot's known rate against the players on it
+            # (an empty spot is taken right away, so this only runs when all are occupied / gave up)
+            est = self.stats.estimates(alias, spots)
+            rank = {i: n for n, i in enumerate(self.scout_order)}
+            best = max(self.scout_seen,
+                       key=lambda i: (est[i] / (1 + self.scout_seen[i]) if self.scout_seen[i] < 999 else -1,
+                                      -rank.get(i, i)))
         else:
-            best = 0
+            best = self.scout_order[0] if self.scout_order else 0
         self.spot_idx = best
         self.scouting = False
         self._arrived_new_spot()
         self.leader.walk_target = None
         seen = ", ".join(f"{spots[i]}: {n if n < 999 else 'unreachable'}" for i, n in sorted(self.scout_seen.items()))
-        log(f"SCOUTING done ({reason}) -> spot {best + 1}/{len(spots)} {spots[best]} | players seen: {seen or '-'}")
+        log(f"SCOUTING done ({reason}) -> spot {best + 1}/{len(spots)} {spots[best]} "
+            f"({self.rate_text(alias, spots[best])} lvl/min) | players seen: {seen or '-'}")
 
     def scout_tick(self, step, spots):
         c = self.leader
@@ -728,7 +851,7 @@ class Group:
         _, _, alias, map_idx, _, _ = step
         if now - self.scout_started > SCOUT_GIVE_UP_SEC:
             return self.finish_scouting(spots, "took too long")
-        if self.scout_i >= len(spots):
+        if self.scout_i >= len(self.scout_order):
             return self.finish_scouting(spots, "all spots occupied")
         if s["map"] != map_idx:
             if now - c.last_warp > 15:
@@ -739,7 +862,8 @@ class Group:
             self.scout_arrived_at = None
             self.scout_best, self.scout_progress_at = 999.0, now
             return
-        tx, ty = spots[self.scout_i]
+        si = self.scout_order[self.scout_i]
+        tx, ty = spots[si]
         dist = math.hypot(s["x"] - tx, s["y"] - ty)
         if dist > ARRIVE_RADIUS:
             c.set_helper(False)
@@ -747,11 +871,11 @@ class Group:
             if dist < self.scout_best - 0.5:
                 self.scout_best, self.scout_progress_at = dist, now
             elif now - self.scout_progress_at > SCOUT_STUCK_SEC:
-                c.log(f"scout: can't reach {spots[self.scout_i]} -> skipping it")
-                self.scout_seen[self.scout_i] = 999
+                c.log(f"scout: can't reach {spots[si]} -> skipping it")
+                self.scout_seen[si] = 999
                 return self._scout_next()
             if c.walk_target != (tx, ty):
-                c.log(f"scout: walking to spot {self.scout_i + 1}/{len(spots)} ({tx},{ty})")
+                c.log(f"scout: walking to spot {si + 1}/{len(spots)} ({tx},{ty})")
                 c.walk_target = (tx, ty)
             c.page.evaluate(WALK_JS, [tx, ty])
             return
@@ -766,11 +890,13 @@ class Group:
             crowd = c.page.evaluate(CROWD_JS, [tx, ty, CROWD_RADIUS, ours])
         except PWError:
             crowd = []
-        self.scout_seen[self.scout_i] = len(crowd)
+        self.scout_seen[si] = len(crowd)
         if not crowd:
-            c.log(f"scout: spot {self.scout_i + 1} ({tx},{ty}) is empty")
+            c.log(f"scout: spot {si + 1} ({tx},{ty}) is empty")
+            self.scout_seen = {}         # take this one (no weighing needed)
+            self.scout_order = [si]
             return self.finish_scouting(spots, "found an empty spot")
-        c.log(f"scout: spot {self.scout_i + 1} ({tx},{ty}) occupied by {', '.join(crowd[:4])}")
+        c.log(f"scout: spot {si + 1} ({tx},{ty}) occupied by {', '.join(crowd[:4])}")
         self._scout_next()
 
     def _scout_next(self):
@@ -781,80 +907,106 @@ class Group:
 
     def _arrived_new_spot(self):
         self.spot_since = time.time()
-        self.exp_samples, self.crowd_since, self.deaths = [], None, []
+        self.lvl_samples, self.stat_point, self.crowd_since, self.deaths = [], None, None, []
         self.arrived = False
 
     def switch_spot(self, reason, spots):
+        """Leave the current spot for the best-ranked spot that isn't on cooldown."""
         now = time.time()
         self.bad_until[(self.step_key, self.spot_idx)] = now + BAD_SPOT_COOLDOWN
-        n = len(spots)
-        order = [(self.spot_idx + i) % n for i in range(1, n)]
+        alias = ROUTE[self.step_key][2]
+        order = [i for i in self.stats.ranked(alias, spots) if i != self.spot_idx]
         free = [i for i in order if self.bad_until.get((self.step_key, i), 0) <= now]
         nxt = free[0] if free else min(order, key=lambda i: self.bad_until.get((self.step_key, i), 0))
-        log(f"SPOT SWITCH ({reason}): {spots[self.spot_idx]} -> {spots[nxt]}")
+        log(f"SPOT SWITCH ({reason}): {spots[self.spot_idx]} -> {spots[nxt]} "
+            f"({self.rate_text(alias, spots[nxt])} lvl/min known)")
         self.spot_idx = nxt
         self._arrived_new_spot()
 
+    def slowest_level(self):
+        """Lowest level among members still below the reset level (None if everyone is capped)."""
+        cap = self.reset_level or 10**9
+        lv = [c.s.get("level") or 1 for c in self.members]
+        below = [l for l in lv if l < cap]
+        return min(below) if below else None
+
     def check_spot(self, step, spots):
-        if len(spots) < 2:
-            return
         now = time.time()
-        _, _, _, map_idx, tx, ty = step
+        _, _, alias, map_idx, tx, ty = step
         lead = self.leader.s
         d = math.hypot(lead["x"] - tx, lead["y"] - ty) if lead["map"] == map_idx else 999
         if d <= ARRIVE_RADIUS + 2:
             self.arrived = True
         at_spot = self.arrived and d <= LEASH_RADIUS
-        if not at_spot:
-            self.spot_since = now  # still travelling: don't judge yet
-            self.exp_samples = []
+        lvl = self.slowest_level()
+        if not at_spot or lvl is None:
+            self.spot_since = now  # still travelling (or everyone capped): don't judge yet
+            self.lvl_samples, self.stat_point = [], None
             return
 
-        # 1) deaths
-        self.deaths = [t for t in self.deaths if now - t < DEATH_WINDOW_SEC]
-        if len(self.deaths) >= DEATHS_TO_SWITCH:
-            return self.switch_spot(f"{len(self.deaths)} deaths in {DEATH_WINDOW_SEC // 60} min", spots)
+        # 0) remember this spot's levels/min (spot_stats.json), once a minute after the first minute here
+        if now - self.spot_since >= 60:
+            if self.stat_point is None:
+                self.stat_point = (now, lvl)
+            elif now - self.stat_point[0] >= 60:
+                t0, l0 = self.stat_point
+                if lvl >= l0:
+                    self.stats.add(alias, (tx, ty), lvl - l0, (now - t0) / 60)
+                self.stat_point = (now, lvl)
 
-        # 2) other players standing at the spot (off by default: only EXP/min matters)
-        ours = [c.name for c in self.members]
-        if not SWITCH_ON_CROWD:
-            ours = None
-        try:
-            crowd = self.leader.page.evaluate(CROWD_JS, [tx, ty, CROWD_RADIUS, ours]) if ours else []
-        except PWError:
-            crowd = []
-        if crowd:
-            self.crowd_since = self.crowd_since or now
-            if now - self.crowd_since >= CROWD_SEC:
-                return self.switch_spot(f"occupied by {', '.join(crowd[:3])}", spots)
+        if len(spots) < 2:
+            return
+        est = self.stats.estimates(alias, spots)
+        is_best = self.stats.ranked(alias, spots)[0] == self.spot_idx
+
+        # 1) deaths (only counted names; needs several different characters dying)
+        self.deaths = [(t, n) for t, n in self.deaths if now - t < DEATH_WINDOW_SEC]
+        names = {n for _, n in self.deaths}
+        if len(self.deaths) >= DEATHS_TO_SWITCH and len(names) >= DEATH_MIN_CHARS:
+            if DEATH_KEEP_BEST and is_best and self.leader.name not in names:
+                if not getattr(self, "_death_keep_logged", False):
+                    log(f"{len(self.deaths)} deaths in {DEATH_WINDOW_SEC // 60} min, but this is the best "
+                        f"known spot ({est[self.spot_idx]:.1f} lvl/min) -> staying")
+                    self._death_keep_logged = True
+            else:
+                return self.switch_spot(f"{len(self.deaths)} deaths in {DEATH_WINDOW_SEC // 60} min "
+                                        f"by {', '.join(sorted(names))}", spots)
         else:
-            self.crowd_since = None
+            self._death_keep_logged = False
 
-        # 3) EXP per minute, summed over members still below the reset level
-        #    (a capped character gains nothing, so it must not count)
-        for c in self.members:
-            e = c.s.get("exp") or 0
-            prev = self.last_exp.get(c.name)
-            if prev is not None and e > prev and (c.s.get("level") or 1) < (self.reset_level or 10**9):
-                self.exp_total += e - prev
-            self.last_exp[c.name] = e
-        exp = self.exp_total
-        if all((c.s.get("level") or 1) >= (self.reset_level or 10**9) for c in self.members):
-            return
-        self.exp_samples.append((now, exp))
-        self.exp_samples = [p for p in self.exp_samples if now - p[0] <= EXP_WINDOW_SEC]
-        if now - self.spot_since < SETTLE_SEC or now - self.exp_samples[0][0] < EXP_WINDOW_SEC * 0.9:
-            return
-        rate = (exp - self.exp_samples[0][1]) / ((now - self.exp_samples[0][0]) / 60)
-        self.best_rate = max(self.best_rate * 0.999, rate)  # slow decay so an old peak doesn't stick forever
-        if rate <= 0 or (self.best_rate > 0 and rate < EXP_LOW_RATIO * self.best_rate):
-            return self.switch_spot(f"EXP/min {rate:,.0f} vs best {self.best_rate:,.0f}", spots)
+        # 2) other players standing at the spot (off by default: only the rate matters)
+        if SWITCH_ON_CROWD:
+            ours = [c.name for c in self.members]
+            try:
+                crowd = self.leader.page.evaluate(CROWD_JS, [tx, ty, CROWD_RADIUS, ours])
+            except PWError:
+                crowd = []
+            if crowd:
+                self.crowd_since = self.crowd_since or now
+                if now - self.crowd_since >= CROWD_SEC:
+                    return self.switch_spot(f"occupied by {', '.join(crowd[:3])}", spots)
+            else:
+                self.crowd_since = None
 
-        # 4) on an alternate long enough -> try the main spot again
-        if (self.spot_idx != 0 and now - self.spot_since >= RECHECK_MAIN_SEC
-                and self.bad_until.get((self.step_key, 0), 0) <= now):
-            log(f"SPOT SWITCH (re-checking main spot): {spots[self.spot_idx]} -> {spots[0]}")
-            self.spot_idx = 0
+        # 3) levels/min of the slowest character vs the best known rate of the OTHER spots
+        self.lvl_samples.append((now, lvl))
+        self.lvl_samples = [p for p in self.lvl_samples if now - p[0] <= RATE_WINDOW_SEC]
+        if now - self.spot_since < SETTLE_SEC or now - self.lvl_samples[0][0] < RATE_WINDOW_SEC * 0.9:
+            return
+        rate = (lvl - self.lvl_samples[0][1]) / ((now - self.lvl_samples[0][0]) / 60)
+        others = [self.stats.rate(alias, s) for i, s in enumerate(spots) if i != self.spot_idx]
+        others = [r for r in others if r is not None]
+        best_other = max(others) if others else 0.0
+        if rate <= 0 or (best_other > 0 and rate < LOW_RATE_RATIO * best_other):
+            return self.switch_spot(f"{rate:.1f} lvl/min vs {best_other:.1f} known elsewhere", spots)
+
+        # 4) not on the best-ranked spot for a while -> try it again
+        best = self.stats.ranked(alias, spots)[0]
+        if (best != self.spot_idx and now - self.spot_since >= RECHECK_MAIN_SEC
+                and self.bad_until.get((self.step_key, best), 0) <= now):
+            log(f"SPOT SWITCH (re-checking best spot): {spots[self.spot_idx]} -> {spots[best]} "
+                f"({self.rate_text(alias, spots[best])} lvl/min known)")
+            self.spot_idx = best
             self._arrived_new_spot()
 
     def detect_reset_level(self):
@@ -917,12 +1069,10 @@ class Group:
         self.first_check = False
 
         for c in self.members:
-            if c.name in self.reset_round:
-                if levels[c.name] < rl:
-                    self.reset_round.discard(c.name)
-                else:
-                    c.try_reset()
+            if c.name in self.reset_round and levels[c.name] < rl:
+                self.reset_round.discard(c.name)
         if self.reset_round:
+            self.reset_together([c for c in self.members if c.name in self.reset_round])
             return
 
         # Blood Castle detour (mu_bc.py): pauses normal leveling while it runs
@@ -938,7 +1088,8 @@ class Group:
         for c in self.members:
             dead = (c.s.get("hp") or 0) <= 0
             if dead and not c.was_dead:
-                self.deaths.append(time.time())
+                if c.name not in DEATH_IGNORE:
+                    self.deaths.append((time.time(), c.name))
                 log(f"{c.name} died at {step[2]} ({step[4]},{step[5]})")
             c.was_dead = dead
             if dead:
@@ -965,16 +1116,38 @@ class Group:
         if time.time() - self.last_status > 60:
             self.last_status = time.time()
             rate = ""
-            if len(self.exp_samples) > 1:
-                (t0, e0), (t1, e1) = self.exp_samples[0], self.exp_samples[-1]
+            if len(self.lvl_samples) > 1:
+                (t0, l0), (t1, l1) = self.lvl_samples[0], self.lvl_samples[-1]
                 if t1 > t0:
-                    rate = f" exp/min {(e1 - e0) / ((t1 - t0) / 60):,.0f} (best {self.best_rate:,.0f})"
-            where = (f"SCOUTING spot {min(self.scout_i, len(spots) - 1) + 1}/{len(spots)}" if self.scouting
+                    rate = (f" lvl/min {(l1 - l0) / ((t1 - t0) / 60):.1f}"
+                            f" (spot avg {self.rate_text(step[2], (step[4], step[5]))})")
+            where = (f"SCOUTING {min(self.scout_i, len(spots) - 1) + 1}/{len(spots)}" if self.scouting
                      else f"spot {self.spot_idx + 1}/{len(spots)} ({step[4]},{step[5]})")
             log(f"zone {step[2]} {where}{rate} | " + " | ".join(
                 f"{c.name} lvl {c.s['level']} r{c.s['resets']} hp {c.s['hp']}/{c.s['maxHP']} "
                 f"helper {'on' if c.s['helper'] else 'off'}" for c in self.members)
                 + f" | party {self.leader.s.get('party')}")
+
+    def reset_together(self, chars):
+        """/reset every character of the round at once (helpers off together, one wait),
+        instead of one after the other (~1.5 min for 5 characters)."""
+        now = time.time()
+        todo = [c for c in chars if c.online and now - c.last_reset_try >= 20]
+        if not todo:
+            return
+        for c in todo:
+            c.last_reset_try = now
+        set_helpers(todo, False)
+        todo = [c for c in todo if c.online]   # a window may have been reloaded by set_helpers
+        for c in todo:
+            c.close_windows()
+        time.sleep(0.5)
+        for c in todo:
+            c.chat("/reset")
+            c.last_ingame = time.time()  # going to character select now is expected, not a disconnect
+        time.sleep(3)
+        for c in todo:
+            c.check_reset_refused()
 
     def refresh_levels(self):
         return {c.name: c.s["level"] or 1 for c in self.members}

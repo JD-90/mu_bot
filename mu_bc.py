@@ -7,13 +7,14 @@ opens in <= 10 minutes, the group stops leveling and:
      Invisibility Cloak from Liaman Barmaid, the others wait at the bar;
   2. participants warp to Devias, stand next to the Spirit of Archangel and talk to him as
      soon as the entry window opens (-> warped into the castle);
-  3. inside, wizzardo invites our participants; if there are 1-3 other players, he kicks that
+  3. inside, wizzardo invites our participants (and never accepts a stranger's invite); if there are 1-3 other players, he kicks that
      many alts (they wait in the castle) and invites the strangers until 30 s before the door
      closes; free slots are then given back to our alts;
   4. wizzardo walks up the corridor (helper on for a few seconds whenever he gets stuck),
-     destroys the statue, picks up the Archangel weapon and
-     returns it to the Archangel; the alts follow him. If another player gets the weapon first,
-     everyone rushes to the Archangel (entrance) to be there when it is delivered;
+     destroys the statue, picks up the Archangel weapon and returns it to the Archangel; the alts
+     follow him by position (in the party or not). Whoever of ours has the weapon delivers it.
+     If ANOTHER player gets the weapon, everyone goes back to the Archangel (entrance) at once,
+     with the same stuck -> helper-burst walking, to be there when it is delivered;
   5. every character tries each Box of Kundun +5 on the ground until one pickup succeeds;
   6. everyone leaves to Lorencia and leaves a stranger party;
   7. at the Lorencia bar every alt trades its Boxes of Kundun (+1..+5) to wizzardo;
@@ -406,11 +407,18 @@ class BloodCastle:
         if lead_in and since_open < door:
             self.party_management(since_open)
 
+        # who has the Archangel's weapon? one of ours (checked in every bag, every tick) or a stranger
         holder = st.get("own") if st else 255
-        lead_has_weapon = lead_in and self.inv(lead, WEAPON) > 0
-        if holder not in (None, 255) and not lead_has_weapon and not a["rush"]:
+        ours_wpn = next((m for m in g.members
+                         if m.s.get("map") == BC_MAP and self.inv(m, WEAPON) > 0), None)
+        a["holder"] = ours_wpn.name if ours_wpn else None
+        if ours_wpn and a.get("ours_logged") != ours_wpn.name:
+            a["ours_logged"] = ours_wpn.name
+            self.g_log(f"BC: {ours_wpn.name} has the weapon -> delivering, everyone to the Archangel")
+        if holder not in (None, 255) and not ours_wpn and not a["rush"]:
             a["rush"] = True
-            self.g_log("BC: another player has the weapon -> everyone to the Archangel")
+            self.g_log("BC: another player has the weapon -> EVERYONE back to the Archangel now")
+        lead_has_weapon = ours_wpn is lead
 
         for c in g.members:
             if (c.s.get("hp") or 0) <= 0:
@@ -485,10 +493,73 @@ class BloodCastle:
                 c.log(f"BC: game says {note}")
 
     def accept_invites(self, c):
-        """Inside the castle every character accepts any party invite."""
-        if c.s.get("partyRequest"):
-            c.log(f"BC: accepting party invite {c.s.get('partyRequestText', '')[:60]}")
+        """Inside the castle: accept party invites from our own characters only.
+        wizzardo must stay party leader (strangers are invited INTO his party), so a stranger's
+        invite is declined - accepting one made him a member who can't invite/kick anymore."""
+        if not c.s.get("partyRequest"):
+            return
+        text = c.s.get("partyRequestText", "")
+        ours = [m.name for m in self.g.members if m is not c]
+        if c is not self.g.leader and any(f'"{n}"' in text for n in ours):
+            c.log(f"BC: accepting party invite {text[:60]}")
             self.ev(c, "() => window.__social.partyRespond(true)")
+        else:
+            c.log(f"BC: declining party invite {text[:60]}")
+            self.ev(c, "() => window.__social.partyRespond(false)")
+
+    def walk_in_castle(self, c, x, y, radius=2):
+        """Walk inside the castle. Monsters block the corridor, so when there is no progress for
+        STUCK_SEC the helper fights for HELPER_BURST seconds, then walking resumes.
+        Returns True once within radius."""
+        b, s = c.bc, c.s
+        now = time.time()
+        d = dist(s, x, y)
+        if d <= radius:
+            if s.get("helper") and now >= b["burst_until"]:
+                c.set_helper(False)
+            c.walk_target = None
+            return True
+        if now < b["burst_until"]:
+            c.set_helper(True)                       # fighting whatever blocks the way
+            return False
+        if s.get("helper"):
+            c.set_helper(False)                      # burst over: walk again
+            c.walk_target = None
+        if c.walk_target != (x, y):
+            c.walk_target, c.walk_best, c.walk_progress_at = (x, y), d, now
+        if d < c.walk_best - 0.5:
+            c.walk_best, c.walk_progress_at = d, now
+        elif now - c.walk_progress_at > STUCK_SEC:
+            b["stuck_n"] = b.get("stuck_n", 0) + 1
+            if b["stuck_n"] % 5 == 1:
+                c.log(f"BC: stuck at ({s.get('x')},{s.get('y')}), {d:.0f} tiles from ({x},{y}) -> helper burst")
+            b["burst_until"] = now + HELPER_BURST
+            c.walk_target = None
+            c.set_helper(True)
+            return False
+        if not self.ev(c, WALK_JS, [int(x), int(y)]):
+            # target tile not walkable: use the nearest walkable tile around it
+            for ox, oy in ((1, 0), (-1, 0), (0, -1), (1, -1), (-1, -1), (2, 0), (0, -2), (2, -2),
+                           (0, 1), (1, 1), (-1, 1)):
+                if self.ev(c, WALK_JS, [int(x) + ox, int(y) + oy]):
+                    break
+        return False
+
+    def deliver(self, c):
+        """c has the weapon: walk to the Archangel and talk to him."""
+        b = c.bc
+        if not self.walk_in_castle(c, *ARCHANGEL, radius=2):
+            return
+        if time.time() - b["talk_at"] > 3:
+            b["talk_at"] = time.time()
+            c.set_helper(False)
+            c.log("BC: delivering the weapon to the Archangel")
+            self.ev(c, TALK_NPC_JS, ARCHANGEL_NPC)
+
+    def to_archangel_mode(self):
+        """Everyone heads to the Archangel: a stranger has the weapon, or one of ours is delivering it."""
+        a = self.active
+        return a["rush"] or a.get("holder") is not None
 
     def party_management(self, since_open):
         a, lead = self.active, self.g.leader
@@ -531,20 +602,13 @@ class BloodCastle:
                 self.g_log(f"BC: party invite {c.name}: {res}")
 
     def leader_inside(self, c, st, has_weapon):
-        a, b = self.active, c.bc
+        b = c.bc
         now = time.time()
-        s = c.s
         if has_weapon:
-            # deliver: walk to the Archangel and talk to him
-            if not self.go(c, BC_MAP, "", *ARCHANGEL, radius=2):
-                return
-            if now - b["talk_at"] > 3:
-                b["talk_at"] = now
-                c.log("BC: delivering the weapon to the Archangel")
-                self.ev(c, TALK_NPC_JS, ARCHANGEL_NPC)
-            return
-        if a["rush"]:
-            self.go(c, BC_MAP, "", *ARCHANGEL, radius=2)
+            return self.deliver(c)
+        if self.to_archangel_mode():
+            # a stranger (or an alt) has the weapon: back to the Archangel immediately
+            self.walk_in_castle(c, *ARCHANGEL, radius=2)
             return
         if not st or st.get("st") not in (1, 4):
             self.go(c, BC_MAP, "", *BC_START, radius=2)   # waiting for the castle to start
@@ -557,46 +621,31 @@ class BloodCastle:
                 c.log("BC: picking up the Archangel's weapon")
                 self.ev(c, PICKUP_JS, weapon["items"][0]["id"])
             return
-        # walk up the corridor; when stuck, helper on for a moment, then keep walking
+        # walk up the corridor (helper bursts when stuck); at the statue: helper on to destroy it
         tx, ty = STATUE
-        d = dist(s, tx, ty)
-        if d <= STATUE_RADIUS:
-            c.set_helper(True)                       # destroy the statue
-            return
-        if now < b["burst_until"]:
-            c.set_helper(True)                       # fighting whatever blocks the way
-            return
-        if s.get("helper"):
-            c.set_helper(False)                      # burst over: walk again
-            c.walk_target = None
-        if c.walk_target != (tx, ty):
-            c.walk_target, c.walk_best, c.walk_progress_at = (tx, ty), d, now
-        if d < c.walk_best - 0.5:
-            c.walk_best, c.walk_progress_at = d, now
-        elif now - c.walk_progress_at > STUCK_SEC:
-            b["burst_until"] = now + HELPER_BURST
-            c.walk_target = None
+        if dist(c.s, tx, ty) <= STATUE_RADIUS:
             c.set_helper(True)
             return
-        if not self.ev(c, WALK_JS, [tx, ty]):
-            # target tile not walkable: use the nearest walkable tile around it
-            for ox, oy in ((1, 0), (-1, 0), (0, -1), (1, -1), (-1, -1), (2, 0), (0, -2), (2, -2)):
-                if self.ev(c, WALK_JS, [tx + ox, ty + oy]):
-                    break
+        self.walk_in_castle(c, tx, ty, radius=STATUE_RADIUS)
 
     def alt_inside(self, c):
+        """Alts follow wizzardo by POSITION (party or not, so nobody is left at the entrance);
+        when the weapon is taken by anyone they go straight to the Archangel."""
         a, lead = self.active, self.g.leader
-        c.set_helper(False)
-        if a["rush"]:
-            self.go(c, BC_MAP, "", *ARCHANGEL, radius=2)
+        if a.get("holder") == c.name:
+            return self.deliver(c)
+        if self.to_archangel_mode():
+            self.walk_in_castle(c, *ARCHANGEL, radius=2)
             return
-        in_party = lead.name in (c.s.get("party") or [])
-        if not in_party or lead.s.get("map") != BC_MAP:
+        if lead.s.get("map") != BC_MAP or (lead.s.get("hp") or 0) <= 0:
+            c.set_helper(False)
             self.go(c, BC_MAP, "", *BC_START, radius=2)    # wait in the castle
             return
         lx, ly = lead.s.get("x"), lead.s.get("y")
         if dist(c.s, lx, ly) > FOLLOW_DIST:
-            self.ev(c, WALK_JS, [int(lx), int(ly)])
+            self.walk_in_castle(c, lx, ly, radius=FOLLOW_DIST)
+        elif c.s.get("helper") and time.time() >= c.bc["burst_until"]:
+            c.set_helper(False)
 
     def end_phase(self, since_end):
         a, g = self.active, self.g
