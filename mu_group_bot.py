@@ -59,8 +59,10 @@ ROUTE = [
 # A spot is judged by LEVELS PER MINUTE of the slowest character still below the reset level
 # (raw EXP grows with level, so it can't compare spots). Every spot's rate is remembered across
 # resets and restarts in spot_stats.json, and spots are ranked by it (best first).
+RATE_WINDOW_SEC     = 240   # measure levels/min over this window
 LOW_RATE_RATIO      = 0.5   # switch if levels/min < 50% of the best known rate of another spot in this range
 SETTLE_SEC          = 240   # give a new spot this long before judging its rate
+STATS_FILE          = "spot_stats.json"
 STATS_MIN_MINUTES   = 5     # a spot needs this many measured minutes before its rate is trusted
 STATS_HALF_LIFE_MIN = 120   # older measurements fade out (half weight after this many measured minutes)
 SWITCH_ON_CROWD     = False # True = also leave a spot when other players stand on it (rate rule still applies)
