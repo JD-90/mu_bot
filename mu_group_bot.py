@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, Error as PWError
+from mu_bc import BloodCastle
 
 # ───────────────────────────── CONFIG ─────────────────────────────
 URL    = "https://mu.mormon.garden/"
@@ -200,6 +201,7 @@ class Char:
         self.known = (-1, 0)        # (resets, highest level seen at that reset count)
         self.stale_logged = False
         self.minimized = False
+        self.bc = None              # Blood Castle per-character state (mu_bc.py)
 
     def log(self, msg):
         log(msg, self.name)
@@ -631,6 +633,7 @@ class Group:
         self.scout_arrived_at = None
         self.scout_best = 999.0    # closest distance reached to the current spot
         self.scout_progress_at = 0
+        self.bcastle = BloodCastle(self)
 
     def follow_point(self, step):
         """Main character's position, if he is alive and farming at the group spot."""
@@ -921,6 +924,13 @@ class Group:
                     c.try_reset()
         if self.reset_round:
             return
+
+        # Blood Castle detour (mu_bc.py): pauses normal leveling while it runs
+        try:
+            if self.bcastle.tick():
+                return
+        except Exception as e:
+            log(f"BC tick error: {e!r}")
 
         # Group step = step for the LOWEST level, so nobody moves on alone.
         step, spots = self.current_step(min(self.refresh_levels().values()))
