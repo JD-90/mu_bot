@@ -1,0 +1,5 @@
+accounts.json
+browser_profile*/
+*.log
+.deps_ok
+__pycache__/

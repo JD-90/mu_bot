@@ -1,0 +1,1074 @@
+"""
+MU group reset bot for https://mu.mormon.garden (OpenMUCB browser client).
+
+Runs 3 characters at once (one browser window each), in one party, always together:
+  * The group's zone/spot is chosen by the LOWEST level in the group, so nobody moves
+    on to the next zone until everyone has reached the threshold (100, 200, 300...).
+  * The leader invites the others into a party; the others accept automatically.
+  * When every character has reached the reset level, all of them /reset together.
+  * Death: that character respawns, warps back to the group's zone and walks to the spot.
+  * Disconnect: that window reloads, logs back in and selects its character.
+
+Run:  run_group.bat        Stop: Ctrl+C in the console window.
+Pause: press P in the console window -> the bot stops doing anything and you can play the
+       characters yourself in the open windows. Press P again to hand control back to the bot.
+"""
+import json
+import math
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright, Error as PWError
+
+# ───────────────────────────── CONFIG ─────────────────────────────
+URL    = "https://mu.mormon.garden/"
+SERVER = "Server 1-1"
+
+
+# Accounts live in accounts.json next to this script (not committed to git).
+# Copy accounts.example.json to accounts.json and fill in your logins.
+_ACC_FILE = Path(__file__).with_name("accounts.json")
+if not _ACC_FILE.exists():
+    sys.exit("accounts.json not found - copy accounts.example.json to accounts.json and fill it in.")
+# First entry is the party leader.
+ACCOUNTS = json.loads(_ACC_FILE.read_text(encoding="utf-8"))
+
+# After every reset: walk to the Lorencia bar, talk to Liaman Barmaid, buy a Zen Chest if affordable.
+SHOP_AFTER_RESET = True
+SHOP_SPOT        = (0, 122, 133)        # (map, x, y) Lorencia bar; Liaman Barmaid stands at (123,135)
+SHOP_NPC         = "Liaman Barmaid"
+ZEN_CHEST_PRICE  = 500_000_000
+ZEN_CHEST_MAX_PER_RESET = 64          # safety cap per shopping trip
+ZEN_CHEST_SLOT   = 0                    # first slot of her shop (used if the name can't be read)
+SHOP_GIVE_UP_SEC = 180                  # stop trying after this long
+
+# (from_level, to_level, /move alias, map index, [main spot, alternate spots...])
+# Map indexes from the client: Lorencia=0, Arena2=83, Arena3=84, Arena4=85
+ROUTE = [
+    (1,   100, "Lorencia", 0,  [(34, 50)]),
+    (100, 200, "Arena2",   83, [(47, 83), (65, 76), (51, 57)]),
+    (200, 300, "Arena3",   84, [(48, 74), (70, 113), (85, 77)]),
+    (300, 400, "Arena3",   84, [(48, 37), (48, 56), (67, 70)]),
+]
+
+# ── when to switch to an alternate spot ──
+EXP_WINDOW_SEC      = 180   # measure the leader's EXP gain over this window
+EXP_LOW_RATIO       = 0.25  # switch if EXP/min < 25% of the best rate seen in this level range
+SETTLE_SEC          = 240   # give a new spot this long before judging its EXP rate
+SWITCH_ON_CROWD     = False # True = also leave a spot when other players stand on it (EXP rule still applies)
+CROWD_RADIUS        = 8     # tiles around the spot
+CROWD_SEC           = 60    # outsiders standing at the spot this long -> switch
+DEATHS_TO_SWITCH    = 3     # party deaths at one spot ...
+DEATH_WINDOW_SEC    = 600   # ... within this many seconds -> switch
+BAD_SPOT_COOLDOWN   = 900   # a spot we left is skipped for this long
+RECHECK_MAIN_SEC    = 1200  # on an alternate this long -> try the main spot again
+
+# ── scouting: on entering a new level range, the main character checks the spots alone ──
+# He walks to each spot of that range (main spot first) and looks for other players within
+# CROWD_RADIUS. The first empty spot is chosen; the alts wait at the warp point meanwhile.
+# If every spot is taken, the one with the fewest players is used. Then the usual rules apply.
+SCOUT_ON_NEW_ZONE   = True
+SCOUT_LOOK_SEC      = 4     # seconds standing at a spot before counting players (let them load)
+SCOUT_STUCK_SEC     = 30    # can't get closer to a spot this long -> skip it
+SCOUT_GIVE_UP_SEC   = 300   # whole scouting run longer than this -> use the best spot seen so far
+
+RENDER_SCALE     = 50       # Option > Quality > Render scale (%) set at login; None = leave as is
+RESET_LEVEL      = None     # None = auto-detect with /resetinfo, otherwise e.g. 400
+HELPER_KEY       = "Equal"  # "=" toggles MU Helper
+ARRIVE_RADIUS    = 3        # tiles: close enough to start the helper / invite to party
+FOLLOW_EVERY     = 10       # seconds: alts check where the main character is this often
+FOLLOW_RADIUS    = 5        # tiles: alt further than this from the main -> walk back next to him
+FOLLOW_GIVE_UP   = 30       # seconds: stop trying to reach the main (he moved / path blocked)
+LEASH_RADIUS     = 25       # tiles: helper drifted further than this -> walk back
+STUCK_SECONDS    = 45       # no walking progress this long -> re-warp
+DISCONNECT_RELOAD_SECONDS = 60  # out of game this long with no progress -> reload the page
+SELECT_TRIES     = 3        # character-select attempts before falling back to a page reload
+INVITE_EVERY     = 10       # seconds between party invites to the same member
+TICK             = 1.0      # seconds between group checks
+PAUSE_KEY        = "p"      # press in the console window to pause / resume the bot
+PAUSE_FILE       = "PAUSE"  # or create a file with this name next to the script to pause (delete it to resume)
+HELPERS_OFF_ON_PAUSE = True # turn every MU Helper off when pausing
+HEADLESS         = False
+WINDOW_SIZE      = (800, 500)
+MINIMIZE_WINDOWS = True     # minimize each game window once it is in game and set up; pausing (P) restores them
+BASE_DIR         = Path(__file__).parent
+LOG_FILE         = BASE_DIR / "mu_group_bot.log"
+# ──────────────────────────────────────────────────────────────────
+
+
+def log(msg, who="group"):
+    line = f"[{datetime.now():%H:%M:%S}] [{who}] {msg}"
+    print(line, flush=True)
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+STATE_JS = """
+() => {
+  const s = window.__store, w = window.__world, soc = window.__social;
+  if (!s) return {ready:false};
+  const p = s.playerData || {};
+  const hero = w && w.playerEntity;
+  return {
+    ready: true,
+    inGame: !!hero && !s.sceneLoading,
+    sceneLoading: !!s.sceneLoading,
+    connectionLost: !!s.connectionLost,
+    chars: (s.charactersList || []).map(c => c.Name),
+    name: p.name, level: p.level, resets: p.resets, exp: Number(p.exp) || 0,
+    x: hero ? Math.floor(hero.transform.pos.x) : p.x,
+    y: hero ? Math.floor(hero.transform.pos.z) : p.y, hp: p.currentHP, maxHP: p.maxHP, money: p.money,
+    map: w ? w.mapIndex : -1,
+    helper: !!(s.muHelper && s.muHelper.active),
+    loginVisible: !!document.querySelector('input[type=password]'),
+    party: soc ? (soc.partyMembers || []).map(m => m.name) : [],
+    partyRequest: !!(soc && soc.partyRequest),
+    partyRequestText: soc && soc.partyRequest ? JSON.stringify(soc.partyRequest) : "",
+  };
+}
+"""
+
+WALK_JS = """
+([x, y]) => {
+  const w = window.__world, hero = w && w.playerEntity;
+  if (!hero || !w.isWalkable(x, y)) return false;
+  const m = hero.playerMoveTo, pf = hero.pathfinding;
+  m.point.x = x; m.point.y = y; m.handled = false; m.sendToServer = true;
+  pf.from.x = hero.transform.pos.x; pf.from.y = hero.transform.pos.z;
+  pf.to.x = x; pf.to.y = y; pf.calculated = false;
+  return true;
+}
+"""
+
+INVITE_JS = """
+(name) => {
+  const w = window.__world;
+  const e = w.netObjsQuery.entities.find(e => e.objectNameInWorld === name && !e.localPlayer);
+  if (!e) return "not in view";
+  window.__social.partyInvite({netId: e.netId, name});
+  return "invited";
+}
+"""
+
+CROWD_JS = """
+([x, y, r, ours]) => {
+  const w = window.__world;
+  return w.netObjsQuery.entities.filter(e =>
+      !e.localPlayer && e.npcType === undefined && !e.dying &&
+      (!!e.playerAnimation || e.skin !== undefined) &&
+      !ours.includes(e.objectNameInWorld) &&
+      Math.hypot(e.transform.pos.x - x, e.transform.pos.z - y) <= r)
+    .map(e => e.objectNameInWorld || ('#' + e.netId));
+}
+"""
+
+CHAT_LINES_JS = """
+() => (window.__social.chatLines || []).slice(-30).map(l =>
+  typeof l === 'string' ? l : [l.text, l.message, l.msg, l.content].filter(Boolean).join(' ') || JSON.stringify(l))
+"""
+
+
+class Char:
+    def __init__(self, acc, page, is_leader):
+        self.acc, self.page, self.is_leader = acc, page, is_leader
+        self.name = acc["character"]
+        self.s = {"ready": False}
+        self.last_ingame = time.time()
+        self.was_online = False      # online on the previous tick (to start the disconnect timer fresh)
+        self.walk_target = None
+        self.walk_best = 0
+        self.walk_progress_at = time.time()
+        self.last_warp = 0
+        self.last_reset_try = 0
+        self.last_invite = {}
+        self.autoparty_sent = False
+        self.next_login_at = 0
+        self.login_fails = 0
+        self.select_tries = 0       # character-select attempts since last in game
+        self.spot = None
+        self.relocating = False
+        self.was_dead = False
+        self.gfx_done = False
+        self.shop_pending = False
+        self.shop_started = 0
+        self.following = False      # alt walking back to the main character
+        self.follow_since = 0
+        self.last_follow_check = 0
+        self.known = (-1, 0)        # (resets, highest level seen at that reset count)
+        self.stale_logged = False
+        self.minimized = False
+
+    def log(self, msg):
+        log(msg, self.name)
+
+    def set_window(self, state):
+        """state: 'minimized' or 'normal' (Chrome DevTools Browser.setWindowBounds)."""
+        try:
+            cdp = self.page.context.new_cdp_session(self.page)
+            win = cdp.send("Browser.getWindowForTarget")["windowId"]
+            cdp.send("Browser.setWindowBounds", {"windowId": win, "bounds": {"windowState": state}})
+            cdp.detach()
+            self.minimized = state == "minimized"
+            self.log(f"window -> {state}")
+        except Exception as e:
+            self.minimized = state == "minimized"   # don't retry every tick
+            self.log(f"could not set window {state}: {e!r}")
+
+    # ── state / actions ──
+    def refresh(self):
+        try:
+            self.s = self.page.evaluate(STATE_JS)
+        except PWError:
+            self.s = {"ready": False}
+        # The client's level can go stale after a map-server switch / reconnect (it re-reads the
+        # character list from login time, e.g. "10" right after a reset) and characters that
+        # don't kill anything never get a level-up packet to correct it.
+        # Rule: within the same reset count, the level can only go up.
+        lvl, rs = self.s.get("level"), self.s.get("resets")
+        if self.s.get("inGame") and lvl and rs is not None:
+            k_rs, k_lvl = self.known
+            if rs > k_rs:
+                if k_rs >= 0:  # reset counter went up -> a reset really happened
+                    self.log(f"RESET confirmed -> resets={rs}")
+                    self.walk_target = None
+                    if SHOP_AFTER_RESET:
+                        self.shop_pending, self.shop_started = True, time.time()
+                self.known = (rs, lvl)
+            elif rs == k_rs and lvl < k_lvl:
+                if not self.stale_logged:
+                    self.log(f"client shows level {lvl}, keeping known level {k_lvl}")
+                    self.stale_logged = True
+                self.s["level"] = k_lvl
+            elif rs == k_rs:
+                self.known, self.stale_logged = (rs, lvl), False
+        return self.s
+
+    @property
+    def online(self):
+        s = self.s
+        return s.get("ready") and s.get("inGame") and not s.get("connectionLost")
+
+    def chat(self, text):
+        self.log(f"chat: {text}")
+        self.page.evaluate("(t) => window.__social.sendChat(t)", text)
+        time.sleep(1.2)
+
+    def set_helper(self, on):
+        if self.s.get("helper") == on:
+            return
+        self.log(f"helper -> {'ON' if on else 'OFF'}")
+        self.page.evaluate("() => { const c=document.querySelector('canvas'); c && c.focus(); }")
+        self.page.keyboard.press(HELPER_KEY)
+        for _ in range(8):  # up to 4 s for the server to confirm
+            time.sleep(0.5)
+            if self.refresh().get("helper") == on:
+                return
+        self.page.evaluate("() => window.__store.toggleMuHelper()")
+        for _ in range(8):
+            time.sleep(0.5)
+            if self.refresh().get("helper") == on:
+                return
+        self.log(f"helper did not turn {'on' if on else 'off'}")
+
+    def set_low_graphics(self):
+        """Option -> VIDEO / Quality -> Preset -> Low. Done once per session."""
+        self.gfx_done = True
+        page = self.page
+        try:
+            page.evaluate("() => { window.__store.optionsEnabled = true; }")
+            time.sleep(1.0)
+            page.get_by_text("Quality", exact=True).first.click()   # left menu, under VIDEO
+            time.sleep(0.5)
+            low = page.get_by_text("Low", exact=True)                # Preset: Low | Classic | Enhanced | Ultra
+            if low.count():
+                low.first.click()
+                self.log("graphics preset -> Low")
+            else:
+                self.log("graphics preset: Low button not found")
+            time.sleep(0.5)
+            if RENDER_SCALE:
+                self.set_render_scale(RENDER_SCALE)
+        except Exception as e:
+            self.log(f"graphics preset error: {e!r}")
+        finally:
+            try:
+                close = page.get_by_text("Close", exact=True)
+                if close.count():
+                    close.first.click()
+                page.evaluate("() => { window.__store.optionsEnabled = false; }")
+            except Exception:
+                pass
+
+    def set_render_scale(self, target):
+        """Clicks along the Render scale slider until its label reads `target`%."""
+        page = self.page
+        info = page.evaluate("""() => {
+          const label = [...document.querySelectorAll('*')].find(e =>
+              e.childElementCount === 0 && e.textContent.trim() === 'Render scale');
+          if (!label) return null;
+          let row = label;
+          while (row.parentElement && !/\\d+\\s*%/.test(row.textContent)) row = row.parentElement;
+          row.setAttribute('data-bot-row', 'render-scale');
+          const range = row.querySelector('input[type=range]');
+          if (range) return {range: true};
+          const lr = label.getBoundingClientRect();
+          let best = null;
+          for (const e of row.querySelectorAll('*')) {
+            const r = e.getBoundingClientRect();
+            if (r.left <= lr.right || r.width < 50 || r.height > 24 || r.height < 3) continue;
+            if (e.textContent.trim()) continue;          // track has no text of its own
+            if (!best || r.width > best.w) best = {x: r.left, y: r.top, w: r.width, h: r.height};
+          }
+          return best ? {track: best} : null;
+        }""")
+        read = lambda: page.evaluate("""() => {
+          const m = (document.querySelector('[data-bot-row=render-scale]')?.textContent || '').match(/(\\d+)\\s*%/);
+          return m ? +m[1] : null; }""")
+        if not info:
+            self.log("render scale: slider not found")
+            return
+        if info.get("range"):
+            page.evaluate("""(v) => {
+              const el = document.querySelector('[data-bot-row=render-scale] input[type=range]');
+              const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+              set.call(el, String(v));
+              el.dispatchEvent(new Event('input', {bubbles: true}));
+              el.dispatchEvent(new Event('change', {bubbles: true}));
+            }""", target)
+        else:
+            t = info["track"]
+            lo, hi = 0.0, 1.0
+            for _ in range(8):  # binary search along the track
+                f = (lo + hi) / 2
+                page.mouse.click(t["x"] + f * t["w"], t["y"] + t["h"] / 2)
+                time.sleep(0.3)
+                v = read()
+                if v is None or v == target:
+                    break
+                if v > target:
+                    hi = f
+                else:
+                    lo = f
+        self.log(f"render scale -> {read()}%")
+
+    # ── Zen Chest after reset ──
+    def shop_tick(self):
+        """Returns True when the shopping trip is finished (bought, skipped or gave up)."""
+        s = self.s
+        if time.time() - self.shop_started > SHOP_GIVE_UP_SEC:
+            self.log("zen chest: gave up (took too long)")
+            return True
+        money = s.get("money") or 0
+        if money < ZEN_CHEST_PRICE:
+            self.log(f"zen chest: skipped, only {money:,} zen")
+            return True
+        m, x, y = SHOP_SPOT
+        if s["map"] != m:
+            if time.time() - self.last_warp > 15:
+                self.set_helper(False)
+                self.chat("/move Lorencia")
+                self.last_warp = time.time()
+            return False
+        if math.hypot(s["x"] - x, s["y"] - y) > 2:
+            self.set_helper(False)
+            if self.walk_target != (x, y):
+                self.log(f"walking to the bar ({x},{y})")
+                self.walk_target = (x, y)
+            self.page.evaluate(WALK_JS, [x, y])
+            return False
+        self.walk_target = None
+        # at the bar: talk to the barmaid
+        found = self.page.evaluate("""(name) => {
+          const e = window.__world.netObjsQuery.entities.find(e =>
+              e.npcType !== undefined && (e.objectNameInWorld || '').trim() === name);
+          if (!e) return false;
+          window.__store.talkToNpc({netId: e.netId, name: e.objectNameInWorld, npcType: e.npcType});
+          return true;
+        }""", SHOP_NPC)
+        if not found:
+            self.log(f"zen chest: {SHOP_NPC} not found nearby")
+            return False
+        slot = None
+        for _ in range(10):
+            time.sleep(0.5)
+            slot = self.page.evaluate("""(fallback) => {
+              const shop = window.__store.npcShop;
+              if (!shop || !shop.items.some(Boolean)) return null;
+              // Zen Chest = item group 14, number 11, level 4
+              const i = shop.items.findIndex(it => it && it.group === 14 && it.num === 11 && it.lvl === 4);
+              return i >= 0 ? i : (shop.items[fallback] ? fallback : -1);
+            }""", ZEN_CHEST_SLOT)
+            if slot is not None:
+                break
+        if slot is None or slot < 0:
+            self.log("zen chest: shop did not open / item not found")
+            self.page.evaluate("() => window.__store.closeNpcShop()")
+            return False
+        # buy as many as the zen allows; stop when zen runs out or a purchase fails (inventory full)
+        money_js = "() => Number(window.__store.playerData.money) || 0"
+        bought, zen = 0, money
+        start = money
+        while zen >= ZEN_CHEST_PRICE and bought < ZEN_CHEST_MAX_PER_RESET:
+            self.page.evaluate("(i) => window.__store.buyItemFromNpc(i)", slot)
+            after = zen
+            for _ in range(10):  # wait up to 5 s for the zen to drop
+                time.sleep(0.5)
+                after = self.page.evaluate(money_js)
+                if after <= zen - ZEN_CHEST_PRICE * 0.9:
+                    break
+            if after > zen - ZEN_CHEST_PRICE * 0.9:
+                self.log(f"zen chest: purchase #{bought + 1} failed (inventory full?)")
+                break
+            bought += 1
+            zen = after
+            for _ in range(10):  # let the client finish the previous buy
+                if not self.page.evaluate("() => !!window.__store.shopBuyPending"):
+                    break
+                time.sleep(0.3)
+        self.page.evaluate("() => { window.__store.closeNpcShop(); window.__store.inventoryEnabled = false; }")
+        self.log(f"zen chest: bought {bought} (zen {start:,} -> {zen:,})")
+        return True
+
+    def close_windows(self):
+        self.page.evaluate("""() => {
+          const s = window.__store;
+          for (const k of Object.keys(s)) if (/Enabled$/.test(k) && k !== 'minimapEnabled' && s[k] === true) s[k] = false;
+          if (s.npcShop && s.closeNpcShop) s.closeNpcShop();
+          if (s.msgWin && s.closeMsgWin) s.closeMsgWin();
+          if (window.__commands && window.__commands.windowOpen) window.__commands.closeWindow();
+        }""")
+        time.sleep(0.5)
+
+    # ── login / reconnect ──
+    def handle_offline(self):
+        s = self.s
+        # Character select (e.g. right after /reset) is a normal state, not a disconnect:
+        # just pick the character again. Only fall back to a page reload if that keeps failing.
+        at_char_select = (s.get("ready") and not s.get("sceneLoading") and not s.get("connectionLost")
+                          and not s.get("loginVisible") and self.name in (s.get("chars") or []))
+        if at_char_select and self.select_tries < SELECT_TRIES:
+            self.select_tries += 1
+            self.log("selecting character")
+            self.page.evaluate("(n) => window.__store.selectCharacterRequest(n)", self.name)
+            self.last_ingame = time.time()  # progress: restart the disconnect timer
+            time.sleep(5)
+            return
+        if s.get("connectionLost") or time.time() - self.last_ingame > DISCONNECT_RELOAD_SECONDS:
+            self.log("reloading page")
+            try:
+                self.page.reload(wait_until="domcontentloaded", timeout=120_000)
+            except PWError as e:
+                self.log(f"reload error: {e}")
+            self.last_ingame = time.time()
+            self.select_tries = 0
+            self.autoparty_sent = False
+            self.gfx_done = False
+            return
+        if not s.get("ready") or s.get("sceneLoading"):
+            return
+        if s.get("loginVisible"):
+            if time.time() < self.next_login_at:
+                return
+            self.log(f"logging in as {self.acc['user']}")
+            self.page.evaluate("() => { window.__store.loginError = undefined; }")
+            self.page.fill('input[type=text]', self.acc["user"])
+            self.page.fill('input[type=password]', self.acc["password"])
+            self.page.press('input[type=password]', "Enter")
+            # wait for the server's answer and log it
+            err = None
+            for _ in range(20):
+                time.sleep(0.5)
+                r = self.page.evaluate(
+                    "() => ({p: !!window.__store.loginProcessing, e: window.__store.loginError || null,"
+                    " form: !!document.querySelector('input[type=password]')})")
+                if not r["p"] and (r["e"] or not r["form"]):
+                    err = r["e"]
+                    break
+            if err:
+                self.login_fails += 1
+                wait = min(30 * self.login_fails, 300)
+                self.log(f"LOGIN FAILED: {err} -> retrying in {wait}s")
+                self.next_login_at = time.time() + wait
+            else:
+                self.login_fails = 0
+            self.last_ingame = time.time()  # don't reload while logging in
+            return
+        srv = self.page.get_by_text(SERVER, exact=True)
+        if srv.count():
+            self.log(f"choosing {SERVER}")
+            srv.first.click()
+            time.sleep(2)
+
+    # ── party ──
+    def party_tick(self, group):
+        s = self.s
+        leader = group.leader
+        if not self.is_leader:
+            if not self.autoparty_sent:
+                self.chat("/autoparty on")
+                self.autoparty_sent = True
+            if s.get("partyRequest"):
+                if leader.name in s.get("partyRequestText", "") or "{" not in s.get("partyRequestText", ""):
+                    self.log("accepting party invite")
+                    self.page.evaluate("() => window.__social.partyRespond(true)")
+            return
+        # leader: invite anyone missing who is standing nearby
+        for m in group.members:
+            if m is self or not m.online or m.name in s.get("party", []):
+                continue
+            if time.time() - self.last_invite.get(m.name, 0) < INVITE_EVERY:
+                continue
+            if math.hypot(s["x"] - m.s["x"], s["y"] - m.s["y"]) > 8 or s["map"] != m.s["map"]:
+                continue
+            res = self.page.evaluate(INVITE_JS, m.name)
+            self.last_invite[m.name] = time.time()
+            self.log(f"party invite {m.name}: {res}")
+
+    # ── reset ──
+    def try_reset(self):
+        if time.time() - self.last_reset_try < 20:
+            return
+        self.last_reset_try = time.time()
+        self.set_helper(False)
+        self.close_windows()
+        time.sleep(1)
+        self.chat("/reset")
+        self.last_ingame = time.time()  # going to character select now is expected, not a disconnect
+        time.sleep(3)
+        # A successful /reset sends us to character select (confirmed later by the reset counter).
+        # Still in game -> the server refused; show why.
+        if self.refresh().get("inGame"):
+            for line in self.page.evaluate(CHAT_LINES_JS)[-4:]:
+                self.log(f"  server: {line}")
+
+    # ── movement toward the group spot ──
+    def move_tick(self, step, follow=None):
+        """follow = (x, y) of the main character when he is farming at the spot (alts only)."""
+        s = self.s
+        _, _, alias, map_idx, tx, ty = step
+        if s["map"] != map_idx:
+            if time.time() - self.last_warp > 15:
+                self.set_helper(False)
+                self.chat(f"/move {alias}")
+                self.last_warp = time.time()
+                self.walk_target = None
+            return
+        dist = math.hypot(s["x"] - tx, s["y"] - ty)
+        if self.spot != (map_idx, tx, ty):  # group changed spot: go there even if the helper is busy
+            self.spot, self.relocating = (map_idx, tx, ty), True
+        # alts: every FOLLOW_EVERY s check the main's position and walk back next to him
+        if follow and not self.relocating:
+            fx, fy = follow
+            fdist = math.hypot(s["x"] - fx, s["y"] - fy)
+            now = time.time()
+            if not self.following and now - self.last_follow_check >= FOLLOW_EVERY:
+                self.last_follow_check = now
+                if fdist > FOLLOW_RADIUS:
+                    self.log(f"{fdist:.0f} tiles from main -> walking back to ({fx},{fy})")
+                    self.following, self.follow_since = True, now
+            if self.following:
+                if fdist <= 2 or now - self.follow_since > FOLLOW_GIVE_UP:
+                    self.following = False
+                    self.last_follow_check = now
+                    self.set_helper(True)
+                    return
+                self.set_helper(False)
+                self.page.evaluate(WALK_JS, [int(fx), int(fy)])
+                return
+        if s["helper"] and dist <= LEASH_RADIUS and not self.relocating:
+            self.walk_target = None
+            return
+        if dist <= ARRIVE_RADIUS:
+            self.walk_target = None
+            self.relocating = False
+            self.set_helper(True)
+            return
+        self.set_helper(False)
+        if self.walk_target != (tx, ty):
+            self.log(f"walking to ({tx},{ty}) on {alias}, at ({s['x']},{s['y']}) lvl {s['level']}")
+            self.walk_target, self.walk_best, self.walk_progress_at = (tx, ty), dist, time.time()
+        if dist < self.walk_best - 0.5:
+            self.walk_best, self.walk_progress_at = dist, time.time()
+        elif time.time() - self.walk_progress_at > STUCK_SECONDS:
+            self.log("stuck walking -> re-warping")
+            self.chat(f"/move {alias}")
+            self.last_warp = time.time()
+            self.walk_target = None
+            return
+        if not self.page.evaluate(WALK_JS, [tx, ty]):
+            self.log(f"({tx},{ty}) not walkable / no hero")
+
+
+class Group:
+    def __init__(self, members):
+        self.members = members
+        self.leader = members[0]
+        self.reset_level = RESET_LEVEL
+        self.reset_round = set()   # names that still have to /reset in the current round
+        self.last_status = 0
+        self.first_check = True
+        # alternate-spot tracking
+        self.step_key = None       # index of the current ROUTE entry
+        self.spot_idx = 0          # which spot of that entry we use
+        self.spot_since = time.time()
+        self.bad_until = {}        # (step_key, spot_idx) -> time it may be used again
+        self.best_rate = 0.0       # best leader EXP/min seen in this ROUTE entry
+        self.exp_samples = []      # (time, leader exp) while farming at the current spot
+        self.crowd_since = None
+        self.deaths = []           # times of party deaths at the current spot
+        self.exp_total = 0.0       # EXP gained by non-capped members (running sum)
+        self.last_exp = {}
+        self.paused = False
+        self.key_paused = False
+        # scouting (see SCOUT_* config)
+        self.scouting = False
+        self.scout_i = 0           # spot being checked
+        self.scout_seen = {}       # spot index -> players counted there
+        self.scout_started = 0
+        self.scout_arrived_at = None
+        self.scout_best = 999.0    # closest distance reached to the current spot
+        self.scout_progress_at = 0
+
+    def follow_point(self, step):
+        """Main character's position, if he is alive and farming at the group spot."""
+        lead = self.leader.s
+        _, _, _, map_idx, tx, ty = step
+        if (lead.get("map") != map_idx or (lead.get("hp") or 0) <= 0 or self.leader.shop_pending
+                or math.hypot(lead["x"] - tx, lead["y"] - ty) > LEASH_RADIUS):
+            return None
+        return (lead["x"], lead["y"])
+
+    # ── pause / manual control ──
+    def pause(self):
+        self.paused = True
+        log("=== PAUSED: the bot is not touching the game. Play the characters yourself. "
+            f"Press {PAUSE_KEY.upper()} in this window to resume. ===")
+        if MINIMIZE_WINDOWS:
+            for c in self.members:
+                if c.minimized:
+                    c.set_window("normal")   # bring the windows back so you can play (re-minimized on resume)
+        if HELPERS_OFF_ON_PAUSE:
+            for c in self.members:
+                try:
+                    if c.refresh().get("helper"):
+                        c.set_helper(False)
+                except Exception as e:
+                    c.log(f"could not turn helper off: {e!r}")
+
+    def resume(self):
+        self.paused = False
+        now = time.time()
+        for c in self.members:
+            # forget everything the bot was in the middle of; it re-reads the game state next tick
+            c.walk_target = None
+            c.relocating = True          # walk back to the group spot even if the helper is on
+            c.following = False
+            c.last_follow_check = now
+            c.last_warp = 0
+            c.last_ingame = now          # don't treat the pause as a disconnect
+            c.select_tries = 0
+            c.last_reset_try = 0
+            c.walk_progress_at = now
+            if c.shop_pending:
+                c.shop_started = now     # pause time doesn't count toward the shop give-up timer
+        self.exp_samples = []            # EXP from manual play must not judge the spot
+        self.last_exp = {}
+        self.spot_since = now
+        self.arrived = False
+        self.crowd_since = None
+        self.deaths = []
+        if self.scouting:                # restart checking the current spot
+            self.scout_started, self.scout_arrived_at = now, None
+            self.scout_best, self.scout_progress_at = 999.0, now
+        log("=== RESUMED: the bot is in control again ===")
+
+    # ── alternate spots ──
+    def current_step(self, level):
+        key = next((i for i, st in enumerate(ROUTE) if st[0] <= level < st[1]), len(ROUTE) - 1)
+        if key != self.step_key:
+            self.step_key, self.spot_idx, self.best_rate = key, 0, 0.0
+            self._arrived_new_spot()
+            if SCOUT_ON_NEW_ZONE and len(ROUTE[key][4]) > 1:
+                self.start_scouting()
+        frm, to, alias, map_idx, spots = ROUTE[key]
+        x, y = spots[self.spot_idx]
+        return (frm, to, alias, map_idx, x, y), spots
+
+    # ── scouting: the main character finds an empty spot before the group settles ──
+    def start_scouting(self):
+        now = time.time()
+        self.scouting, self.scout_i, self.scout_seen = True, 0, {}
+        self.scout_started, self.scout_arrived_at = now, None
+        self.scout_best, self.scout_progress_at = 999.0, now
+        log(f"SCOUTING {ROUTE[self.step_key][2]}: {self.leader.name} checks the spots for other players")
+
+    def finish_scouting(self, spots, reason):
+        if self.scout_seen:
+            # fewest players; on a tie, the earlier spot in the list (main spot first)
+            best = min(self.scout_seen, key=lambda i: (self.scout_seen[i], i))
+        else:
+            best = 0
+        self.spot_idx = best
+        self.scouting = False
+        self._arrived_new_spot()
+        self.leader.walk_target = None
+        seen = ", ".join(f"{spots[i]}: {n if n < 999 else 'unreachable'}" for i, n in sorted(self.scout_seen.items()))
+        log(f"SCOUTING done ({reason}) -> spot {best + 1}/{len(spots)} {spots[best]} | players seen: {seen or '-'}")
+
+    def scout_tick(self, step, spots):
+        c = self.leader
+        s = c.s
+        now = time.time()
+        _, _, alias, map_idx, _, _ = step
+        if now - self.scout_started > SCOUT_GIVE_UP_SEC:
+            return self.finish_scouting(spots, "took too long")
+        if self.scout_i >= len(spots):
+            return self.finish_scouting(spots, "all spots occupied")
+        if s["map"] != map_idx:
+            if now - c.last_warp > 15:
+                c.set_helper(False)
+                c.chat(f"/move {alias}")
+                c.last_warp = now
+            self.scout_started = now     # the give-up timer only counts time spent on the map
+            self.scout_arrived_at = None
+            self.scout_best, self.scout_progress_at = 999.0, now
+            return
+        tx, ty = spots[self.scout_i]
+        dist = math.hypot(s["x"] - tx, s["y"] - ty)
+        if dist > ARRIVE_RADIUS:
+            c.set_helper(False)
+            self.scout_arrived_at = None
+            if dist < self.scout_best - 0.5:
+                self.scout_best, self.scout_progress_at = dist, now
+            elif now - self.scout_progress_at > SCOUT_STUCK_SEC:
+                c.log(f"scout: can't reach {spots[self.scout_i]} -> skipping it")
+                self.scout_seen[self.scout_i] = 999
+                return self._scout_next()
+            if c.walk_target != (tx, ty):
+                c.log(f"scout: walking to spot {self.scout_i + 1}/{len(spots)} ({tx},{ty})")
+                c.walk_target = (tx, ty)
+            c.page.evaluate(WALK_JS, [tx, ty])
+            return
+        # standing at the spot: give other players a moment to appear, then count them
+        if self.scout_arrived_at is None:
+            self.scout_arrived_at = now
+            return
+        if now - self.scout_arrived_at < SCOUT_LOOK_SEC:
+            return
+        ours = [m.name for m in self.members]
+        try:
+            crowd = c.page.evaluate(CROWD_JS, [tx, ty, CROWD_RADIUS, ours])
+        except PWError:
+            crowd = []
+        self.scout_seen[self.scout_i] = len(crowd)
+        if not crowd:
+            c.log(f"scout: spot {self.scout_i + 1} ({tx},{ty}) is empty")
+            return self.finish_scouting(spots, "found an empty spot")
+        c.log(f"scout: spot {self.scout_i + 1} ({tx},{ty}) occupied by {', '.join(crowd[:4])}")
+        self._scout_next()
+
+    def _scout_next(self):
+        self.scout_i += 1
+        self.scout_arrived_at = None
+        self.scout_best, self.scout_progress_at = 999.0, time.time()
+        self.leader.walk_target = None
+
+    def _arrived_new_spot(self):
+        self.spot_since = time.time()
+        self.exp_samples, self.crowd_since, self.deaths = [], None, []
+        self.arrived = False
+
+    def switch_spot(self, reason, spots):
+        now = time.time()
+        self.bad_until[(self.step_key, self.spot_idx)] = now + BAD_SPOT_COOLDOWN
+        n = len(spots)
+        order = [(self.spot_idx + i) % n for i in range(1, n)]
+        free = [i for i in order if self.bad_until.get((self.step_key, i), 0) <= now]
+        nxt = free[0] if free else min(order, key=lambda i: self.bad_until.get((self.step_key, i), 0))
+        log(f"SPOT SWITCH ({reason}): {spots[self.spot_idx]} -> {spots[nxt]}")
+        self.spot_idx = nxt
+        self._arrived_new_spot()
+
+    def check_spot(self, step, spots):
+        if len(spots) < 2:
+            return
+        now = time.time()
+        _, _, _, map_idx, tx, ty = step
+        lead = self.leader.s
+        d = math.hypot(lead["x"] - tx, lead["y"] - ty) if lead["map"] == map_idx else 999
+        if d <= ARRIVE_RADIUS + 2:
+            self.arrived = True
+        at_spot = self.arrived and d <= LEASH_RADIUS
+        if not at_spot:
+            self.spot_since = now  # still travelling: don't judge yet
+            self.exp_samples = []
+            return
+
+        # 1) deaths
+        self.deaths = [t for t in self.deaths if now - t < DEATH_WINDOW_SEC]
+        if len(self.deaths) >= DEATHS_TO_SWITCH:
+            return self.switch_spot(f"{len(self.deaths)} deaths in {DEATH_WINDOW_SEC // 60} min", spots)
+
+        # 2) other players standing at the spot (off by default: only EXP/min matters)
+        ours = [c.name for c in self.members]
+        if not SWITCH_ON_CROWD:
+            ours = None
+        try:
+            crowd = self.leader.page.evaluate(CROWD_JS, [tx, ty, CROWD_RADIUS, ours]) if ours else []
+        except PWError:
+            crowd = []
+        if crowd:
+            self.crowd_since = self.crowd_since or now
+            if now - self.crowd_since >= CROWD_SEC:
+                return self.switch_spot(f"occupied by {', '.join(crowd[:3])}", spots)
+        else:
+            self.crowd_since = None
+
+        # 3) EXP per minute, summed over members still below the reset level
+        #    (a capped character gains nothing, so it must not count)
+        for c in self.members:
+            e = c.s.get("exp") or 0
+            prev = self.last_exp.get(c.name)
+            if prev is not None and e > prev and (c.s.get("level") or 1) < (self.reset_level or 10**9):
+                self.exp_total += e - prev
+            self.last_exp[c.name] = e
+        exp = self.exp_total
+        if all((c.s.get("level") or 1) >= (self.reset_level or 10**9) for c in self.members):
+            return
+        self.exp_samples.append((now, exp))
+        self.exp_samples = [p for p in self.exp_samples if now - p[0] <= EXP_WINDOW_SEC]
+        if now - self.spot_since < SETTLE_SEC or now - self.exp_samples[0][0] < EXP_WINDOW_SEC * 0.9:
+            return
+        rate = (exp - self.exp_samples[0][1]) / ((now - self.exp_samples[0][0]) / 60)
+        self.best_rate = max(self.best_rate * 0.999, rate)  # slow decay so an old peak doesn't stick forever
+        if rate <= 0 or (self.best_rate > 0 and rate < EXP_LOW_RATIO * self.best_rate):
+            return self.switch_spot(f"EXP/min {rate:,.0f} vs best {self.best_rate:,.0f}", spots)
+
+        # 4) on an alternate long enough -> try the main spot again
+        if (self.spot_idx != 0 and now - self.spot_since >= RECHECK_MAIN_SEC
+                and self.bad_until.get((self.step_key, 0), 0) <= now):
+            log(f"SPOT SWITCH (re-checking main spot): {spots[self.spot_idx]} -> {spots[0]}")
+            self.spot_idx = 0
+            self._arrived_new_spot()
+
+    def detect_reset_level(self):
+        c = self.leader
+        c.chat("/resetinfo")
+        time.sleep(2)
+        for line in reversed(c.page.evaluate(CHAT_LINES_JS)):
+            m = re.search(r"requires level (\d+)", line)
+            if m:
+                self.reset_level = int(m.group(1))
+                log(f"reset level detected: {self.reset_level}")
+                return
+        self.reset_level = ROUTE[-1][1]
+        log(f"could not read /resetinfo, using {self.reset_level}")
+
+    def tick(self):
+        for c in self.members:
+            if c.page.is_closed():
+                raise RuntimeError(f"{c.name} window has been closed")
+            c.refresh()
+            if c.online:
+                c.last_ingame = time.time()
+                c.was_online = True
+                c.select_tries = 0
+                if not c.gfx_done:
+                    c.set_low_graphics()
+                elif MINIMIZE_WINDOWS and not c.minimized and not HEADLESS:
+                    c.set_window("minimized")
+            else:
+                if c.was_online:
+                    # First tick we see it out of game (map warp, /reset, real drop): start the
+                    # disconnect timer NOW. last_ingame can be stale if the previous tick was long
+                    # (scouting warps, a reset round), which used to reload windows that were only
+                    # on a loading screen.
+                    c.last_ingame = time.time()
+                    c.was_online = False
+                c.handle_offline()
+
+        online = [c for c in self.members if c.online]
+        if len(online) < len(self.members):
+            # hold everyone who is in game at their current activity until the group is complete
+            return
+
+        if self.reset_level is None:
+            self.detect_reset_level()
+            return
+
+        levels = {c.name: c.s["level"] or 1 for c in self.members}
+        rl = self.reset_level
+
+        # Start a reset round when everyone has reached the reset level.
+        # On startup, also finish an interrupted round (some at reset level, others already back at the start).
+        if not self.reset_round:
+            if all(l >= rl for l in levels.values()):
+                self.reset_round = {n for n in levels}
+                log(f"everyone reached {rl} -> resetting together")
+            elif self.first_check and min(levels.values()) < ROUTE[0][1] and any(l >= rl for l in levels.values()):
+                self.reset_round = {n for n, l in levels.items() if l >= rl}
+                log(f"finishing interrupted reset round for {sorted(self.reset_round)}")
+        self.first_check = False
+
+        for c in self.members:
+            if c.name in self.reset_round:
+                if levels[c.name] < rl:
+                    self.reset_round.discard(c.name)
+                else:
+                    c.try_reset()
+        if self.reset_round:
+            return
+
+        # Group step = step for the LOWEST level, so nobody moves on alone.
+        step, spots = self.current_step(min(self.refresh_levels().values()))
+        scouting = self.scouting
+        for c in self.members:
+            dead = (c.s.get("hp") or 0) <= 0
+            if dead and not c.was_dead:
+                self.deaths.append(time.time())
+                log(f"{c.name} died at {step[2]} ({step[4]},{step[5]})")
+            c.was_dead = dead
+            if dead:
+                c.walk_target = None
+                continue  # dead: wait for respawn
+            if c.shop_pending:
+                if c.shop_tick():
+                    c.shop_pending = False
+                continue
+            if scouting:
+                if c is self.leader:
+                    self.scout_tick(step, spots)
+                elif c.s["map"] != step[3]:
+                    c.move_tick(step)        # warps to the zone (and nothing else while off the map)
+                else:
+                    c.walk_target = None     # on the zone map: wait where we are for the scout
+                c.party_tick(self)
+                continue
+            c.move_tick(step, follow=self.follow_point(step) if c is not self.leader else None)
+            c.party_tick(self)
+        if not scouting:
+            self.check_spot(step, spots)
+
+        if time.time() - self.last_status > 60:
+            self.last_status = time.time()
+            rate = ""
+            if len(self.exp_samples) > 1:
+                (t0, e0), (t1, e1) = self.exp_samples[0], self.exp_samples[-1]
+                if t1 > t0:
+                    rate = f" exp/min {(e1 - e0) / ((t1 - t0) / 60):,.0f} (best {self.best_rate:,.0f})"
+            where = (f"SCOUTING spot {min(self.scout_i, len(spots) - 1) + 1}/{len(spots)}" if self.scouting
+                     else f"spot {self.spot_idx + 1}/{len(spots)} ({step[4]},{step[5]})")
+            log(f"zone {step[2]} {where}{rate} | " + " | ".join(
+                f"{c.name} lvl {c.s['level']} r{c.s['resets']} hp {c.s['hp']}/{c.s['maxHP']} "
+                f"helper {'on' if c.s['helper'] else 'off'}" for c in self.members)
+                + f" | party {self.leader.s.get('party')}")
+
+    def refresh_levels(self):
+        return {c.name: c.s["level"] or 1 for c in self.members}
+
+
+def disable_console_quickedit():
+    """On Windows, clicking/selecting text in the console pauses the program until a key is
+    pressed. Turn that off so an accidental click can't freeze the bot."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if k32.GetConsoleMode(h, ctypes.byref(mode)):
+            # clear ENABLE_QUICK_EDIT_MODE (0x40), keep ENABLE_EXTENDED_FLAGS (0x80)
+            k32.SetConsoleMode(h, (mode.value & ~0x0040) | 0x0080)
+    except Exception:
+        pass
+
+
+def pause_requested(group):
+    """Console key P toggles pause; a PAUSE file next to the script also pauses while it exists."""
+    pressed = False
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+            while msvcrt.kbhit():
+                if msvcrt.getwch().lower() == PAUSE_KEY:
+                    pressed = not pressed
+        except Exception:
+            pass
+    flag = BASE_DIR / PAUSE_FILE
+    if pressed:
+        if group.paused:          # resume: also clear the file so it can't re-pause
+            group.key_paused = False
+            try:
+                flag.unlink()
+            except OSError:
+                pass
+        else:
+            group.key_paused = True
+    return group.key_paused or flag.exists()
+
+
+def main():
+    disable_console_quickedit()
+    import socket
+    lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        lock.bind(("127.0.0.1", 47291))  # held for the life of this process
+    except OSError:
+        print("The group bot is already running in another window. Close that one first.")
+        input("Press Enter to exit...")
+        return
+    log("=== MU group bot starting ===")
+    with sync_playwright() as pw:
+        members = []
+        for i, acc in enumerate(ACCOUNTS):
+            ctx = pw.chromium.launch_persistent_context(
+                str(BASE_DIR / f"browser_profile_{acc['user']}"),
+                headless=HEADLESS,
+                viewport={"width": WINDOW_SIZE[0], "height": WINDOW_SIZE[1]},
+                args=[
+                    "--disable-background-timer-throttling",
+                    "--disable-renderer-backgrounding",
+                    "--disable-backgrounding-occluded-windows",
+                    f"--window-position={40 + i * 50},{40 + i * 50}",
+                ],
+            )
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.goto(URL, wait_until="domcontentloaded", timeout=180_000)
+            members.append(Char(acc, page, is_leader=(i == 0)))
+        group = Group(members)
+        log(f"Press {PAUSE_KEY.upper()} in this console window to pause the bot and play yourself.")
+        while True:
+            want_pause = pause_requested(group)
+            if want_pause and not group.paused:
+                group.pause()
+            elif not want_pause and group.paused:
+                group.resume()
+            if group.paused:
+                if any(c.page.is_closed() for c in group.members):
+                    log("a game window was closed -> stopping")
+                    return
+                time.sleep(0.3)
+                continue
+            try:
+                group.tick()
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                if "has been closed" in str(e):
+                    log("a game window was closed -> stopping")
+                    return
+                log(f"error: {e!r}")
+                time.sleep(5)
+            time.sleep(TICK)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("stopped by user")
+        sys.exit(0)
