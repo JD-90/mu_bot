@@ -80,7 +80,9 @@ DEVIAS_MIN_LEVEL    = 20    # /move Devias (Spirit of Archangel) needs this leve
 BC_INVITE_MAX       = 2     # inside: invite the same stranger at most this many times
 
 # windows
-WINDOW_CHECK_EVERY  = 30    # seconds: re-minimize a window that got restored (unless paused with 1-5)
+WINDOW_CHECK_EVERY  = 30    # seconds between window checks
+REMINIMIZE_RESTORED = False # True = re-minimize any window that got restored (the old behaviour).
+                            # False = a window you restore by hand stays open until you minimize it again
 
 # alts give their Boxes of Kundun to the main character when they meet while leveling
 TRADE_BOXES         = True
@@ -213,7 +215,7 @@ class Agent:
         self.mode = "start"
         self.anchor_name = None
         self.win_check = 0
-        self.user_maximized = False  # you maximized this window: keep_minimized leaves it alone
+        self.user_opened = False     # you restored this window by hand: keep_minimized leaves it open
         self.open_logged = None
         self.boxes = 0               # Boxes of Kundun (+1..+5) in my bag (checked every 30 s)
         self.boxes_at = 0
@@ -272,7 +274,8 @@ class Agent:
     def keep_minimized(self):
         """Windows get restored behind the bot's back (Windows focus, a reload, a click on the
         taskbar...). Every WINDOW_CHECK_EVERY seconds: not paused with 1-5 / no click needed ->
-        minimize it again. A window YOU maximized is left alone (minimize it yourself when done)."""
+        minimize it again. With REMINIMIZE_RESTORED off, a window you restored is left open until
+        you minimize it yourself."""
         if not G.MINIMIZE_WINDOWS or G.HEADLESS or self.show_window:
             return
         now = time.time()
@@ -280,14 +283,14 @@ class Agent:
             return
         self.win_check = now
         st = self.window_state()
-        if st == "maximized":
-            if not self.user_maximized:
-                self.user_maximized = True
-                self.log("window maximized by hand -> leaving it open (minimize it to hand it back to the bot)")
+        if not REMINIMIZE_RESTORED:
+            if st and st != "minimized" and not self.user_opened:
+                self.user_opened = True
+                self.log(f"window restored by hand ({st}) -> leaving it open (minimize it to hand it back to the bot)")
+            elif st == "minimized" and self.user_opened:
+                self.user_opened = False
+                self.log("window minimized again -> bot keeps it minimized")
             return
-        if self.user_maximized:
-            self.user_maximized = False
-            self.log(f"window no longer maximized ({st}) -> bot keeps it minimized again")
         if st and st != "minimized":
             self.log(f"window was {st} -> minimizing it again")
             self.c.set_window("minimized")
