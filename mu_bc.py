@@ -153,6 +153,61 @@ SCAN_JS = """
 }
 """
 
+# ── weapon diagnostics (2026-10-10: solo BC4 run never saw the weapon on the ground) ──
+# ground-item name fallback when the 13/19 code doesn't match. Only group-13 items, and only the
+# quest weapons: "archangel|divine" also matched Divine Boots/Gloves (11/19, 10/19) and the
+# Scroll of Archangel (13/16) -> 2026-10-10 13:05 castle lost by three characters "delivering" armor.
+WEAPON_NAME_RE = "(staff|sword|crossbow) of archangel"
+DELIVER_TIMEOUT_SEC = 3               # talking to the Archangel this long with no 13/19 in the bag -> not the weapon
+GROUND_RADIUS  = 15                   # ground-item dump radius near the statue
+GROUND_NEAR    = 12                   # start dumping the ground this close to the statue
+GROUND_LOG_SEC = 5                    # check the ground this often near the statue
+GROUND_LOG_FORCE_SEC = 30             # log the ground even if unchanged this often
+
+# every ground item within r tiles (r null = all): name, codes, position
+GROUND_JS = """
+(r) => {
+  const w = window.__world, h = w.playerEntity; if (!h) return null;
+  const p = h.transform.pos, out = [];
+  for (const e of w.netObjsQuery.entities) {
+    if (!e.droppedItem) continue;
+    const it = e.droppedItem;
+    const d = Math.hypot(e.transform.pos.x - p.x, e.transform.pos.z - p.z);
+    if (r !== null && d > r) continue;
+    out.push({id: e.netId, name: e.objectNameInWorld || '', money: !!it.isMoney,
+              g: it.group, n: it.num, lvl: it.item ? it.item.lvl : null,
+              x: Math.round(e.transform.pos.x), y: Math.round(e.transform.pos.z), d: Math.round(d)});
+  }
+  out.sort((a, b) => a.d - b.d);
+  return out;
+}
+"""
+
+# the Archangel's weapon on the ground: by item code OR by name
+WEAPON_SCAN_JS = """
+([g, n, re]) => {
+  const w = window.__world, h = w.playerEntity; if (!h) return [];
+  const p = h.transform.pos, rx = new RegExp(re, 'i'), out = [];
+  for (const e of w.netObjsQuery.entities) {
+    if (!e.droppedItem || e.droppedItem.isMoney) continue;
+    const it = e.droppedItem, name = e.objectNameInWorld || '';
+    const byCode = it.group === g && it.num === n, byName = it.group === g && rx.test(name);
+    if (!byCode && !byName) continue;
+    out.push({id: e.netId, name, g: it.group, n: it.num, lvl: it.item ? it.item.lvl : null,
+              by: byCode ? 'code' : 'name',
+              d: Math.hypot(e.transform.pos.x - p.x, e.transform.pos.z - p.z)});
+  }
+  out.sort((a, b) => a.d - b.d);
+  return out;
+}
+"""
+
+# bag contents (slots 12+) as "group/num/lvl" strings
+BAG_JS = """
+() => (window.__store.playerData.items || []).map((it, i) =>
+    i >= 12 && it ? `${it.group}/${it.num}/${it.lvl}` : null).filter(Boolean)
+"""
+
 PICKUP_JS = """
 (id) => {
   const w = window.__world;

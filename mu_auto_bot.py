@@ -28,15 +28,18 @@ Blood Castle (15 minutes before every castle, BC_PLAN_SEC):
 Box trading (TRADE_BOXES):
   * An alt carrying Boxes of Kundun (+1..+5) that meets the main character (first account in
     accounts.json) while both are leveling (same map, within TRADE_MEET_RADIUS tiles) asks him for
-    a trade: both stop, warp to the Lorencia bar (safe zone), the alt puts every box in the trade
-    window, both confirm, and both go back to leveling. One trade at a time; never around Blood
+    a trade right there: both turn the helper off, the alt walks up to the main, sends the request,
+    the main accepts only the alt's request, the alt puts every box in and confirms only once the
+    MAIN's own trade window shows those boxes (so it can't be trading with a stranger), the main
+    confirms, and both go back to leveling at the same spot. One trade at a time; never around Blood
     Castle time. A failed trade is retried later (TRADE_RETRY_SEC), and after TRADE_MAX_FAILS
     failures in a row that alt waits TRADE_GIVEUP_SEC.
 
 Run:   run_auto.bat           Stop: Ctrl+C in the console window.
 Pause: P pauses / resumes EVERY character. Keys 1-5 pause / resume ONE character (order of
        accounts.json). A paused character's window is restored so you can play it; the others
-       keep going.
+       keep going. While paused, everything you do in that window is written to mu_record.log
+       (mu_recorder.py) so new events can be learned from it.
 """
 import math
 import socket
@@ -84,12 +87,37 @@ WINDOW_CHECK_EVERY  = 30    # seconds between window checks
 REMINIMIZE_RESTORED = False # True = re-minimize any window that got restored (the old behaviour).
                             # False = a window you restore by hand stays open until you minimize it again
 
+# who sent the incoming trade request: "alt", "other" (a name/netId of someone else in view) or "unknown"
+TRADE_FROM_JS = """
+([alt, ours]) => {
+  const r = window.__eco.tradeRequest; if (!r) return {from: 'none'};
+  let raw = ''; try { raw = JSON.stringify(r); } catch (e) { raw = String(r); }
+  const ents = window.__world.netObjsQuery.entities.filter(e => e.objectNameInWorld && !e.localPlayer);
+  const vals = new Set(); const walk = (o, d) => { if (o == null || d > 2) return;
+    if (typeof o !== 'object') { vals.add(o); return; } for (const k in o) walk(o[k], d + 1); };
+  walk(r, 0);
+  const hit = e => vals.has(e.objectNameInWorld) || (e.netId != null && vals.has(e.netId));
+  if ([...vals].includes(alt) || ents.some(e => e.objectNameInWorld === alt && hit(e))) return {from: 'alt', raw};
+  if (ents.some(e => !ours.includes(e.objectNameInWorld) && !e.npcType && hit(e))) return {from: 'other', raw};
+  return {from: 'unknown', raw};
+}
+"""
+
+# what the other side put in my trade window: Kundun boxes / anything else
+TRADE_YOURS_JS = """
+(minLvl) => { const it = Object.values(window.__eco.yourTradeItems || {}).filter(Boolean);
+  const g = i => i.item || i;   // an item whose fields we can't read counts as a box (not as "other")
+  const other = i => g(i).group !== undefined && !(g(i).group === 14 && g(i).num === 11 && (g(i).lvl || 0) >= minLvl);
+  return {boxes: it.filter(i => !other(i)).length, other: it.filter(other).length}; }
+"""
+
 # alts give their Boxes of Kundun to the main character when they meet while leveling
 TRADE_BOXES         = True
 TRADE_TO            = None  # character that receives the boxes; None = first account in accounts.json
 TRADE_MEET_RADIUS   = 15    # same map, this close, both leveling -> trade
-TRADE_SPOT          = B.TRADE_SPOT   # Lorencia bar (safe zone): main stands here, the alt 2 tiles south
-TRADE_TIMEOUT       = 180   # seconds for the whole thing (warps included) before giving up
+TRADE_NEAR          = 3     # the alt walks this close to the main (where he is leveling) and trades there
+TRADE_TIMEOUT       = 60    # seconds for the whole thing before giving up
+TRADE_OFFLINE_GRACE = 10    # the other side may look offline this long (map loading) before we give up
 TRADE_RETRY_SEC     = 600   # a failed trade: that alt tries again after this long
 TRADE_MAX_FAILS     = 3     # ... and after this many failures in a row ...
 TRADE_GIVEUP_SEC    = 3600  # ... it waits this long
@@ -340,6 +368,7 @@ class Agent:
         if self.paused:
             self.mode = "paused"
             c.refresh()
+            c.rec.tick()
             self.keep_minimized()
             self.publish()
             return
@@ -358,6 +387,11 @@ class Agent:
             if c.was_online:
                 c.last_ingame = time.time()
                 c.was_online = False
+            # A reload / re-login restores the window on its own. Unless you had opened it by hand,
+            # forget that it was minimized so the bot minimizes it again once back in game
+            # (instead of keep_minimized mistaking it for a window you restored yourself).
+            if not self.user_opened:
+                c.minimized = False
             self.mode = "offline"
             self.publish()
             c.handle_offline()
@@ -475,11 +509,13 @@ class Agent:
                 c.set_helper(False)
         except Exception as e:
             self.log(f"pause: {e!r}")
+        c.rec.start()               # write down what you do while you play it (mu_recorder.py)
 
     def resume(self):
         self.paused = False
         self.show_window = False
         c = self.c
+        c.rec.stop()
         now = time.time()
         c.walk_target, c.relocating, c.following = None, True, False
         c.last_follow_check, c.last_warp, c.last_ingame = now, 0, now
@@ -793,10 +829,10 @@ class Agent:
         with hub.lock:
             if hub.trade is not None:
                 return None
-            t = {"alt": self.name, "lead": hub.trade_to, "phase": "gather", "start": now, "phase_at": now,
+            t = {"alt": self.name, "lead": hub.trade_to, "phase": "meet", "start": now, "phase_at": now,
                  "n": self.boxes, "requests": 0, "ok": False}
             hub.trade = t
-        self.log(f"met {hub.trade_to} with {self.boxes} Box(es) of Kundun -> both go to the Lorencia bar to trade")
+        self.log(f"met {hub.trade_to} with {self.boxes} Box(es) of Kundun -> trading right here")
         return t
 
     def trade_phase(self, t, phase):
@@ -819,9 +855,8 @@ class Agent:
                 " if (e.tradeOpen) e.cancelTrade(); if (e.tradeRequest) e.answerTradeRequest(false); }")
         self.my_trade = None
         self.trade_filled = False
-        self.step_key = None          # re-pick leg and spot (walk back to farming)
-        c.walk_target = None
-        c.spot = None
+        c.walk_target = None          # same spot as before: move_tick walks back / turns the helper on
+        self.spot_since, self.samples, self.stat_point = time.time(), [], None   # don't count the pause
         if self.name == t["alt"]:
             self.boxes_at = 0
             now = time.time()
@@ -847,17 +882,27 @@ class Agent:
             if t is None or self.name not in (t["alt"], t["lead"]):
                 return False
             self.my_trade, self.trade_sent, self.trade_filled = t, 0, False
+            self.c.set_helper(False)
+            self.c.walk_target = None
             if self.name == t["lead"]:
-                self.log(f"{t['alt']} has {t['n']} Box(es) of Kundun for me -> going to the Lorencia bar")
+                self.log(f"{t['alt']} has {t['n']} Box(es) of Kundun for me -> stopping here to trade")
         if hub.trade is not t:
             self.trade_cleanup(t)
             return False
+        now = time.time()
         other = hub.snapshot().get(t["lead"] if self.name == t["alt"] else t["alt"]) or {}
+        off_key = "off_" + self.name
+        if other.get("online") and not other.get("paused"):
+            t.pop(off_key, None)
+        else:
+            t.setdefault(off_key, now)      # a few seconds offline (map loading) is fine
         if self.bcs or other.get("bc"):
             self.trade_end(t, False, "Blood Castle comes first")
-        elif not other.get("online") or other.get("paused"):
+        elif other.get("paused") or now - t.get(off_key, now) > TRADE_OFFLINE_GRACE:
             self.trade_end(t, False, "the other character is offline / paused")
-        elif time.time() - t["start"] > TRADE_TIMEOUT:
+        elif other.get("map") is not None and other.get("map") != self.c.s.get("map"):
+            self.trade_end(t, False, "not on the same map any more")
+        elif now - t["start"] > TRADE_TIMEOUT:
             self.trade_end(t, False, f"took more than {TRADE_TIMEOUT}s (phase {t['phase']})")
         if hub.trade is not t:
             self.trade_cleanup(t)
@@ -875,21 +920,27 @@ class Agent:
         return True
 
     def trade_alt(self, t, lead):
+        """Walk up to the main where he stands, send the request, put the boxes in, confirm --
+        but only once the MAIN's own window shows the boxes arriving (= it's really him)."""
         c, s = self.c, self.c.s
         now = time.time()
-        m, x, y = TRADE_SPOT
-        if t["phase"] == "gather":
-            here = self.go(m, "Lorencia", x, y + 2, radius=1)
-            if here and lead.get("map") == m and lead.get("x") is not None and \
-                    math.hypot(lead["x"] - s["x"], lead["y"] - s["y"]) <= 3:
+        if t["phase"] == "meet":
+            c.set_helper(False)
+            lx, ly = lead.get("x"), lead.get("y")
+            if lx is None or s.get("x") is None:
+                return
+            if math.hypot(lx - s["x"], ly - s["y"]) <= TRADE_NEAR:
+                c.walk_target = None
                 self.trade_phase(t, "request")
+                return
+            self.go(s.get("map"), None, int(lx), int(ly), radius=TRADE_NEAR - 1)
             return
         st = self.ev(B.TRADE_STATE_JS) or {}
         if t["phase"] == "request":
             if st.get("open"):
                 self.trade_phase(t, "fill")
                 return
-            if now - self.trade_sent < 8:
+            if now - self.trade_sent < 6:
                 return
             if t["requests"] >= 3:
                 return self.trade_end(t, False, f"{t['lead']} never opened the trade window")
@@ -899,6 +950,8 @@ class Agent:
             t["requests"] += 1
             self.trade_sent = now
             self.log(f"box trade: request to {t['lead']}: {res}")
+            if res == "not in view":
+                self.trade_phase(t, "meet")     # he moved: walk up to him again
             return
         if not st.get("open"):
             if t["phase"] == "confirm":
@@ -910,6 +963,12 @@ class Agent:
                 return self.trade_end(t, False, "trade window closed, boxes still in my bag")
             return self.trade_end(t, False, "trade window closed before confirming")
         if t["phase"] == "fill":
+            if not t.get("lead_open"):
+                # my window is open but the main's isn't (yet): wait a bit, then it's someone else
+                if now - t["phase_at"] > 8:
+                    self.trade_end(t, False, f"my trade window opened but {t['lead']}'s didn't -> "
+                                             "not trading with someone else")
+                return
             if not self.trade_filled:
                 slots = self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or []
                 if not slots:
@@ -926,31 +985,48 @@ class Agent:
                 self.trade_filled = True
                 t["filled_at"] = time.time()
                 return
-            if st.get("mine", 0) >= t["n"]:
-                time.sleep(1)
+            # the safety check: confirm only when the MAIN sees exactly my boxes in his window
+            if st.get("mine", 0) >= t["n"] and t.get("lead_boxes", 0) >= t["n"]:
+                time.sleep(0.5)
+                self.log(f"box trade: {t['lead']} sees my {t['n']} box(es) -> confirming")
                 self.ev("() => window.__eco.setMyConfirm(true)")
                 self.trade_phase(t, "confirm")
-            elif now - t.get("filled_at", now) > 10:
-                self.trade_end(t, False, f"only {st.get('mine', 0)}/{t['n']} boxes reached the trade window")
+            elif now - t.get("filled_at", now) > 12:
+                self.trade_end(t, False, f"{st.get('mine', 0)}/{t['n']} boxes in my window, "
+                                         f"{t.get('lead_boxes', 0)} seen by {t['lead']}")
             return
         if t["phase"] == "confirm" and now - t["phase_at"] > 15:
             self.trade_end(t, False, f"{t['lead']} did not confirm")
 
     def trade_lead(self, t):
+        """Stand still (helper off); accept only the alt's request; confirm when his boxes are in."""
         c = self.c
-        m, x, y = TRADE_SPOT
-        if t["phase"] == "gather":
-            self.go(m, "Lorencia", x, y, radius=1)
-            return
+        c.set_helper(False)
+        c.walk_target = None
         st = self.ev(B.TRADE_STATE_JS) or {}
         if st.get("req") and not st.get("open"):
-            text = self.ev("() => JSON.stringify(window.__eco.tradeRequest || null)") or ""
-            c.set_helper(False)
-            self.log(f"box trade: accepting trade request {text[:80]}")
+            who = self.ev(TRADE_FROM_JS, [t["alt"], self.hub.names]) or {}
+            if who.get("from") == "other":
+                self.log(f"box trade: declining a trade request from someone else {who.get('raw', '')[:80]}")
+                self.ev("() => window.__eco.answerTradeRequest(false)")
+                return
+            if who.get("from") != "alt":
+                self.log(f"box trade: can't tell who sent this request {who.get('raw', '')[:80]} -> "
+                         f"accepting, {t['alt']} only confirms if I see his boxes")
+            else:
+                self.log(f"box trade: accepting {t['alt']}'s trade request")
             self.ev("() => window.__eco.answerTradeRequest(true)")
             return
-        if t["phase"] == "confirm" and st.get("open") and not st.get("myOk") \
-                and st.get("yours", 0) >= t["n"] and st.get("yourOk"):
+        if not st.get("open"):
+            t["lead_open"], t["lead_boxes"] = False, 0
+            return
+        box = self.ev(TRADE_YOURS_JS, B.KUNDUN_MIN_LVL) or {}
+        if box.get("other"):
+            self.log("box trade: something other than Kundun boxes in the window -> cancelling")
+            self.ev("() => window.__eco.cancelTrade()")
+            return self.trade_end(t, False, "unexpected items in the trade window")
+        t["lead_open"], t["lead_boxes"] = True, box.get("boxes", 0)
+        if t["phase"] == "confirm" and not st.get("myOk") and st.get("yours", 0) >= t["n"] and st.get("yourOk"):
             time.sleep(0.5)
             self.log(f"box trade: {st.get('yours')} box(es) in the window -> confirming")
             self.ev("() => window.__eco.setMyConfirm(true)")
@@ -1008,13 +1084,18 @@ class Agent:
             self.log(f"BC error: {e!r}")
             return True
 
-    def bc_done(self, why):
+    def bc_done(self, why, late=False):
         self.log(f"BLOOD CASTLE {self.bcs['tier']}: {why} -> back to leveling")
         plan = self.hub.plan
         if plan and not self.bcs.get("entered"):
             with self.hub.lock:      # never got in: free the castle so someone else can take it
                 plan["assign"].pop(self.name, None)
-                plan["out"].add(self.name)
+                if late:
+                    # only missed the climb deadline: keeps leveling and may still land in a free
+                    # castle's range before the door closes -> the re-plan may assign it as a holder
+                    plan["started"].discard(self.name)
+                else:
+                    plan["out"].add(self.name)
         self.bcs = None
         self.step_key = None
         self.c.walk_target = None
@@ -1041,7 +1122,7 @@ class Agent:
             if b["phase"] == "prep":
                 pass
             elif since_open > -BC_CLIMB_DEADLINE:
-                self.bc_done(f"did not reach level {bc_entry_level(tier)} in time (level {lvl})")
+                self.bc_done(f"did not reach level {bc_entry_level(tier)} in time (level {lvl})", late=True)
                 return False
             else:
                 return False      # keep leveling (and resetting) toward the range
@@ -1093,7 +1174,7 @@ class Agent:
             c.walk_target, c.walk_best, c.walk_progress_at = (x, y), d, time.time()
         if d < c.walk_best - 0.5:
             c.walk_best, c.walk_progress_at = d, time.time()
-        elif time.time() - c.walk_progress_at > 45 and not in_bc(map_idx):
+        elif alias and time.time() - c.walk_progress_at > 45 and not in_bc(map_idx):
             self.log("stuck walking -> re-warping")
             c.chat(f"/move {alias}")
             c.last_warp, c.walk_target = time.time(), None
@@ -1281,6 +1362,36 @@ class Agent:
             res = self.ev(B.INVITE_BY_NAME_JS, n)
             self.log(f"BC: party invite {n}: {res}")
 
+    BC_PHASES = {0: "start", 1: "kill monsters", 4: "gate/statue", 2: "finished"}
+
+    def bc_diag(self, b, st):
+        """Diagnostics: log every castle state change, and what's on the ground near the statue."""
+        s, now = self.c.s, time.time()
+        if st:
+            key = (st.get("st"), st.get("own"), st.get("wpn"))
+            if key != b.get("st_key"):
+                b["st_key"] = key
+                self.log(f"BC state: phase {st.get('st')} ({self.BC_PHASES.get(st.get('st'), '?')}) | "
+                         f"kills {st.get('cur')}/{st.get('max')} | {st.get('rem')}s left | "
+                         f"weapon holder {st.get('own')} | weapon num {st.get('wpn')}")
+        if dist(s, *B.STATUE) > B.GROUND_NEAR or now - b.get("ground_at", 0) < B.GROUND_LOG_SEC:
+            return
+        b["ground_at"] = now
+        items = self.ev(B.GROUND_JS, B.GROUND_RADIUS)
+        if items is None:
+            return
+        sig = sorted((i["name"], i["g"], i["n"], i["lvl"]) for i in items)
+        if sig == b.get("ground_sig") and now - b.get("ground_logged", 0) < B.GROUND_LOG_FORCE_SEC:
+            return
+        b["ground_sig"], b["ground_logged"] = sig, now
+        if not items:
+            self.log(f"BC ground: nothing within {B.GROUND_RADIUS} tiles of ({s.get('x')},{s.get('y')})")
+            return
+        parts = [("zen" if i["money"] else f"{i['name']!r} [{i['g']}/{i['n']} lvl {i['lvl']}]")
+                 + f" @({i['x']},{i['y']})" for i in items[:12]]
+        more = f" +{len(items) - 12} more" if len(items) > 12 else ""
+        self.log(f"BC ground ({len(items)} within {B.GROUND_RADIUS}): " + "; ".join(parts) + more)
+
     def inside(self, b, since_open):
         c, s = self.c, self.c.s
         st = self.ev(B.BC_STATE_JS)
@@ -1298,18 +1409,55 @@ class Agent:
         if (s.get("hp") or 0) <= 0:
             return True
         self.bc_party(b)
-        has_weapon = self.inv(B.WEAPON) > 0
+        self.bc_diag(b, st)
+        holder = st.get("own") if st else 255
+        # after a pickup attempt: the bag code may not be 13/19, so also trust "item gone from
+        # the ground + the game says someone holds the weapon" (solo / right after our pickup)
+        pk = b.get("pick_try")
+        if pk and not b.get("we_have"):
+            pid, t0, bag0 = pk
+            ground = self.ev(B.WEAPON_SCAN_JS, [B.WEAPON[0], B.WEAPON[1], B.WEAPON_NAME_RE]) or []
+            if not any(w["id"] == pid for w in ground):
+                bag = list(self.ev(B.BAG_JS) or [])
+                new = list(bag)
+                for x in (bag0 or []):
+                    if x in new:
+                        new.remove(x)
+                real = [x for x in new if x.startswith(f"{B.WEAPON[0]}/{B.WEAPON[1]}/")]
+                if real or (bag0 is None and holder not in (None, 255)):
+                    b["we_have"] = True
+                    self.log(f"BC: weapon picked up -> new in bag: {new or 'nothing?'}, "
+                             f"holder index {holder}")
+                    b["pick_try"] = None
+                elif new:
+                    self.log(f"BC: that was not the weapon (new in bag: {new}) -> rescanning")
+                    b["pick_try"] = None
+                elif time.time() - t0 > 4:
+                    self.log("BC: weapon left the ground but nothing changed for us -> rescanning")
+                    b["pick_try"] = None
+        in_bag = self.inv(B.WEAPON) > 0
+        has_weapon = in_bag or b.get("we_have")
         if has_weapon:
             if not self.walk_in_castle(b, *B.ARCHANGEL, radius=2):
                 return True
+            if in_bag:
+                b["deliver_at"] = None
+            else:
+                t0 = b.get("deliver_at")
+                if t0 and time.time() - t0 > B.DELIVER_TIMEOUT_SEC:
+                    self.log(f"BC: still 'delivering' after {B.DELIVER_TIMEOUT_SEC}s and no "
+                             f"{B.WEAPON[0]}/{B.WEAPON[1]} in the bag -> it was not the weapon, carrying on")
+                    b["we_have"], b["deliver_at"] = False, None
+                    return True
             if time.time() - b["talk_at"] > 3:
+                if not in_bag and not b.get("deliver_at"):
+                    b["deliver_at"] = time.time()
                 b["talk_at"] = time.time()
                 c.set_helper(False)
                 self.log("BC: delivering the weapon to the Archangel")
                 self.ev(B.TALK_NPC_JS, B.ARCHANGEL_NPC)
             return True
-        holder = st.get("own") if st else 255
-        if holder not in (None, 255) and not b["rush"]:
+        if holder not in (None, 255) and not b["rush"] and not b.get("pick_try"):
             b["rush"] = True
             self.log("BC: another player has the weapon -> back to the Archangel")
         if b["rush"]:
@@ -1318,14 +1466,19 @@ class Agent:
         if not st or st.get("st") not in (1, 4):
             self.go(s.get("map"), "", *B.BC_START, radius=2)   # waiting for the castle to start
             return True
-        weapon = (self.ev(B.SCAN_JS, [self.hub.names, B.CLEAR_RADIUS, B.WEAPON[0], B.WEAPON[1], None])
-                  or {}).get("items", [])
+        weapon = self.ev(B.WEAPON_SCAN_JS, [B.WEAPON[0], B.WEAPON[1], B.WEAPON_NAME_RE]) or []
         if weapon:
-            if time.time() - b.get("pick_at", 0) > 2:
-                b["pick_at"] = time.time()
+            now = time.time()
+            if now - b.get("pick_at", 0) > 2:
+                b["pick_at"] = now
+                w = weapon[0]
                 c.set_helper(False)
-                self.log("BC: picking up the Archangel's weapon")
-                self.ev(B.PICKUP_JS, weapon[0]["id"])
+                self.log(f"BC: picking up the Archangel's weapon: {w['name']!r} "
+                         f"[{w['g']}/{w['n']} lvl {w['lvl']}] matched by {w['by']}, {w['d']:.0f} tiles away")
+                if not b.get("pick_try") or b["pick_try"][0] != w["id"]:
+                    bag0 = self.ev(B.BAG_JS)
+                    b["pick_try"] = (w["id"], now, list(bag0) if bag0 is not None else None)
+                self.ev(B.PICKUP_JS, w["id"])
             return True
         tx, ty = B.STATUE
         if dist(s, tx, ty) <= B.STATUE_RADIUS:

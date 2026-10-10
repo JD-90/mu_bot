@@ -23,6 +23,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright, Error as PWError
 from mu_bc import BloodCastle
+from mu_recorder import Recorder
 
 # ───────────────────────────── CONFIG ─────────────────────────────
 URL    = "https://mu.mormon.garden/"
@@ -42,6 +43,7 @@ SHOP_AFTER_RESET = True
 SHOP_SPOT        = (0, 122, 133)        # (map, x, y) Lorencia bar; Liaman Barmaid stands at (123,135)
 SHOP_NPC         = "Liaman Barmaid"
 ZEN_CHEST_PRICE  = 500_000_000
+ZEN_KEEP         = 700_000_000          # never buy below this: every character keeps at least this much zen
 ZEN_CHEST_MAX_PER_RESET = 64          # safety cap per shopping trip
 ZEN_CHEST_SLOT   = 0                    # first slot of her shop (used if the name can't be read)
 SHOP_GIVE_UP_SEC = 180                  # stop trying after this long
@@ -310,6 +312,7 @@ class Char:
         self.stale_logged = False
         self.minimized = False
         self.bc = None              # Blood Castle per-character state (mu_bc.py)
+        self.rec = Recorder(page, self.name, self.log)   # records your play while paused (mu_recorder.py)
 
     def log(self, msg):
         log(msg, self.name)
@@ -478,8 +481,8 @@ class Char:
             self.log("zen chest: gave up (took too long)")
             return True
         money = s.get("money") or 0
-        if money < ZEN_CHEST_PRICE:
-            self.log(f"zen chest: skipped, only {money:,} zen")
+        if money - ZEN_CHEST_PRICE < ZEN_KEEP:
+            self.log(f"zen chest: skipped, only {money:,} zen (keeping {ZEN_KEEP:,})")
             return True
         m, x, y = SHOP_SPOT
         if s["map"] != m:
@@ -527,7 +530,7 @@ class Char:
         money_js = "() => Number(window.__store.playerData.money) || 0"
         bought, zen = 0, money
         start = money
-        while zen >= ZEN_CHEST_PRICE and bought < ZEN_CHEST_MAX_PER_RESET:
+        while zen - ZEN_CHEST_PRICE >= ZEN_KEEP and bought < ZEN_CHEST_MAX_PER_RESET:
             self.page.evaluate("(i) => window.__store.buyItemFromNpc(i)", slot)
             after = zen
             for _ in range(10):  # wait up to 5 s for the zen to drop
@@ -545,7 +548,7 @@ class Char:
                     break
                 time.sleep(0.3)
         self.page.evaluate("() => { window.__store.closeNpcShop(); window.__store.inventoryEnabled = false; }")
-        self.log(f"zen chest: bought {bought} (zen {start:,} -> {zen:,})")
+        self.log(f"zen chest: bought {bought} (zen {start:,} -> {zen:,}, keeping {ZEN_KEEP:,})")
         return True
 
     def close_windows(self):
@@ -769,10 +772,14 @@ class Group:
                         c.set_helper(False)
                 except Exception as e:
                     c.log(f"could not turn helper off: {e!r}")
+        for c in self.members:
+            c.rec.start()
 
     def resume(self):
         self.paused = False
         now = time.time()
+        for c in self.members:
+            c.rec.stop()
         for c in self.members:
             # forget everything the bot was in the middle of; it re-reads the game state next tick
             c.walk_target = None
@@ -1236,6 +1243,8 @@ def main():
                 if any(c.page.is_closed() for c in group.members):
                     log("a game window was closed -> stopping")
                     return
+                for c in group.members:
+                    c.rec.tick()
                 time.sleep(0.3)
                 continue
             try:
