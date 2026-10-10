@@ -25,6 +25,14 @@ Blood Castle (15 minutes before every castle, BC_PLAN_SEC):
     corridor, destroy the statue, take the weapon and deliver it (or rush back to the
     Archangel when someone else has it), pick up the Box of Kundun +5, back to leveling.
 
+Box trading (TRADE_BOXES):
+  * An alt carrying Boxes of Kundun (+1..+5) that meets the main character (first account in
+    accounts.json) while both are leveling (same map, within TRADE_MEET_RADIUS tiles) asks him for
+    a trade: both stop, warp to the Lorencia bar (safe zone), the alt puts every box in the trade
+    window, both confirm, and both go back to leveling. One trade at a time; never around Blood
+    Castle time. A failed trade is retried later (TRADE_RETRY_SEC), and after TRADE_MAX_FAILS
+    failures in a row that alt waits TRADE_GIVEUP_SEC.
+
 Run:   run_auto.bat           Stop: Ctrl+C in the console window.
 Pause: P pauses / resumes EVERY character. Keys 1-5 pause / resume ONE character (order of
        accounts.json). A paused character's window is restored so you can play it; the others
@@ -68,6 +76,22 @@ BC_LOW_RATE         = 25    # levels/min right after a reset (Lorencia)
 BC_WAIT_INVITE_SEC  = 30    # inside: wait this long for a stranger's invite before inviting ourselves
 BC_INVITE_EVERY     = 10    # seconds between invites to the same player
 BC_SHOW_WINDOW_AFTER = 2    # entry dialog not found this many times -> restore the window so you can click
+DEVIAS_MIN_LEVEL    = 20    # /move Devias (Spirit of Archangel) needs this level: BC1 entries wait for it
+BC_INVITE_MAX       = 2     # inside: invite the same stranger at most this many times
+
+# windows
+WINDOW_CHECK_EVERY  = 30    # seconds: re-minimize a window that got restored (unless paused with 1-5)
+
+# alts give their Boxes of Kundun to the main character when they meet while leveling
+TRADE_BOXES         = True
+TRADE_TO            = None  # character that receives the boxes; None = first account in accounts.json
+TRADE_MEET_RADIUS   = 15    # same map, this close, both leveling -> trade
+TRADE_SPOT          = B.TRADE_SPOT   # Lorencia bar (safe zone): main stands here, the alt 2 tiles south
+TRADE_TIMEOUT       = 180   # seconds for the whole thing (warps included) before giving up
+TRADE_RETRY_SEC     = 600   # a failed trade: that alt tries again after this long
+TRADE_MAX_FAILS     = 3     # ... and after this many failures in a row ...
+TRADE_GIVEUP_SEC    = 3600  # ... it waits this long
+TRADE_BC_QUIET      = 180   # no new trades from BC_PLAN_SEC + this before a castle opens until the door closes
 # ──────────────────────────────────────────────────────────────────
 
 _log_lock = threading.Lock()
@@ -122,6 +146,13 @@ class SharedStats(G.SpotStats):
         return super().ranked(alias, spots)
 
 
+def bc_entry_level(tier):
+    """Level a climber stops at: a few levels inside the range, and never below the level
+    /move Devias needs (BC1 starts at 15 but Devias needs 20: four BC1 runs were lost to that)."""
+    _, lo, hi = BC_TIERS[tier - 1]
+    return min(max(lo + BC_ENTER_MARGIN, DEVIAS_MIN_LEVEL), hi)
+
+
 def stats_alias(alias, in_party):
     return alias if in_party else f"{alias}/solo"
 
@@ -138,7 +169,10 @@ class Hub:
         self.detecting = False
         self.open_at = None          # next Blood Castle entry window (epoch seconds)
         self.plan = None             # {"key", "open_at", "assign": {name: (tier, role)}, "started", "out"}
+        self.trade = None            # box trade in progress: {"alt", "lead", "phase", "start", "phase_at", "n", ...}
+        self.trade_to = TRADE_TO or (names[0] if names else None)
         self.paused = set()
+        self.pause_all = False       # P / PAUSE file: everyone paused, windows stay minimized
         self.stop = False
 
     def put(self, name, d):
@@ -178,6 +212,16 @@ class Agent:
         self.last_status = 0
         self.mode = "start"
         self.anchor_name = None
+        self.win_check = 0
+        self.user_maximized = False  # you maximized this window: keep_minimized leaves it alone
+        self.open_logged = None
+        self.boxes = 0               # Boxes of Kundun (+1..+5) in my bag (checked every 30 s)
+        self.boxes_at = 0
+        self.my_trade = None
+        self.trade_next = 0
+        self.trade_fails = 0
+        self.trade_sent = 0
+        self.trade_filled = False
 
     def log(self, msg):
         log(msg, self.name)
@@ -215,6 +259,39 @@ class Agent:
         self.hub.put(self.name, {"name": self.name, "online": False, "paused": False, "mode": "stopped",
                                  "level": None})
 
+    def window_state(self):
+        try:
+            cdp = self.c.page.context.new_cdp_session(self.c.page)
+            win = cdp.send("Browser.getWindowForTarget")["windowId"]
+            st = cdp.send("Browser.getWindowBounds", {"windowId": win})["bounds"].get("windowState")
+            cdp.detach()
+            return st
+        except Exception:
+            return None
+
+    def keep_minimized(self):
+        """Windows get restored behind the bot's back (Windows focus, a reload, a click on the
+        taskbar...). Every WINDOW_CHECK_EVERY seconds: not paused with 1-5 / no click needed ->
+        minimize it again. A window YOU maximized is left alone (minimize it yourself when done)."""
+        if not G.MINIMIZE_WINDOWS or G.HEADLESS or self.show_window:
+            return
+        now = time.time()
+        if now - self.win_check < WINDOW_CHECK_EVERY:
+            return
+        self.win_check = now
+        st = self.window_state()
+        if st == "maximized":
+            if not self.user_maximized:
+                self.user_maximized = True
+                self.log("window maximized by hand -> leaving it open (minimize it to hand it back to the bot)")
+            return
+        if self.user_maximized:
+            self.user_maximized = False
+            self.log(f"window no longer maximized ({st}) -> bot keeps it minimized again")
+        if st and st != "minimized":
+            self.log(f"window was {st} -> minimizing it again")
+            self.c.set_window("minimized")
+
     def ev(self, js, arg=None):
         try:
             return self.c.page.evaluate(js, arg) if arg is not None else self.c.page.evaluate(js)
@@ -235,6 +312,7 @@ class Agent:
             "step": self.step_key, "spot": None if self.scouting else self.spot_idx,
             "scouting": self.scouting, "step_since": self.step_since, "arrived": self.arrived,
             "target": target, "rate": self.recent_rate(),
+            "bc": self.bcs is not None, "boxes": self.boxes,
         })
 
     def recent_rate(self):
@@ -259,6 +337,7 @@ class Agent:
         if self.paused:
             self.mode = "paused"
             c.refresh()
+            self.keep_minimized()
             self.publish()
             return
         c.refresh()
@@ -270,6 +349,8 @@ class Agent:
                 c.set_low_graphics()
             elif G.MINIMIZE_WINDOWS and not c.minimized and not G.HEADLESS and not self.show_window:
                 c.set_window("minimized")
+            else:
+                self.keep_minimized()
         else:
             if c.was_online:
                 c.last_ingame = time.time()
@@ -294,6 +375,12 @@ class Agent:
             self.read_bc_timer()
         if self.bc_tick():
             self.publish()
+            return
+        if self.trade_tick():
+            self.publish()
+            if now - self.last_status > 60:
+                self.last_status = now
+                self.status()
             return
         if lvl >= hub.reset_level:
             self.mode = "reset"
@@ -326,6 +413,11 @@ class Agent:
                 where += f" (with {self.anchor_name})"
         r = self.recent_rate()
         bc = f" | BC{self.bcs['tier']} {self.bcs['role']}/{self.bcs['phase']}" if self.bcs else ""
+        if self.my_trade:
+            t = self.my_trade
+            bc += f" | box trade {t['alt']} -> {t['lead']} ({t['phase']})"
+        elif self.boxes:
+            bc += f" | {self.boxes} Kundun box(es)"
         self.log(f"lvl {s.get('level')} r{s.get('resets')} | {where} | "
                  f"{'%.1f' % r if r is not None else '?'} lvl/min | hp {s.get('hp')}/{s.get('maxHP')} | "
                  f"party {s.get('party')}{bc}")
@@ -370,11 +462,11 @@ class Agent:
     # ── pause ──
     def pause(self):
         self.paused = True
-        self.show_window = True
+        self.show_window = not self.hub.pause_all    # P = everyone: windows stay minimized
         c = self.c
         self.log(f"=== PAUSED (press {self.idx + 1} again to resume this character) ===")
         try:
-            if c.minimized:
+            if c.minimized and self.show_window:
                 c.set_window("normal")
             if G.HELPERS_OFF_ON_PAUSE and c.refresh().get("helper"):
                 c.set_helper(False)
@@ -660,6 +752,206 @@ class Agent:
             res = self.ev(G.INVITE_JS, n)
             self.log(f"party invite {n}: {res}")
 
+
+    # ── alts give their Boxes of Kundun to the main character ──
+    def boxes_count(self):
+        now = time.time()
+        if now - self.boxes_at >= 30:
+            self.boxes_at = now
+            slots = self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL)
+            if slots is not None:
+                self.boxes = len(slots)
+        return self.boxes
+
+    def trade_quiet(self):
+        """True around Blood Castle time: no new trades then."""
+        o = self.hub.open_at
+        if o is None:
+            return False
+        until = o - time.time()
+        return -B.BC_DOOR_CLOSE_SEC - 60 <= until <= BC_PLAN_SEC + TRADE_BC_QUIET
+
+    def maybe_start_trade(self):
+        hub, c, s = self.hub, self.c, self.c.s
+        now = time.time()
+        lvl = s.get("level") or 0
+        if self.bcs or now < self.trade_next or (s.get("hp") or 0) <= 0 or c.shop_pending \
+                or lvl >= (hub.reset_level or 10 ** 6) or s.get("x") is None:
+            return None
+        if self.boxes_count() <= 0 or self.trade_quiet():
+            return None
+        lead = hub.snapshot().get(hub.trade_to)
+        if not lead or not lead.get("online") or lead.get("paused") or lead.get("mode") != "level" \
+                or lead.get("bc") or (lead.get("hp") or 0) <= 0:
+            return None
+        if lead.get("map") != s.get("map") or lead.get("x") is None or \
+                math.hypot(lead["x"] - s["x"], lead["y"] - s["y"]) > TRADE_MEET_RADIUS:
+            return None
+        with hub.lock:
+            if hub.trade is not None:
+                return None
+            t = {"alt": self.name, "lead": hub.trade_to, "phase": "gather", "start": now, "phase_at": now,
+                 "n": self.boxes, "requests": 0, "ok": False}
+            hub.trade = t
+        self.log(f"met {hub.trade_to} with {self.boxes} Box(es) of Kundun -> both go to the Lorencia bar to trade")
+        return t
+
+    def trade_phase(self, t, phase):
+        with self.hub.lock:
+            if self.hub.trade is t:
+                t["phase"], t["phase_at"] = phase, time.time()
+
+    def trade_end(self, t, ok, why):
+        with self.hub.lock:
+            if self.hub.trade is not t:
+                return
+            self.hub.trade = None
+            t["ok"] = ok
+        self.log(f"box trade {t['alt']} -> {t['lead']}: {why}")
+
+    def trade_cleanup(self, t):
+        """My side after a trade ended (either side may have ended it)."""
+        c = self.c
+        self.ev("() => { const e = window.__eco; if (!e) return;"
+                " if (e.tradeOpen) e.cancelTrade(); if (e.tradeRequest) e.answerTradeRequest(false); }")
+        self.my_trade = None
+        self.trade_filled = False
+        self.step_key = None          # re-pick leg and spot (walk back to farming)
+        c.walk_target = None
+        c.spot = None
+        if self.name == t["alt"]:
+            self.boxes_at = 0
+            now = time.time()
+            if t.get("ok"):
+                self.trade_fails = 0
+                self.trade_next = now + 60
+            else:
+                self.trade_fails += 1
+                wait = TRADE_GIVEUP_SEC if self.trade_fails >= TRADE_MAX_FAILS else TRADE_RETRY_SEC
+                self.trade_next = now + wait
+                self.log(f"box trade failed ({self.trade_fails} in a row) -> next try in {wait // 60} min")
+
+    def trade_tick(self):
+        """True while a box trade takes over this character (leveling paused)."""
+        if not TRADE_BOXES:
+            return False
+        hub = self.hub
+        t = self.my_trade
+        if t is None:
+            t = hub.trade
+            if t is None and self.name != hub.trade_to:
+                t = self.maybe_start_trade()
+            if t is None or self.name not in (t["alt"], t["lead"]):
+                return False
+            self.my_trade, self.trade_sent, self.trade_filled = t, 0, False
+            if self.name == t["lead"]:
+                self.log(f"{t['alt']} has {t['n']} Box(es) of Kundun for me -> going to the Lorencia bar")
+        if hub.trade is not t:
+            self.trade_cleanup(t)
+            return False
+        other = hub.snapshot().get(t["lead"] if self.name == t["alt"] else t["alt"]) or {}
+        if self.bcs or other.get("bc"):
+            self.trade_end(t, False, "Blood Castle comes first")
+        elif not other.get("online") or other.get("paused"):
+            self.trade_end(t, False, "the other character is offline / paused")
+        elif time.time() - t["start"] > TRADE_TIMEOUT:
+            self.trade_end(t, False, f"took more than {TRADE_TIMEOUT}s (phase {t['phase']})")
+        if hub.trade is not t:
+            self.trade_cleanup(t)
+            return False
+        self.mode = "trade"
+        if (self.c.s.get("hp") or 0) <= 0:
+            return True
+        try:
+            if self.name == t["alt"]:
+                self.trade_alt(t, other)
+            else:
+                self.trade_lead(t)
+        except Exception as e:
+            self.log(f"box trade error: {e!r}")
+        return True
+
+    def trade_alt(self, t, lead):
+        c, s = self.c, self.c.s
+        now = time.time()
+        m, x, y = TRADE_SPOT
+        if t["phase"] == "gather":
+            here = self.go(m, "Lorencia", x, y + 2, radius=1)
+            if here and lead.get("map") == m and lead.get("x") is not None and \
+                    math.hypot(lead["x"] - s["x"], lead["y"] - s["y"]) <= 3:
+                self.trade_phase(t, "request")
+            return
+        st = self.ev(B.TRADE_STATE_JS) or {}
+        if t["phase"] == "request":
+            if st.get("open"):
+                self.trade_phase(t, "fill")
+                return
+            if now - self.trade_sent < 8:
+                return
+            if t["requests"] >= 3:
+                return self.trade_end(t, False, f"{t['lead']} never opened the trade window")
+            c.set_helper(False)
+            c.close_windows()
+            res = self.ev(B.TRADE_REQUEST_JS, t["lead"])
+            t["requests"] += 1
+            self.trade_sent = now
+            self.log(f"box trade: request to {t['lead']}: {res}")
+            return
+        if not st.get("open"):
+            if t["phase"] == "confirm":
+                time.sleep(1)
+                left = len(self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or [])
+                self.boxes = left
+                if left < t["n"]:
+                    return self.trade_end(t, True, f"done, {t['n'] - left} box(es) given, {left} left")
+                return self.trade_end(t, False, "trade window closed, boxes still in my bag")
+            return self.trade_end(t, False, "trade window closed before confirming")
+        if t["phase"] == "fill":
+            if not self.trade_filled:
+                slots = self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or []
+                if not slots:
+                    return self.trade_end(t, False, "no boxes in the bag any more")
+                t["n"] = len(slots)
+                self.log(f"box trade: putting {len(slots)} box(es) in the trade window")
+                for slot in slots:     # Inventory (0) -> my trade window (1)
+                    for _ in range(8):
+                        if not (self.ev(B.TRADE_STATE_JS) or {}).get("busy"):
+                            break
+                        time.sleep(0.4)
+                    self.ev("(i) => window.__store.autoMoveItem(0, i, 1)", slot)
+                    time.sleep(0.6)
+                self.trade_filled = True
+                t["filled_at"] = time.time()
+                return
+            if st.get("mine", 0) >= t["n"]:
+                time.sleep(1)
+                self.ev("() => window.__eco.setMyConfirm(true)")
+                self.trade_phase(t, "confirm")
+            elif now - t.get("filled_at", now) > 10:
+                self.trade_end(t, False, f"only {st.get('mine', 0)}/{t['n']} boxes reached the trade window")
+            return
+        if t["phase"] == "confirm" and now - t["phase_at"] > 15:
+            self.trade_end(t, False, f"{t['lead']} did not confirm")
+
+    def trade_lead(self, t):
+        c = self.c
+        m, x, y = TRADE_SPOT
+        if t["phase"] == "gather":
+            self.go(m, "Lorencia", x, y, radius=1)
+            return
+        st = self.ev(B.TRADE_STATE_JS) or {}
+        if st.get("req") and not st.get("open"):
+            text = self.ev("() => JSON.stringify(window.__eco.tradeRequest || null)") or ""
+            c.set_helper(False)
+            self.log(f"box trade: accepting trade request {text[:80]}")
+            self.ev("() => window.__eco.answerTradeRequest(true)")
+            return
+        if t["phase"] == "confirm" and st.get("open") and not st.get("myOk") \
+                and st.get("yours", 0) >= t["n"] and st.get("yourOk"):
+            time.sleep(0.5)
+            self.log(f"box trade: {st.get('yours')} box(es) in the window -> confirming")
+            self.ev("() => window.__eco.setMyConfirm(true)")
+
     # ── Blood Castle ──
     def read_bc_timer(self):
         now = time.time()
@@ -675,7 +967,9 @@ class Agent:
             o = self.hub.open_at
             if since <= B.BC_DOOR_CLOSE_SEC and (o is None or not (now - B.BC_DOOR_CLOSE_SEC - 60 <= o <= now)):
                 self.hub.open_at = now - since
-                self.log(f"BC: entry window is open ({int(since)}s ago, timer says {t!r}) -> planning entries")
+                if self.open_logged != round(now - since):
+                    self.open_logged = round(now - since)
+                    self.log(f"BC: entry window is open ({int(since)}s ago, timer says {t!r}) -> planning entries")
             return
         secs = t["secs"]
         since = 3600 - secs
@@ -735,7 +1029,7 @@ class Agent:
         if b["phase"] == "climb":
             if b["role"] == "reset" and (s.get("resets") or 0) == b.setdefault("resets0", s.get("resets") or 0):
                 pass              # not reset yet: the level is still the old one
-            elif min(lo + BC_ENTER_MARGIN, hi) <= lvl <= hi:
+            elif bc_entry_level(tier) <= lvl <= hi:
                 self.log(f"BC{tier}: level {lvl} is in range ({lo}-{hi}) -> stop leveling, holding")
                 b["phase"] = "prep"
             elif lvl > hi:
@@ -744,11 +1038,15 @@ class Agent:
             if b["phase"] == "prep":
                 pass
             elif since_open > -BC_CLIMB_DEADLINE:
-                self.bc_done(f"did not reach level {lo + BC_ENTER_MARGIN} in time (level {lvl})")
+                self.bc_done(f"did not reach level {bc_entry_level(tier)} in time (level {lvl})")
                 return False
             else:
                 return False      # keep leveling (and resetting) toward the range
         self.mode = "bc"
+        if b["phase"] == "prep" and lvl < DEVIAS_MIN_LEVEL and not in_bc(s.get("map")):
+            self.log(f"BC{tier}: level {lvl} is too low for /move Devias ({DEVIAS_MIN_LEVEL}) -> leveling a bit first")
+            b["phase"] = "climb"
+            return False
         if b["phase"] == "prep":
             if in_bc(s.get("map")):
                 b["phase"], b["entered"] = "inside", True
@@ -839,7 +1137,14 @@ class Agent:
                     ok = True
                     break
         self.ev("() => { window.__store.closeNpcShop(); window.__store.inventoryEnabled = false; }")
-        self.log(f"BC: cloak +{tier} {'bought' if ok else 'NOT bought (slot %s)' % slot}")
+        if ok:
+            self.log(f"BC: cloak +{tier} bought")
+        else:
+            note = self.ev("() => (window.__store.notifications || []).slice(-2)"
+                           ".map(n => n.text || n.message || JSON.stringify(n))") or []
+            chat = (self.ev(G.CHAT_LINES_JS) or [])[-2:]
+            self.log(f"BC: cloak +{tier} NOT bought (slot {slot}) | zen {self.c.s.get('money')} | "
+                     f"game says: {note} {chat}")
         return ok
 
     def prepare_and_enter(self, b, since_open):
@@ -964,10 +1269,12 @@ class Agent:
         if not b.get("inviting"):
             b["inviting"] = True
             self.log("BC: no invite came -> inviting the players here myself")
+        counts = b.setdefault("invite_n", {})
         for n in players:
-            if n in party or now - b["invited"].get(n, 0) < BC_INVITE_EVERY:
+            if n in party or now - b["invited"].get(n, 0) < BC_INVITE_EVERY or counts.get(n, 0) >= BC_INVITE_MAX:
                 continue
             b["invited"][n] = now
+            counts[n] = counts.get(n, 0) + 1
             res = self.ev(B.INVITE_BY_NAME_JS, n)
             self.log(f"BC: party invite {n}: {res}")
 
@@ -1076,7 +1383,7 @@ def build_plan(hub, open_at, taken=None, skip=()):
                         key=lambda n: (avail[n]["level"], n))
         if inside and t not in taken:
             taken[t] = inside[0]
-            assign[inside[0]] = (t, "hold")
+            assign[inside[0]] = (t, "hold" if avail[inside[0]]["level"] >= DEVIAS_MIN_LEVEL else "climb")
             why[inside[0]] = f"lvl {avail[inside[0]]['level']}"
     # climbers: nearest free castle above them they can reach in time (lowest levels pick first)
     for n in sorted((n for n in avail if n not in assign), key=lambda n: (avail[n]["level"], n)):
@@ -1085,11 +1392,11 @@ def build_plan(hub, open_at, taken=None, skip=()):
         for t, lo, hi in BC_TIERS:
             if t in taken or lo <= lvl:
                 continue
-            need = lo + BC_ENTER_MARGIN - lvl
+            need = bc_entry_level(t) - lvl
             if need / rate <= left_min:
                 taken[t] = n
                 assign[n] = (t, "climb")
-                why[n] = f"lvl {lvl} -> {lo + BC_ENTER_MARGIN}, ~{need / rate:.0f} min"
+                why[n] = f"lvl {lvl} -> {bc_entry_level(t)}, ~{need / rate:.0f} min"
             break   # only the NEAREST free castle above (the next ones are even further)
     # nobody in BC1: the leftover closest to the reset level resets and climbs to it
     if 1 not in taken:
@@ -1098,14 +1405,14 @@ def build_plan(hub, open_at, taken=None, skip=()):
         for n in (n for n in avail if n not in assign):
             lvl = avail[n]["level"]
             rate = max(avail[n].get("rate") or BC_DEFAULT_RATE, 1.0)
-            mins = max(rl - lvl, 0) / rate + BC_RESET_OVERHEAD + (lo1 + BC_ENTER_MARGIN) / BC_LOW_RATE
+            mins = max(rl - lvl, 0) / rate + BC_RESET_OVERHEAD + bc_entry_level(1) / BC_LOW_RATE
             if mins <= left_min and (best is None or mins < best[0]):
                 best = (mins, n, lvl)
         if best:
             mins, n, lvl = best
             taken[1] = n
             assign[n] = (1, "reset")
-            why[n] = f"lvl {lvl} -> reset -> {lo1 + BC_ENTER_MARGIN}, ~{mins:.0f} min"
+            why[n] = f"lvl {lvl} -> reset -> {bc_entry_level(1)}, ~{mins:.0f} min"
     return assign, why
 
 
@@ -1160,26 +1467,32 @@ def read_keys(hub, agents):
                 if k == G.PAUSE_KEY:
                     if all(a.name in hub.paused for a in agents):
                         hub.paused.clear()
+                        hub.pause_all = False
                         log("=== RESUMING EVERYONE ===")
                     else:
+                        hub.pause_all = True
                         hub.paused.update(a.name for a in agents)
-                        log("=== PAUSING EVERYONE (P again to resume) ===")
+                        log("=== PAUSING EVERYONE (P again to resume; windows stay minimized, "
+                            "use 1-5 to open one) ===")
                 elif k.isdigit() and 1 <= int(k) <= len(agents):
-                    n = agents[int(k) - 1].name
-                    if n in hub.paused:
-                        hub.paused.discard(n)
+                    a = agents[int(k) - 1]
+                    if a.name in hub.paused:
+                        hub.paused.discard(a.name)
                     else:
-                        hub.paused.add(n)
+                        hub.pause_all = False
+                        hub.paused.add(a.name)
         except Exception:
             pass
     flag = G.BASE_DIR / G.PAUSE_FILE
     if flag.exists():
         if not getattr(read_keys, "file_paused", False):
             read_keys.file_paused = True
+            hub.pause_all = True
             hub.paused.update(a.name for a in agents)
             log("=== PAUSE file found: everyone paused (delete it to resume) ===")
     elif getattr(read_keys, "file_paused", False):
         read_keys.file_paused = False
+        hub.pause_all = False
         hub.paused.clear()
         log("=== PAUSE file removed: resuming everyone ===")
 
