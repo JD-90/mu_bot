@@ -51,9 +51,12 @@ BC_MAPS       = {11, 12, 13, 14, 15, 16, 17, 52}
 def in_bc(m):
     return m in BC_MAPS
 BC_START      = (12, 6)
+BC_WAIT       = (13, 13)            # wait here (by the bridge) until the castle starts; falls back to
+                                    # the nearest walkable tile within 2, then to BC_START
 ARCHANGEL     = (12, 12)            # stand here to deliver / wait for the boxes (Archangel ≈ 12,11)
 ARCHANGEL_NPC = 232
-WEAPON        = (13, 19)            # Archangel's weapon (staff / sword / crossbow)
+WEAPON        = (5, 10)             # Archangel's weapon: "Weapon of Archangel" [5/10 lvl 0] (seen 2026-10-10, BC3)
+WEAPON_CODES  = [(5, 10), (0, 19), (4, 18)]   # 5/10 confirmed; sword 0/19 / crossbow 4/18 = classic codes, unconfirmed
 BOX           = (14, 11, 12)        # Box of Kundun +5
 STATUE        = (13, 93)            # walk towards the statue (weapon drops at ≈13,95)
 STATUE_RADIUS = 3                   # this close -> helper on to destroy the statue
@@ -105,6 +108,62 @@ INV_COUNT_JS = """
     i >= 12 && it && it.group === g && it.num === n && (l === null || it.lvl === l)).length
 """
 
+# how many Archangel weapons (any of WEAPON_CODES) are in the bag
+WEAPON_INV_JS = """
+(codes) => (window.__store.playerData.items || []).filter((it, i) =>
+    i >= 12 && it && codes.some(([g, n]) => it.group === g && it.num === n)).length
+"""
+
+# what is open on screen (store windows + visible DOM dialogs), to learn the post-delivery dialog
+OPEN_UI_JS = """
+() => {
+  const s = window.__store, out = {flags: [], dom: []};
+  for (const k of Object.keys(s)) if (/Enabled$/.test(k) && k !== 'minimapEnabled' && s[k] === true) out.flags.push(k);
+  for (const k of ['msgWin', 'npcShop', 'pendingNpcTalk', 'offlineNpcWindow'])
+    if (s[k]) { let v; try { v = JSON.stringify(s[k]).slice(0, 200); } catch (e) { v = String(s[k]); } out.flags.push(k + '=' + v); }
+  if (window.__commands && window.__commands.windowOpen) out.flags.push('commands.windowOpen');
+  for (const b of document.querySelectorAll('button, [role=button], .mu-button, [class*=button], [class*=btn]')) {
+    const r = b.getBoundingClientRect(), t = (b.textContent || '').trim();
+    if (r.width && r.height && t && t.length < 20) out.dom.push(t);
+  }
+  out.dom = [...new Set(out.dom)].slice(0, 30);
+  return out;
+}
+"""
+
+# the game's message window (e.g. the one the Archangel leaves after the delivery; it stays on
+# screen even after leaving the castle). Returns its text and closes it: closeMsgWin / msgWinOk /
+# a visible OK button. null = nothing open.
+MSGWIN_JS = """
+() => {
+  const s = window.__store; if (!s || !s.msgWin) return null;
+  let txt; try { txt = JSON.stringify(s.msgWin).slice(0, 300); } catch (e) { txt = String(s.msgWin); }
+  let how = null;
+  try { if (typeof s.closeMsgWin === 'function') { s.closeMsgWin(); how = 'closeMsgWin'; } } catch (e) {}
+  try { if (s.msgWin && typeof s.msgWinOk === 'function') { s.msgWinOk(); how = 'msgWinOk'; } } catch (e) {}
+  if (s.msgWin) {
+    for (const b of document.querySelectorAll('button, [role=button], .mu-button, [class*=button], [class*=btn]')) {
+      const r = b.getBoundingClientRect(), t = (b.textContent || '').trim();
+      if (r.width && r.height && /^(ok|aceptar)$/i.test(t)) { b.click(); how = 'clicked ' + t; break; }
+    }
+  }
+  return {txt, how, still: !!s.msgWin};
+}
+"""
+MSGWIN_CHECK_SEC = 5                  # look for an open message window this often
+
+# click a visible OK / Close button (fallback when closing the store windows didn't clear the dialog)
+CLICK_OK_JS = """
+() => {
+  const want = /^(ok|close|cerrar|aceptar|confirm|continue|x)$/i;
+  for (const b of document.querySelectorAll('button, [role=button], .mu-button, [class*=button], [class*=btn]')) {
+    const r = b.getBoundingClientRect(), t = (b.textContent || '').trim();
+    if (r.width && r.height && want.test(t)) { b.click(); return t; }
+  }
+  return null;
+}
+"""
+
 TALK_NPC_JS = """
 (t) => {
   const w = window.__world, h = w.playerEntity; if (!h) return false;
@@ -115,6 +174,18 @@ TALK_NPC_JS = """
   if (!e) return false;
   window.__store.talkToNpc({netId: e.netId, name: e.objectNameInWorld, npcType: e.npcType});
   return true;
+}
+"""
+
+WAIT_SPOT_JS = """
+([x, y, fx, fy]) => {
+  const w = window.__world;
+  if (!w || !w.isWalkable) return [fx, fy];
+  for (let r = 0; r <= 2; r++)
+    for (let dx = -r; dx <= r; dx++)
+      for (let dy = -r; dy <= r; dy++)
+        if (Math.max(Math.abs(dx), Math.abs(dy)) === r && w.isWalkable(x + dx, y + dy)) return [x + dx, y + dy];
+  return [fx, fy];
 }
 """
 
@@ -157,8 +228,10 @@ SCAN_JS = """
 # ground-item name fallback when the 13/19 code doesn't match. Only group-13 items, and only the
 # quest weapons: "archangel|divine" also matched Divine Boots/Gloves (11/19, 10/19) and the
 # Scroll of Archangel (13/16) -> 2026-10-10 13:05 castle lost by three characters "delivering" armor.
-WEAPON_NAME_RE = "(staff|sword|crossbow) of archangel"
-DELIVER_TIMEOUT_SEC = 3               # talking to the Archangel this long with no 13/19 in the bag -> not the weapon
+# 2026-10-10 14:07: the ground name is exactly "Weapon of Archangel" (5/10). Anchored, so traded
+# "Excellent Staff of Archangel +14", Divine armor and the Scroll of Archangel never match.
+WEAPON_NAME_RE = "^(weapon|staff|sword|crossbow) of archangel$"
+DELIVER_TIMEOUT_SEC = 3               # talking to the Archangel this long with no weapon in the bag -> not the weapon
 GROUND_RADIUS  = 15                   # ground-item dump radius near the statue
 GROUND_NEAR    = 12                   # start dumping the ground this close to the statue
 GROUND_LOG_SEC = 5                    # check the ground this often near the statue
@@ -191,7 +264,7 @@ WEAPON_SCAN_JS = """
   for (const e of w.netObjsQuery.entities) {
     if (!e.droppedItem || e.droppedItem.isMoney) continue;
     const it = e.droppedItem, name = e.objectNameInWorld || '';
-    const byCode = it.group === g && it.num === n, byName = it.group === g && rx.test(name);
+    const byCode = it.group === g && it.num === n, byName = rx.test(name.trim());
     if (!byCode && !byName) continue;
     out.push({id: e.netId, name, g: it.group, n: it.num, lvl: it.item ? it.item.lvl : null,
               by: byCode ? 'code' : 'name',
@@ -241,6 +314,28 @@ BUY_JS = """
 KUNDUN_SLOTS_JS = """
 (minLvl) => (window.__store.playerData.items || []).map((it, i) =>
     (i >= 12 && it && it.group === 14 && it.num === 11 && it.lvl >= minLvl) ? i : -1).filter(i => i >= 0)
+"""
+
+# free bag cells for 1x1 items (boxes). Bag = slots 12..75 (8 columns x 8 rows). An item sits in its
+# top-left slot; its size comes from the item if the client gives one, otherwise 1x1 is assumed,
+# so this can over-count (never under-count). keys = the first item's field names (to learn sizes).
+BAG_FREE_JS = """
+() => {
+  const items = window.__store.playerData.items || [], used = new Array(64).fill(false);
+  let keys = null, sized = 0;
+  const num = v => (typeof v === 'number' && v >= 1 && v <= 4) ? v : null;
+  for (let i = 12; i < 76; i++) {
+    const it = items[i]; if (!it) continue;
+    if (!keys) keys = Object.keys(it).join(',');
+    const d = it.def || it.info || it.attr || {};
+    const w = num(it.width) || num(it.w) || num(d.width) || num(d.w) || 1;
+    const h = num(it.height) || num(it.h) || num(d.height) || num(d.h) || 1;
+    if (w > 1 || h > 1) sized++;
+    const c0 = (i - 12) % 8, r0 = Math.floor((i - 12) / 8);
+    for (let r = r0; r < Math.min(8, r0 + h); r++) for (let c = c0; c < Math.min(8, c0 + w); c++) used[r * 8 + c] = true;
+  }
+  return {free: used.filter(u => !u).length, sized, keys};
+}
 """
 
 TRADE_STATE_JS = """
@@ -730,7 +825,7 @@ class BloodCastle:
             self.walk_in_castle(c, *ARCHANGEL, radius=2)
             return
         if not st or st.get("st") not in (1, 4):
-            self.go(c, c.s.get("map"), "", *BC_START, radius=2)   # waiting for the castle to start
+            self.go(c, c.s.get("map"), "", *(self.ev(c, WAIT_SPOT_JS, [*BC_WAIT, *BC_START]) or BC_START), radius=2)   # waiting for the castle to start
             return
         weapon = self.scan(c, WEAPON, r=CLEAR_RADIUS)
         if weapon["items"]:
@@ -758,7 +853,7 @@ class BloodCastle:
             return
         if not in_bc(lead.s.get("map")) or (lead.s.get("hp") or 0) <= 0:
             c.set_helper(False)
-            self.go(c, c.s.get("map"), "", *BC_START, radius=2)    # wait in the castle
+            self.go(c, c.s.get("map"), "", *(self.ev(c, WAIT_SPOT_JS, [*BC_WAIT, *BC_START]) or BC_START), radius=2)    # wait in the castle
             return
         lx, ly = lead.s.get("x"), lead.s.get("y")
         if dist(c.s, lx, ly) > FOLLOW_DIST:

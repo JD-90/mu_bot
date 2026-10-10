@@ -34,12 +34,16 @@ Box trading (TRADE_BOXES):
     confirms, and both go back to leveling at the same spot. One trade at a time; never around Blood
     Castle time. A failed trade is retried later (TRADE_RETRY_SEC), and after TRADE_MAX_FAILS
     failures in a row that alt waits TRADE_GIVEUP_SEC.
+  * The main publishes his free bag cells every 30 s. Nobody offers him boxes when he has less than
+    TRADE_MIN_FREE free, an alt gives only as many as fit, and a trade that fails although it should
+    have fit marks him full until his free space goes up (or TRADE_FULL_SEC passes).
 
 Run:   run_auto.bat           Stop: Ctrl+C in the console window.
 Pause: P pauses / resumes EVERY character. Keys 1-5 pause / resume ONE character (order of
        accounts.json). A paused character's window is restored so you can play it; the others
        keep going. While paused, everything you do in that window is written to mu_record.log
-       (mu_recorder.py) so new events can be learned from it.
+       (mu_recorder.py) so new events can be learned from it. Characters in BIG_ON_PAUSE get a
+       maximized window at full render scale while paused (back to 800x500 / low on resume).
 """
 import math
 import socket
@@ -84,6 +88,9 @@ BC_INVITE_MAX       = 2     # inside: invite the same stranger at most this many
 
 # windows
 WINDOW_CHECK_EVERY  = 30    # seconds between window checks
+BIG_ON_PAUSE        = {"wizzardo"}  # these characters get a maximized, sharp window when you pause
+                                    # them with 1-5 (back to 800x500 / low graphics on resume)
+BIG_RENDER_SCALE    = 100   # Render scale (%) while big; None = leave it as the bot set it
 REMINIMIZE_RESTORED = False # True = re-minimize any window that got restored (the old behaviour).
                             # False = a window you restore by hand stays open until you minimize it again
 
@@ -121,6 +128,9 @@ TRADE_OFFLINE_GRACE = 10    # the other side may look offline this long (map loa
 TRADE_RETRY_SEC     = 600   # a failed trade: that alt tries again after this long
 TRADE_MAX_FAILS     = 3     # ... and after this many failures in a row ...
 TRADE_GIVEUP_SEC    = 3600  # ... it waits this long
+TRADE_MIN_FREE      = 1     # the main needs at least this many free bag cells, or nobody offers him boxes
+TRADE_FULL_SEC      = 7200  # a trade the main failed to take while his bag looked big enough -> treat him
+                            # as full until his free space goes up (or this long passes)
 TRADE_BC_QUIET      = 180   # no new trades from BC_PLAN_SEC + this before a castle opens until the door closes
 # ──────────────────────────────────────────────────────────────────
 
@@ -201,6 +211,7 @@ class Hub:
         self.plan = None             # {"key", "open_at", "assign": {name: (tier, role)}, "started", "out"}
         self.trade = None            # box trade in progress: {"alt", "lead", "phase", "start", "phase_at", "n", ...}
         self.trade_to = TRADE_TO or (names[0] if names else None)
+        self.lead_full = None        # {"free", "at"}: the main couldn't take boxes -> no trades until he has more room
         self.paused = set()
         self.pause_all = False       # P / PAUSE file: everyone paused, windows stay minimized
         self.stop = False
@@ -244,8 +255,14 @@ class Agent:
         self.anchor_name = None
         self.win_check = 0
         self.user_opened = False     # you restored this window by hand: keep_minimized leaves it open
+        self.big = False             # window maximized for manual play (BIG_ON_PAUSE)
+        self.msgwin_at = 0
         self.open_logged = None
         self.boxes = 0               # Boxes of Kundun (+1..+5) in my bag (checked every 30 s)
+        self.bag_free = None         # main only: free bag cells (checked every 30 s)
+        self.bag_free_at = 0
+        self.bag_keys_logged = False
+        self.bag_low_logged = False
         self.boxes_at = 0
         self.my_trade = None
         self.trade_next = 0
@@ -299,6 +316,62 @@ class Agent:
         except Exception:
             return None
 
+    def go_big(self):
+        """Maximize the window and make the game fill it, with a sharper render scale."""
+        c, page = self.c, self.c.page
+        self.big = True
+        try:
+            cdp = page.context.new_cdp_session(page)
+            win = cdp.send("Browser.getWindowForTarget")["windowId"]
+            cdp.send("Browser.setWindowBounds", {"windowId": win, "bounds": {"windowState": "normal"}})
+            time.sleep(0.5)
+            b = cdp.send("Browser.getWindowBounds", {"windowId": win})["bounds"]
+            vp = page.viewport_size or {"width": G.WINDOW_SIZE[0], "height": G.WINDOW_SIZE[1]}
+            extra_w, extra_h = b["width"] - vp["width"], b["height"] - vp["height"]   # borders + toolbar
+            cdp.send("Browser.setWindowBounds", {"windowId": win, "bounds": {"windowState": "maximized"}})
+            time.sleep(0.8)
+            b = cdp.send("Browser.getWindowBounds", {"windowId": win})["bounds"]
+            cdp.detach()
+            c.minimized = False
+            w, h = max(800, b["width"] - extra_w), max(500, b["height"] - extra_h)
+            page.set_viewport_size({"width": w, "height": h})
+            self.log(f"window maximized for manual play ({w}x{h})")
+        except Exception as e:
+            self.log(f"could not maximize the window: {e!r}")
+        if BIG_RENDER_SCALE:
+            self.options_render_scale(BIG_RENDER_SCALE)
+
+    def go_small(self):
+        """Back to the bot's 800x500 window and low graphics (then it gets minimized as usual)."""
+        c, page = self.c, self.c.page
+        self.big = False
+        try:
+            page.set_viewport_size({"width": G.WINDOW_SIZE[0], "height": G.WINDOW_SIZE[1]})
+            c.set_window("normal")      # un-maximize; the main tick minimizes it again
+            self.user_opened = False
+        except Exception as e:
+            self.log(f"could not shrink the window: {e!r}")
+        c.gfx_done = False              # main tick re-applies the Low preset + bot render scale
+
+    def options_render_scale(self, value):
+        page = self.c.page
+        try:
+            page.evaluate("() => { window.__store.optionsEnabled = true; }")
+            time.sleep(1.0)
+            page.get_by_text("Quality", exact=True).first.click()
+            time.sleep(0.5)
+            self.c.set_render_scale(value)
+        except Exception as e:
+            self.log(f"render scale error: {e!r}")
+        finally:
+            try:
+                close = page.get_by_text("Close", exact=True)
+                if close.count():
+                    close.first.click()
+                page.evaluate("() => { window.__store.optionsEnabled = false; }")
+            except Exception:
+                pass
+
     def keep_minimized(self):
         """Windows get restored behind the bot's back (Windows focus, a reload, a click on the
         taskbar...). Every WINDOW_CHECK_EVERY seconds: not paused with 1-5 / no click needed ->
@@ -343,7 +416,7 @@ class Agent:
             "step": self.step_key, "spot": None if self.scouting else self.spot_idx,
             "scouting": self.scouting, "step_since": self.step_since, "arrived": self.arrived,
             "target": target, "rate": self.recent_rate(),
-            "bc": self.bcs is not None, "boxes": self.boxes,
+            "bc": self.bcs is not None, "boxes": self.boxes, "bag_free": self.bag_free,
         })
 
     def recent_rate(self):
@@ -377,6 +450,9 @@ class Agent:
             c.last_ingame = time.time()
             c.was_online = True
             c.select_tries = 0
+            self.check_msgwin()
+            if TRADE_BOXES and self.name == hub.trade_to:
+                self.update_bag_free()
             if not c.gfx_done:
                 c.set_low_graphics()
             elif G.MINIMIZE_WINDOWS and not c.minimized and not G.HEADLESS and not self.show_window:
@@ -455,6 +531,8 @@ class Agent:
             bc += f" | box trade {t['alt']} -> {t['lead']} ({t['phase']})"
         elif self.boxes:
             bc += f" | {self.boxes} Kundun box(es)"
+        if self.name == self.hub.trade_to and self.bag_free is not None:
+            bc += f" | bag {self.bag_free} free" + (" (FULL for trades)" if self.hub.lead_full else "")
         self.log(f"lvl {s.get('level')} r{s.get('resets')} | {where} | "
                  f"{'%.1f' % r if r is not None else '?'} lvl/min | hp {s.get('hp')}/{s.get('maxHP')} | "
                  f"party {s.get('party')}{bc}")
@@ -509,6 +587,8 @@ class Agent:
                 c.set_helper(False)
         except Exception as e:
             self.log(f"pause: {e!r}")
+        if self.show_window and self.name.lower() in {n.lower() for n in BIG_ON_PAUSE} and not G.HEADLESS:
+            self.go_big()
         c.rec.start()               # write down what you do while you play it (mu_recorder.py)
 
     def resume(self):
@@ -516,6 +596,8 @@ class Agent:
         self.show_window = False
         c = self.c
         c.rec.stop()
+        if self.big:
+            self.go_small()
         now = time.time()
         c.walk_target, c.relocating, c.following = None, True, False
         c.last_follow_check, c.last_warp, c.last_ingame = now, 0, now
@@ -802,6 +884,30 @@ class Agent:
                 self.boxes = len(slots)
         return self.boxes
 
+    def update_bag_free(self):
+        """Main only: free bag cells, published so the alts know whether a trade can fit."""
+        now = time.time()
+        if now - self.bag_free_at < 30:
+            return
+        self.bag_free_at = now
+        r = self.ev(B.BAG_FREE_JS)
+        if not r:
+            return
+        prev, self.bag_free = self.bag_free, r["free"]
+        hub = self.hub
+        if not self.bag_keys_logged and r.get("keys"):
+            self.bag_keys_logged = True
+            self.log(f"bag: {r['free']} free cells ({r.get('sized')} item(s) bigger than 1x1 found) | "
+                     f"item fields: {r['keys']}")
+        if hub.lead_full and (self.bag_free > hub.lead_full["free"] or now - hub.lead_full["at"] > TRADE_FULL_SEC):
+            self.log(f"bag: {self.bag_free} free cells now -> taking boxes again")
+            hub.lead_full = None
+        if self.bag_free < 5 and not self.bag_low_logged:
+            self.bag_low_logged = True
+            self.log(f"bag: only {self.bag_free} free cell(s) left -> make room for more Boxes of Kundun")
+        elif self.bag_free >= 5:
+            self.bag_low_logged = False
+
     def trade_quiet(self):
         """True around Blood Castle time: no new trades then."""
         o = self.hub.open_at
@@ -826,11 +932,17 @@ class Agent:
         if lead.get("map") != s.get("map") or lead.get("x") is None or \
                 math.hypot(lead["x"] - s["x"], lead["y"] - s["y"]) > TRADE_MEET_RADIUS:
             return None
+        free = lead.get("bag_free")
+        if hub.lead_full or (free is not None and free < TRADE_MIN_FREE):
+            if now - getattr(self, "full_logged", 0) > 1800:
+                self.full_logged = now
+                self.log(f"{hub.trade_to}'s bag is full ({free} free) -> keeping my {self.boxes} box(es) for now")
+            return None
         with hub.lock:
             if hub.trade is not None:
                 return None
             t = {"alt": self.name, "lead": hub.trade_to, "phase": "meet", "start": now, "phase_at": now,
-                 "n": self.boxes, "requests": 0, "ok": False}
+                 "n": self.boxes, "requests": 0, "ok": False, "lead_free": free}
             hub.trade = t
         self.log(f"met {hub.trade_to} with {self.boxes} Box(es) of Kundun -> trading right here")
         return t
@@ -958,8 +1070,11 @@ class Agent:
                 time.sleep(1)
                 left = len(self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or [])
                 self.boxes = left
-                if left < t["n"]:
-                    return self.trade_end(t, True, f"done, {t['n'] - left} box(es) given, {left} left")
+                before = t.get("before", t["n"])
+                if left < before:
+                    return self.trade_end(t, True, f"done, {before - left} box(es) given, {left} left")
+                # both confirmed and nothing moved: most likely his bag had no room
+                self.mark_lead_full(t)
                 return self.trade_end(t, False, "trade window closed, boxes still in my bag")
             return self.trade_end(t, False, "trade window closed before confirming")
         if t["phase"] == "fill":
@@ -973,6 +1088,11 @@ class Agent:
                 slots = self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or []
                 if not slots:
                     return self.trade_end(t, False, "no boxes in the bag any more")
+                t["before"] = len(slots)
+                cap = t.get("lead_free")
+                if cap is not None and cap < len(slots):
+                    self.log(f"box trade: {t['lead']} has room for {cap} -> giving {cap} of {len(slots)}")
+                    slots = slots[:max(1, cap)]
                 t["n"] = len(slots)
                 self.log(f"box trade: putting {len(slots)} box(es) in the trade window")
                 for slot in slots:     # Inventory (0) -> my trade window (1)
@@ -997,6 +1117,15 @@ class Agent:
             return
         if t["phase"] == "confirm" and now - t["phase_at"] > 15:
             self.trade_end(t, False, f"{t['lead']} did not confirm")
+
+    def mark_lead_full(self, t):
+        """A trade that should have fit didn't go through: stop offering boxes to the main until
+        his free space goes up (he sold / stored something) or TRADE_FULL_SEC passes."""
+        hub = self.hub
+        free = (hub.snapshot().get(t["lead"]) or {}).get("bag_free")
+        hub.lead_full = {"free": free if free is not None else 0, "at": time.time()}
+        self.log(f"box trade: {t['lead']} could not take the boxes (bag says {free} free) -> "
+                 "nobody offers him boxes until he has more room")
 
     def trade_lead(self, t):
         """Stand still (helper off); accept only the alt's request; confirm when his boxes are in."""
@@ -1423,7 +1552,7 @@ class Agent:
                 for x in (bag0 or []):
                     if x in new:
                         new.remove(x)
-                real = [x for x in new if x.startswith(f"{B.WEAPON[0]}/{B.WEAPON[1]}/")]
+                real = [x for x in new if any(x.startswith(f"{g}/{n}/") for g, n in B.WEAPON_CODES)]
                 if real or (bag0 is None and holder not in (None, 255)):
                     b["we_have"] = True
                     self.log(f"BC: weapon picked up -> new in bag: {new or 'nothing?'}, "
@@ -1435,7 +1564,7 @@ class Agent:
                 elif time.time() - t0 > 4:
                     self.log("BC: weapon left the ground but nothing changed for us -> rescanning")
                     b["pick_try"] = None
-        in_bag = self.inv(B.WEAPON) > 0
+        in_bag = (self.ev(B.WEAPON_INV_JS, [list(x) for x in B.WEAPON_CODES]) or 0) > 0
         has_weapon = in_bag or b.get("we_have")
         if has_weapon:
             if not self.walk_in_castle(b, *B.ARCHANGEL, radius=2):
@@ -1446,7 +1575,7 @@ class Agent:
                 t0 = b.get("deliver_at")
                 if t0 and time.time() - t0 > B.DELIVER_TIMEOUT_SEC:
                     self.log(f"BC: still 'delivering' after {B.DELIVER_TIMEOUT_SEC}s and no "
-                             f"{B.WEAPON[0]}/{B.WEAPON[1]} in the bag -> it was not the weapon, carrying on")
+                             "Archangel weapon in the bag -> it was not the weapon, carrying on")
                     b["we_have"], b["deliver_at"] = False, None
                     return True
             if time.time() - b["talk_at"] > 3:
@@ -1464,7 +1593,8 @@ class Agent:
             self.walk_in_castle(b, *B.ARCHANGEL, radius=2)
             return True
         if not st or st.get("st") not in (1, 4):
-            self.go(s.get("map"), "", *B.BC_START, radius=2)   # waiting for the castle to start
+            self.go(s.get("map"), "", *(self.ev(B.WAIT_SPOT_JS, [*B.BC_WAIT, *B.BC_START]) or B.BC_START),
+                    radius=2)   # waiting for the castle to start (by the bridge)
             return True
         weapon = self.ev(B.WEAPON_SCAN_JS, [B.WEAPON[0], B.WEAPON[1], B.WEAPON_NAME_RE]) or []
         if weapon:
@@ -1487,8 +1617,38 @@ class Agent:
         self.walk_in_castle(b, tx, ty, radius=B.STATUE_RADIUS)
         return True
 
+    def check_msgwin(self):
+        """Close the game's message window (OK dialog) whenever one is open, and log its text."""
+        now = time.time()
+        if now - self.msgwin_at < B.MSGWIN_CHECK_SEC:
+            return
+        self.msgwin_at = now
+        r = self.ev(B.MSGWIN_JS)
+        if r:
+            self.log(f"message window closed ({r.get('how')}){' - STILL OPEN' if r.get('still') else ''}: {r.get('txt')}")
+
+    def close_dialogs(self, b, tag):
+        """The Archangel leaves a dialog on screen after the delivery: log what is open, close the
+        game windows, and if a dialog is still there click its OK / Close button."""
+        c = self.c
+        ui = self.ev(B.OPEN_UI_JS) or {}
+        if ui.get("flags"):
+            self.log(f"BC: open on screen ({tag}): {ui.get('flags')} | buttons {ui.get('dom')}")
+        try:
+            c.close_windows()
+        except Exception as e:
+            self.log(f"BC: close windows: {e!r}")
+        after = self.ev(B.OPEN_UI_JS) or {}
+        if after.get("flags"):
+            hit = self.ev(B.CLICK_OK_JS)
+            self.log(f"BC: still open after closing: {after.get('flags')} -> clicked {hit!r}")
+
     def end_phase(self, b, since_end):
         c, s = self.c, self.c.s
+        for t in (1, 5, 15):                  # the dialog can show up a moment after the delivery
+            if since_end >= t and t not in b.setdefault("ui_closed", set()):
+                b["ui_closed"].add(t)
+                self.close_dialogs(b, f"{t}s after the end")
         if in_bc(s.get("map")) and not b["box"] and since_end < B.END_WAIT_SEC:
             if not self.go(s.get("map"), "", *B.ARCHANGEL, radius=4) and since_end < 20:
                 return True
