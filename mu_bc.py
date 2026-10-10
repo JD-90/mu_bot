@@ -32,6 +32,8 @@ BC_PREP_SEC       = 600             # start preparing this long before the entry
 BC_DOOR_CLOSE_SEC = 300             # entry closes this long after the window opens (castle starts ~5.5 min)
 BC_INVITE_MARGIN  = 30              # stop waiting for strangers this long before the door closes
 BC_MAX_STRANGERS  = 3               # 1..3 other players -> make room for them in our party
+BC_REBUY_NEEDS_SEC = 90            # cloak missing: go buy another only if this long is left before the door closes
+BC_MAX_REBUYS     = 2             # ... and at most this many times per castle
 BC_ENTRY_NEEDS_SEC = 60             # window already open: still go if at least this long is left before the door closes
 
 BAR_SPOT      = (0, 122, 133)       # Lorencia bar (Liaman Barmaid at 123,135)
@@ -39,7 +41,15 @@ BAR_NPC       = "Liaman Barmaid"
 CLOAK         = (13, 18)            # Invisibility Cloak, item level = castle level
 SPIRIT_SPOT   = (2, 218, 29)        # Devias, next to Spirit of Archangel (217,29)
 SPIRIT_NPC    = 233
-BC_MAP        = 12                  # same map for every castle level
+BC_MAP        = 12                  # Castle 2 (kept for reference)
+# Each castle level is its OWN map (classic MU: Blood Castle 1-7 = maps 11-17, 8 = 52).
+# Only Castle 2 (map 12) had been seen, so the bot used to think a character in Castle 4
+# was outside and /move-d it back to Devias.
+BC_MAPS       = {11, 12, 13, 14, 15, 16, 17, 52}
+
+
+def in_bc(m):
+    return m in BC_MAPS
 BC_START      = (12, 6)
 ARCHANGEL     = (12, 12)            # stand here to deliver / wait for the boxes (Archangel ≈ 12,11)
 ARCHANGEL_NPC = 232
@@ -63,10 +73,12 @@ BC_TIMER_JS = """
   for (const e of document.querySelectorAll('.event-row-label')) {
     const t = (e.parentElement || e).textContent || '';
     if (!/Blood Castle/i.test(t)) continue;
+    const text = t.replace(/\\s+/g, ' ').trim().slice(0, 80);
+    if (/\\bopen/i.test(t)) return {open: true, text};      // "Open" wins over any number in the row
     const m = t.match(/(\\d+):(\\d+)(?::(\\d+))?/);
-    if (!m) return {open: true};
+    if (!m) return {open: true, text};
     const n = m.slice(1).filter(v => v !== undefined).map(Number);
-    return {secs: n.length === 3 ? n[0] * 3600 + n[1] * 60 + n[2] : n[0] * 60 + n[1]};
+    return {secs: n.length === 3 ? n[0] * 3600 + n[1] * 60 + n[2] : n[0] * 60 + n[1], text};
   }
   return null;
 }
@@ -193,16 +205,36 @@ TRADE_REQUEST_JS = """
 """
 
 # The Spirit only opens the "Messenger of Archangel" dialog; entering needs a click on the
-# castle button (client: enterBloodCastle -> BloodCastleEnterRequest). Find that button.
+# castle row. Real DOM (seen 2026-10-09):
+#   div.mu-item-window.v097d-window.v097d-event.v097d-event-castle
+#     div.v097d-event-row[role=button][data-row=0..6]  (+ class "disabled" when the
+#         character's level is outside that castle's range; the cloak doesn't matter)
+#       div.v097d-event-label  "Castle 2 (level 81-130)"
+# The whole row (354x83) is the button (React onClick on the row).
 ENTER_BUTTON_JS = """
 (tier) => {
-  const root = document.getElementById('blood-castle-enter');
+  const root = document.querySelector('.v097d-event-castle');
   if (!root) return {dialog: false};
   const re = new RegExp('Castle\\\\s*' + tier + '\\\\b');
-  const els = [...root.querySelectorAll('*')].filter(e => e.childElementCount === 0 && re.test(e.textContent || ''));
-  if (!els.length) return {dialog: true, text: (root.textContent || '').slice(0, 200)};
-  const r = els[0].getBoundingClientRect();
-  return {dialog: true, x: r.left + r.width / 2, y: r.top + r.height / 2, label: els[0].textContent};
+  const rows = [...root.querySelectorAll('.v097d-event-row')];
+  const row = rows.find(r => re.test((r.querySelector('.v097d-event-label') || r).textContent || ''))
+           || rows[tier - 1];
+  if (!row) return {dialog: true, text: (root.textContent || '').slice(0, 200)};
+  const r = row.getBoundingClientRect();
+  return {dialog: true, x: r.left + r.width / 2, y: r.top + r.height / 2,
+          label: (row.textContent || '').trim(), disabled: row.classList.contains('disabled')};
+}
+"""
+
+# fallback when the mouse click lands on something else: fire the row's click directly
+CLICK_ROW_JS = """
+(tier) => {
+  const rows = [...document.querySelectorAll('.v097d-event-castle .v097d-event-row')];
+  const re = new RegExp('Castle\\\\s*' + tier + '\\\\b');
+  const row = rows.find(r => re.test(r.textContent || '')) || rows[tier - 1];
+  if (!row) return false;
+  row.click();
+  return true;
 }
 """
 
@@ -259,7 +291,7 @@ class BloodCastle:
             c.walk_target, c.walk_best, c.walk_progress_at = (x, y), d, time.time()
         if d < c.walk_best - 0.5:
             c.walk_best, c.walk_progress_at = d, time.time()
-        elif time.time() - c.walk_progress_at > 45 and map_idx != BC_MAP:
+        elif time.time() - c.walk_progress_at > 45 and not in_bc(map_idx):
             c.log("stuck walking -> re-warping")
             c.chat(f"/move {alias}")
             c.last_warp, c.walk_target = time.time(), None
@@ -270,6 +302,14 @@ class BloodCastle:
     def inv(self, c, item):
         g, n, l = (item + (None,))[:3]
         return self.ev(c, INV_COUNT_JS, [g, n, l]) or 0
+
+    def cloak_count(self, c, tier):
+        """Cloaks of this castle level in the bag; None if the page could not be read
+        (then we don't send the character shopping by mistake)."""
+        try:
+            return c.page.evaluate(INV_COUNT_JS, [CLOAK[0], CLOAK[1], tier]) or 0
+        except Exception:
+            return None
 
     def buy_cloak(self, c, tier):
         """At the bar: buy one cloak of this castle level. True when we have one."""
@@ -385,7 +425,7 @@ class BloodCastle:
         now = time.time()
         since_open = now - a["open_at"]
         door = BC_DOOR_CLOSE_SEC
-        lead_in = lead.s.get("map") == BC_MAP
+        lead_in = in_bc(lead.s.get("map"))
         st = self.ev(lead, BC_STATE_JS) if lead_in else None
         if st and st.get("t", 0) < a["open_at"] * 1000 - 60_000:
             st = None   # left over from a previous castle
@@ -410,7 +450,7 @@ class BloodCastle:
         # who has the Archangel's weapon? one of ours (checked in every bag, every tick) or a stranger
         holder = st.get("own") if st else 255
         ours_wpn = next((m for m in g.members
-                         if m.s.get("map") == BC_MAP and self.inv(m, WEAPON) > 0), None)
+                         if in_bc(m.s.get("map")) and self.inv(m, WEAPON) > 0), None)
         a["holder"] = ours_wpn.name if ours_wpn else None
         if ours_wpn and a.get("ours_logged") != ours_wpn.name:
             a["ours_logged"] = ours_wpn.name
@@ -426,7 +466,9 @@ class BloodCastle:
             if c.name not in a["parts"]:
                 self.go(c, *self.bar_target())
                 continue
-            if c.s.get("map") == BC_MAP:
+            if in_bc(c.s.get("map")):
+                if not c.bc["entered"]:
+                    c.log(f"BC: inside the castle (map {c.s.get('map')})")
                 c.bc["entered"] = True
                 if c is lead:
                     self.leader_inside(c, st, lead_has_weapon)
@@ -458,6 +500,22 @@ class BloodCastle:
                     c.log("BC: no cloak -> staying in Lorencia")
                     a["parts"].discard(c.name)
             return
+        # never walk to / talk to the Spirit without the cloak (it is consumed on entry, so a
+        # character thrown out of the castle has none left)
+        have = self.cloak_count(c, a["tier"])
+        if have == 0 and time.time() - b["talk_at"] < 10:
+            return   # just talked: the cloak was likely consumed and the warp into the castle is loading
+        if have == 0:
+            left = BC_DOOR_CLOSE_SEC - since_open
+            b["rebuys"] = b.get("rebuys", 0) + 1
+            if left >= BC_REBUY_NEEDS_SEC and b["rebuys"] <= BC_MAX_REBUYS:
+                c.log(f"BC: no cloak +{a['tier']} in the bag -> back to the bar for another "
+                      f"({int(left)}s left before the door closes)")
+                b["cloak"] = False
+            else:
+                c.log(f"BC: no cloak +{a['tier']} and no time / too many tries -> skipping this castle")
+                a["parts"].discard(c.name)
+            return
         m, x, y = SPIRIT_SPOT
         if not self.go(c, m, "Devias", x, y, radius=1):
             return
@@ -481,11 +539,17 @@ class BloodCastle:
             if "x" not in btn:
                 c.log(f"BC: castle {a['tier']} button not found in dialog: {btn.get('text')!r}")
                 return
+            if btn.get("disabled"):
+                c.log(f"BC: '{btn.get('label')}' is greyed out (level out of range) -> skipping this castle")
+                c.close_windows()
+                a["parts"].discard(c.name)
+                return
             c.log(f"BC: clicking '{btn.get('label')}'")
             try:
                 c.page.mouse.click(btn["x"], btn["y"])
             except Exception as e:
-                c.log(f"BC: click failed {e!r}")
+                c.log(f"BC: mouse click failed {e!r} -> clicking the row from JS")
+                self.ev(c, CLICK_ROW_JS, a["tier"])
             # errors (cloak level wrong / not open / level too high) show as game notifications
             time.sleep(1.5)
             note = self.ev(c, "() => (window.__store.notifications || []).slice(-2).map(n => n.text || n.message || JSON.stringify(n))")
@@ -566,7 +630,7 @@ class BloodCastle:
         now = time.time()
         party = lead.s.get("party") or []
         ours_in = [c for c in self.g.members if c is not lead and c.name in a["parts"]
-                   and c.s.get("map") == BC_MAP]
+                   and in_bc(c.s.get("map"))]
         deadline = BC_DOOR_CLOSE_SEC - BC_INVITE_MARGIN
         if not a["party_done"] and since_open >= deadline:
             a["party_done"] = True
@@ -611,7 +675,7 @@ class BloodCastle:
             self.walk_in_castle(c, *ARCHANGEL, radius=2)
             return
         if not st or st.get("st") not in (1, 4):
-            self.go(c, BC_MAP, "", *BC_START, radius=2)   # waiting for the castle to start
+            self.go(c, c.s.get("map"), "", *BC_START, radius=2)   # waiting for the castle to start
             return
         weapon = self.scan(c, WEAPON, r=CLEAR_RADIUS)
         if weapon["items"]:
@@ -637,9 +701,9 @@ class BloodCastle:
         if self.to_archangel_mode():
             self.walk_in_castle(c, *ARCHANGEL, radius=2)
             return
-        if lead.s.get("map") != BC_MAP or (lead.s.get("hp") or 0) <= 0:
+        if not in_bc(lead.s.get("map")) or (lead.s.get("hp") or 0) <= 0:
             c.set_helper(False)
-            self.go(c, BC_MAP, "", *BC_START, radius=2)    # wait in the castle
+            self.go(c, c.s.get("map"), "", *BC_START, radius=2)    # wait in the castle
             return
         lx, ly = lead.s.get("x"), lead.s.get("y")
         if dist(c.s, lx, ly) > FOLLOW_DIST:
@@ -652,9 +716,9 @@ class BloodCastle:
         busy = False
         for c in g.members:
             b = c.bc
-            if c.s.get("map") != BC_MAP or b["box"]:
+            if not in_bc(c.s.get("map")) or b["box"]:
                 continue
-            if not self.go(c, BC_MAP, "", *ARCHANGEL, radius=4) and since_end < 20:
+            if not self.go(c, c.s.get("map"), "", *ARCHANGEL, radius=4) and since_end < 20:
                 busy = True
                 continue
             now = time.time()
@@ -682,7 +746,7 @@ class BloodCastle:
         if since_end < END_WAIT_SEC + 60:
             pending = False
             for c in g.members:
-                if c.s.get("map") == BC_MAP:
+                if in_bc(c.s.get("map")):
                     pending = True
                     if time.time() - c.last_warp > 15:
                         c.chat("/move Lorencia")

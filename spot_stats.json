@@ -1,34 +1,42 @@
 {
  "Arena2 47,83": {
-  "levels": 232.0,
-  "minutes": 10.0
+  "levels": 308.8647742726854,
+  "minutes": 15.745276704083992
  },
  "Arena2 51,57": {
   "levels": 109.0,
   "minutes": 10.0
  },
  "Arena3 48,37": {
-  "levels": 148.0,
-  "minutes": 10.0
+  "levels": 370.94228490205415,
+  "minutes": 28.044518101913688
  },
  "Arena3 48,56": {
-  "levels": 35.0,
-  "minutes": 10.0
+  "levels": 36.79542234422115,
+  "minutes": 10.956437627137692
  },
  "Arena3 48,74": {
-  "levels": 189.0,
-  "minutes": 10.0
+  "levels": 371.7194048567069,
+  "minutes": 19.232627390551684
  },
  "Arena3 67,70": {
-  "levels": 69.0,
-  "minutes": 10.0
+  "levels": 161.00321080369574,
+  "minutes": 21.030619710133156
  },
  "Arena3 70,113": {
   "levels": 164.0,
   "minutes": 10.0
  },
+ "Arena3/solo 48,56": {
+  "levels": 9.965332274527988,
+  "minutes": 2.0016925324058743
+ },
  "Lorencia 34,50": {
-  "levels": 200.0,
-  "minutes": 10.0
+  "levels": 450.3228771535285,
+  "minutes": 21.010081843535797
+ },
+ "Lorencia/solo 34,50": {
+  "levels": 7.0,
+  "minutes": 1.0028021295865377
  }
 }
