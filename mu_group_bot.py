@@ -15,6 +15,7 @@ Pause: press P in the console window -> the bot stops doing anything and you can
 """
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -36,7 +37,16 @@ _ACC_FILE = Path(__file__).with_name("accounts.json")
 if not _ACC_FILE.exists():
     sys.exit("accounts.json not found - copy accounts.example.json to accounts.json and fill it in.")
 # First entry is the party leader.
-ACCOUNTS = json.loads(_ACC_FILE.read_text(encoding="utf-8"))
+# Entries without "user"/"character" are settings, not accounts, e.g. {"anthropic_api_key": "sk-ant-..."}.
+_ACC_RAW = json.loads(_ACC_FILE.read_text(encoding="utf-8-sig"))
+ACCOUNTS = [a for a in _ACC_RAW if isinstance(a, dict) and "user" in a and "character" in a]
+SETTINGS = {}
+for _a in _ACC_RAW:
+    if isinstance(_a, dict) and _a not in ACCOUNTS:
+        SETTINGS.update(_a)
+# The Claude API key for chat replies (any key name containing "api_key" is accepted).
+ANTHROPIC_API_KEY = (os.environ.get("ANTHROPIC_API_KEY")
+                     or next((v for k, v in SETTINGS.items() if "api_key" in k.lower() and v), None))
 
 # After every reset: walk to the Lorencia bar, talk to Liaman Barmaid, buy a Zen Chest if affordable.
 SHOP_AFTER_RESET = True
