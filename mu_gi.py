@@ -36,14 +36,14 @@ import mu_group_bot as G
 
 # ───────────────────────────── CONFIG ─────────────────────────────
 GI_ENABLED       = True
-GI_CHARS         = {"wizzardo"}     # always hunt (lower case) ...
+GI_CHARS         = {"wizzardo", "bruto"}   # always hunt (lower case; bruto: Juan 2026-10-11) ...
 GI_MAX_STATS     = True             # ... plus every character with ALL 4 stats >= GI_MIN_STAT (Juan 2026-10-11)
 GI_MIN_STAT      = 65000            # "max stats": STR, AGI, VIT and ENE all at least this
 GI_STATS_EVERY   = 300              # seconds between stat checks
 GI_SKILLS        = {}               # fixed skill per character (lower-case name -> skill number); empty = by class:
                                     # Ice Storm if owned (Soul Masters), else the Dark Knight combo, else the selected skill
 GI_START_MINUTE  = 50               # fallback when the event panel can't be read (PC clock)
-GI_PREP_SEC      = 60               # start preparing this long before the start (:49:00)
+GI_PREP_SEC      = 90               # start preparing this long before the start (:48:30: potions in Noria, then the waiting map)
 GI_WAIT_SEC      = 30               # be at the waiting spot this long before the start (:49:30)
 GI_HUNT_SEC      = 180              # hunt this long (:50:00 -> :53:00)
 GI_WAIT_DIST     = 20               # waiting spot: this many tiles outside the Noria safe zone
@@ -81,6 +81,17 @@ DEVIAS_OUT_WARPS = ["Devias4", "Devias2", "Devias3"]  # stuck in the Devias safe
 GI_TOWN_MAX_SEC  = 3                # in the Devias safe zone this long during the hunt -> warp out (Juan 2026-10-11)
 NORIA_WARP       = "Noria"
 NORIA_TOWN       = (175, 100)       # roughly the middle of Noria town (search for the safe-zone edge from here)
+# Before the start our hunters wait scattered over these maps (Juan 2026-10-11), in this order:
+# 1st hunter Devias, 2nd Noria, 3rd Lorencia, 4th Devias, ... (Devias needs level 20 -> Noria instead)
+GI_PRE_MAPS      = [MAP_DEVIAS, MAP_NORIA, MAP_LORENCIA]
+GI_PRE_WARP      = {MAP_DEVIAS: "Devias3", MAP_NORIA: "Noria", MAP_LORENCIA: "Lorencia"}
+GI_PRE_CENTER    = {MAP_NORIA: NORIA_TOWN}   # town middle to search the safe-zone edge from (others: where we land)
+# At the start, GI_FOCUS_COUNT of them go to the FOCUS map: the map named in the "[Map] Golden invasion!" banner
+# (every Golden Dragon we ever saw was in the banner's map), or the one with the most golden mobs when there is
+# no banner for one of our maps. The others hunt where they waited.
+GI_FOCUS_COUNT   = 3
+GI_BANNER_WAIT   = 6                # seconds to wait for the banner / the first real counts at the start
+MAP_NAMES        = {MAP_LORENCIA: "Lorencia", MAP_DEVIAS: "Devias", MAP_NORIA: "Noria", 7: "Atlans", 8: "Tarkan"}
 DEVIAS_MIN_LEVEL = 20
 NORIA_MIN_LEVEL  = 10
 # ──────────────────────────────────────────────────────────────────
@@ -107,6 +118,7 @@ GI_INSTALL_JS = r"""
   const W = window;
   if (W.__gi && W.__gi.version === cfg.version) { W.__gi.cfg = cfg; return 'kept'; }
   if (W.__gi && W.__gi.timer) clearInterval(W.__gi.timer);
+  if (W.__gi && W.__gi.obs) { try { W.__gi.obs.disconnect(); } catch (e) {} }
   const G = W.__gi = {version: cfg.version, cfg, on: false, counts: null, countsAt: 0, myId: null,
     potUntil: 0, lastPot: 0, pots: 0, casts: 0, myCasts: 0, lastCast: 0, lastHp: null,
     hostile: new Map(), target: null, targetIsPlayer: false, lastTargetName: null,
@@ -165,8 +177,14 @@ GI_INSTALL_JS = r"""
     if (h.dying || (pd.currentHP || 0) <= 0) { G.wasSafe = true; G.bQueue = []; return false; }
     G.myId = h.netId;
     const me = P(h), safe = (w.getTerrainFlag(Math.round(me.x), Math.round(me.y)) & 1) === 1;
+    // a warp: other map, or a jump of more than 15 tiles on the same map (e.g. Devias 2/3/4)
+    const warped = G.lastMap !== undefined && (w.mapIndex !== G.lastMap ||
+      (G.lastPos && Math.hypot(me.x - G.lastPos.x, me.y - G.lastPos.y) > 15));
+    G.lastMap = w.mapIndex; G.lastPos = me;
     if (!safe && G.wasSafe !== false)
       for (const n of buffs) G.wantBuff(s, n, `left the safe zone at (${Math.round(me.x)},${Math.round(me.y)})`);
+    else if (!safe && warped)
+      for (const n of buffs) G.wantBuff(s, n, `warped to (${Math.round(me.x)},${Math.round(me.y)}) on map ${w.mapIndex}`);
     G.wasSafe = safe;
     if (safe) { G.bQueue = []; return false; }
     if (!G.bQueue.length) return false;
@@ -335,6 +353,15 @@ GI_INSTALL_JS = r"""
       skill: s.currentSkill, map: w.mapIndex, x: Math.round(me.x), y: Math.round(me.y),
       safe: w.getTerrainFlag ? (w.getTerrainFlag(Math.round(me.x), Math.round(me.y)) & 1) === 1 : null};
   };
+  // "[Devias] Golden invasion!" banner -> G.banner = {name, at} (the map with the Golden Dragons)
+  try {
+    G.obs = new MutationObserver(muts => { for (const m of muts) for (const n of m.addedNodes) {
+      const t = (n.textContent || ''); if (t.length > 300) continue;
+      const b = t.match(/\[(Lorencia|Devias|Noria|Atlans|Tarkan)\] Golden invasion!/i);
+      if (b) G.banner = {name: b[1], at: Date.now()};
+    } });
+    G.obs.observe(document.body, {childList: true, subtree: true});
+  } catch (e) {}
   G.timer = setInterval(() => { try { G.tick(); } catch (e) { G.err = String(e).slice(0, 200); } }, cfg.loopMs);
   return 'installed';
 }
@@ -342,7 +369,7 @@ GI_INSTALL_JS = r"""
 
 GI_STATUS_JS = """() => { const G = window.__gi; if (!G) return null;
   const ev = G.events.splice(0); return {status: G.status, events: ev, counts: G.counts, countsAt: G.countsAt,
-  err: G.err || null, on: G.on}; }"""
+  err: G.err || null, on: G.on, banner: G.banner || null}; }"""
 
 # Soul Barrier watcher on/off; returns its events (null = not installed, e.g. the page reloaded)
 GI_BARRIER_JS = """(on) => { const G = window.__gi; if (!G || !G.barrierTick) return null; G.barrier = on;
@@ -578,6 +605,9 @@ class GoldenInvasion:
             if not sh or sh.get("key") != key:
                 hub.gi_shared = {"key": key, "grids": {}, "assign": {}}   # shared by all our hunters
         self.goal = None
+        self.pre_map = self.pick_pre_map()
+        with hub.lock:
+            hub.gi_shared.setdefault("pre", {})[self.a.name] = self.pre_map
         self.deaths = 0
         self.was_dead = False
         self.pk_tries = 0
@@ -587,7 +617,7 @@ class GoldenInvasion:
         self.zen0 = c.s.get("money") or 0
         install = self.ev(GI_INSTALL_JS, self.cfg())
         self.log(f"=== GOLDEN INVASION at {time.strftime('%H:%M:%S', time.localtime(self.start_at))} "
-                 f"-> preparing (fight loop {install}) ===")
+                 f"-> preparing, waiting in {MAP_NAMES[self.pre_map]} (fight loop {install}) ===")
         a.leave_party("Golden Invasion")
         c.set_helper(False)
         if c.minimized and not G_HEADLESS():
@@ -595,7 +625,7 @@ class GoldenInvasion:
         a.show_window = True
 
     def cfg(self):
-        return {"version": 5, "ours": list(self.a.hub.names), "skill": GI_SKILLS.get(self.a.name.lower(), 0), "potKey": GI_POTION_KEY,
+        return {"version": 7, "ours": list(self.a.hub.names), "skill": GI_SKILLS.get(self.a.name.lower(), 0), "potKey": GI_POTION_KEY,
                 "potEvery": GI_POT_EVERY_MS, "hitWindow": GI_HIT_WINDOW_MS, "pvpRadius": GI_PVP_RADIUS,
                 "view": GI_VIEW, "boxWait": GI_BOX_WAIT_SEC * 1000, "loopMs": GI_LOOP_MS,
                 "barrierTries": GI_BARRIER_TRIES,
@@ -623,8 +653,8 @@ class GoldenInvasion:
                 self.phase = "hunt"
                 self.start_hunt()
                 return True
-            if rel >= -GI_WAIT_SEC and self.potions_ok:
-                self.phase = "wait"
+            if self.potions_ok:
+                self.phase = "wait"               # go to the waiting map right away
             else:
                 self.prep()
                 return True
@@ -727,26 +757,50 @@ class GoldenInvasion:
         c.walk_target = None
 
     # ── WAIT: outside the Noria safe zone ──
+    def hunters(self):
+        """Our hunters this invasion, in accounts.json order."""
+        snap = self.a.hub.snapshot()
+        names = [n for n in self.a.hub.names if (snap.get(n) or {}).get("gi_hunter") or n == self.a.name]
+        return names
+
+    def pick_pre_map(self):
+        """Where I wait before the start: hunters spread over GI_PRE_MAPS in accounts order."""
+        hs = self.hunters()
+        i = hs.index(self.a.name) if self.a.name in hs else 0
+        m = GI_PRE_MAPS[i % len(GI_PRE_MAPS)]
+        if m == MAP_DEVIAS and (self.c.s.get("level") or 0) < DEVIAS_MIN_LEVEL:
+            m = MAP_NORIA
+        return m
+
     def go_wait_spot(self):
         c, s = self.c, self.c.s
         if (s.get("hp") or 0) <= 0:
             return
-        if s.get("map") != MAP_NORIA:
-            self.warp(NORIA_WARP)
+        m = self.pre_map
+        if s.get("map") != m:
+            self.warp(GI_PRE_WARP[m])
+            self.wait_spot = None
             return
         if self.wait_spot is None:
-            r = self.ev(WAIT_SPOT_JS, [NORIA_TOWN[0], NORIA_TOWN[1], GI_WAIT_DIST]) or {}
+            cx, cy = GI_PRE_CENTER.get(m, (s.get("x"), s.get("y")))
+            r = self.ev(WAIT_SPOT_JS, [cx, cy, GI_WAIT_DIST]) or {}
             spots = r.get("spots") or []
-            if spots:
+            if r.get("hereSafe") is False:
+                self.wait_spot = (s.get("x"), s.get("y"))          # landed outside the safe zone: stay here
+                self.log(f"waiting in {MAP_NAMES[m]} at {self.wait_spot} (already outside the safe zone)")
+            elif spots:
                 self.wait_spot = (spots[0]["x"], spots[0]["y"])
-                self.log(f"waiting spot {self.wait_spot} ({spots[0]['edge']} tiles to the safe-zone edge; "
-                         f"town tile safe={r.get('hereSafe')} flag={r.get('hereFlag')})")
+                self.log(f"waiting in {MAP_NAMES[m]} at {self.wait_spot} ({spots[0]['edge']} tiles to the "
+                         f"safe-zone edge; town tile flag={r.get('hereFlag')})")
             else:
-                self.wait_spot = (NORIA_TOWN[0] + 25, NORIA_TOWN[1] + 25)
-                self.log(f"could not read the safe zone (flag={r.get('hereFlag')}) -> waiting at {self.wait_spot}")
+                self.wait_spot = (cx + 25, cy + 25)
+                self.log(f"could not read the safe zone in {MAP_NAMES[m]} (flag={r.get('hereFlag')}) -> "
+                         f"waiting at {self.wait_spot}")
         x, y = self.wait_spot
-        if math.hypot((s.get("x") or 0) - x, (s.get("y") or 0) - y) > 2:
+        if math.hypot((s.get("x") or 0) - x, (s.get("y") or 0) - y) > 2.5:
             self.ev(B.WALK_JS, [x, y])
+        elif hasattr(self.a, "idle_wiggle"):
+            self.a.idle_wiggle((m, x, y))      # small random steps while waiting (mu_auto_bot IDLE_WIGGLE)
 
     # ── HUNT ──
     def start_hunt(self):
@@ -766,6 +820,44 @@ class GoldenInvasion:
         if sh is not None:
             with self.a.hub.lock:
                 sh["assign"][self.a.name] = m
+
+    def focus_map(self, banner, counts):
+        """Decided once per invasion (the first hunter to get here decides for everybody):
+        the focus map = the banner's map (dragons) if it's one of ours, else the one with the most golden
+        mobs; GI_FOCUS_COUNT hunters go there (those already waiting there first, then the strongest = first
+        in accounts.json), the others hunt where they waited."""
+        hub = self.a.hub
+        sh = hub.gi_shared
+        snap = hub.snapshot()          # BEFORE taking hub.lock: snapshot() takes it too (non-reentrant -> deadlock)
+        with hub.lock:
+            if "focus" not in sh:
+                maps = (counts or {}).get("maps") or {}
+                cnt = {m: int(maps.get(str(m), maps.get(m, 0)) or 0) for m in GI_PRE_MAPS}
+                by_name = {v.lower(): k for k, v in MAP_NAMES.items()}
+                bm = by_name.get((banner or {}).get("name", "").lower())
+                if bm in GI_PRE_MAPS:
+                    focus, why = bm, f"banner says {MAP_NAMES[bm]} (Golden Dragons)"
+                else:
+                    focus = max(GI_PRE_MAPS, key=lambda m: cnt[m])
+                    why = (f"banner {banner.get('name')} is not one of ours, " if banner else "no banner, ") \
+                        + f"most golden mobs in {MAP_NAMES[focus]}"
+                pre = sh.get("pre", {})
+                order = [n for n in self.hunters() if n in pre]
+                ok = [n for n in order if focus != MAP_DEVIAS or ((snap.get(n) or {}).get("level") or 0) >= DEVIAS_MIN_LEVEL]
+                members = [n for n in ok if pre.get(n) == focus][:GI_FOCUS_COUNT]
+                members += [n for n in ok if n not in members][:GI_FOCUS_COUNT - len(members)]
+                sh["focus"], sh["members"] = focus, members
+                hub_log = (f"FOCUS {MAP_NAMES[focus]} ({why}; counts "
+                           + ", ".join(f"{MAP_NAMES[m]} {cnt[m]}" for m in GI_PRE_MAPS)
+                           + f") -> {', '.join(members)} go there, the others stay")
+            else:
+                hub_log = None
+            focus, members = sh["focus"], sh["members"]
+        if hub_log:
+            self.log(hub_log)
+        if self.a.name in members:
+            return focus, f"focus team ({MAP_NAMES[focus]})"
+        return self.pre_map, f"staying where I waited ({MAP_NAMES[self.pre_map]})"
 
     def choose_map(self, counts):
         """Devias or Noria: the most golden mobs per hunter of ours already there (spreads our hunters)."""
@@ -811,28 +903,32 @@ class GoldenInvasion:
         if dead:
             return
         if self.map_target is None:
-            if (counts and counts.get("total")) or rel > 8:
-                self.map_target, why = self.choose_map(counts)
+            banner = st.get("banner")
+            if banner and banner.get("at", 0) / 1000 < self.cur_start - 30:
+                banner = None                                  # an old banner from a previous hour
+            if banner or (counts and counts.get("total") and rel > GI_BANNER_WAIT) or rel > GI_BANNER_WAIT + 4:
+                self.map_target, why = self.focus_map(banner, counts)
                 self.assign_map(self.map_target)
-                self.log(f"map: {'Devias' if self.map_target == MAP_DEVIAS else 'Noria'} ({why}; "
-                         f"counts {counts and counts.get('maps')})")
+                self.log(f"map: {MAP_NAMES.get(self.map_target)} ({why})")
             else:
                 return
         # switch map when ours is empty and the other one still has plenty
         if counts and s.get("map") == self.map_target and status.get("mode") == "search":
             maps = counts.get("maps") or {}
             here = int(maps.get(str(self.map_target), 0) or 0)
-            other = MAP_NORIA if self.map_target == MAP_DEVIAS else MAP_DEVIAS
+            lvl_ok = lambda m: m != MAP_DEVIAS or (s.get("level") or 0) >= DEVIAS_MIN_LEVEL
+            rest = [m for m in GI_PRE_MAPS if m != self.map_target and lvl_ok(m)]
+            other = max(rest, key=lambda m: int(maps.get(str(m), 0) or 0)) if rest else self.map_target
             there = int(maps.get(str(other), 0) or 0)
-            if here == 0 and there >= 5 and (other != MAP_DEVIAS or (s.get("level") or 0) >= DEVIAS_MIN_LEVEL):
-                self.log(f"map: nothing left here, {there} left on the other map -> switching")
+            if here == 0 and there >= 5:
+                self.log(f"map: nothing left here, {there} left in {MAP_NAMES[other]} -> switching")
                 self.map_target, self.goal = other, None
                 self.assign_map(other)
         if s.get("map") != self.map_target:
             if self.map_target == MAP_DEVIAS:
                 alias = DEVIAS_WARPS[min(self.warp_tries // 2, len(DEVIAS_WARPS) - 1)]
             else:
-                alias = NORIA_WARP
+                alias = GI_PRE_WARP.get(self.map_target, NORIA_WARP)
             if time.time() - self.last_warp >= 8:
                 self.warp_tries += 1
                 self.warp(alias)

@@ -22,6 +22,9 @@ Only one bot can run at a time.
 - `B` in the console switches Blood Castle on / off. It starts as `BC_AUTO` near the top of `mu_auto_bot.py` (currently off). Switching off drops anyone who hasn't entered a castle yet; anyone already inside finishes it.
 - Restart to load code changes, but not between :45 and :10 (Blood Castle time).
 
+## Idle wiggle
+While a character only waits (Lorencia bar before Blood Castle or while its leveler is away, by the Spirit in Devias, by the bridge inside the castle, at the Golden Invasion waiting spot) it takes a random 1-2 tile step every 10-25 s, staying within 2 tiles of the spot. In Devias it stops 15 s before the door opens and stands on the spot for the click. Settings: `IDLE_WIGGLE*` near the top of `mu_auto_bot.py` (`IDLE_WIGGLE = False` turns it off).
+
 ## Leveling pairs (grand resets)
 Grand resets are done by hand. To have another character carry a grand-reset character, edit `PAIRS` near the top of `mu_auto_bot.py`:
 

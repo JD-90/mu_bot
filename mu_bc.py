@@ -368,6 +368,74 @@ BAG_JS = """
     i >= 12 && it ? `${it.group}/${it.num}/${it.lvl}` : null).filter(Boolean)
 """
 
+# ── fast weapon grab (2026-10-11) ──
+# Logs showed the weapon on the ground for 5-6 s before we even sent the first pickup: the Python
+# tick is 1/s and every MU Helper toggle blocks it ~5 s waiting for the server. Same fix as the
+# Golden Invasion fight loop: a loop INSIDE the page (every GRAB_LOOP_MS) watches the ground while the
+# castle runs, and the moment the weapon shows up it drops any attack and re-sends the pickup every
+# GRAB_PICK_MS until it leaves the ground. Python only arms/disarms it, logs it, and turns the
+# helper off (without waiting).
+GRAB_VERSION   = 1
+GRAB_LOOP_MS   = 50                  # in-page check period (20x/s)
+GRAB_PICK_MS   = 200                 # re-send the pickup this often while the weapon is on the ground
+GRAB_RADIUS    = 20                  # tiles: chase the weapon this far
+BC_FAST_TICK   = 0.25                # Python tick inside the castle (normal: 1 s)
+HELPER_ASYNC_GUARD = 4.5             # s: don't press the helper key again before the last press could land
+
+# cfg = {version, on, g, n, re, radius, loopMs, pickMs}; installs once per page, returns status + events
+BC_GRAB_JS = """
+(cfg) => {
+  const W = window;
+  let G = W.__bcGrab;
+  if (!G || G.version !== cfg.version) {
+    if (G && G.timer) clearInterval(G.timer);
+    G = W.__bcGrab = {version: cfg.version, on: false, cfg, id: null, seenAt: 0, firstPickAt: 0,
+                      lastPick: 0, picks: 0, fails: 0, events: [], err: null};
+    const ev = s => { if (G.events.length < 50) G.events.push(s); };
+    if (W.__eventBus) W.__eventBus.on('ItemPickUpRequestFailed', () => { if (G.id !== null) G.fails++; });
+    G.tick = () => {
+      if (!G.on) return;
+      const w = W.__world, h = w && w.playerEntity; if (!h) return;
+      const c = G.cfg, rx = new RegExp(c.re, 'i'), p = h.transform.pos, now = Date.now();
+      let best = null;
+      for (const e of w.netObjsQuery.entities) {
+        if (!e.droppedItem || e.droppedItem.isMoney) continue;
+        const it = e.droppedItem;
+        if (!((it.group === c.g && it.num === c.n) || rx.test((e.objectNameInWorld || '').trim()))) continue;
+        const d = Math.hypot(e.transform.pos.x - p.x, e.transform.pos.z - p.z);
+        if (d <= c.radius && (!best || d < best.d)) best = {e, d};
+      }
+      if (!best) {
+        if (G.id !== null) {
+          ev(`weapon left the ground ${now - G.seenAt} ms after we saw it ` +
+             `(first pickup after ${G.firstPickAt ? G.firstPickAt - G.seenAt : '-'} ms, ` +
+             `${G.picks} pickup requests, ${G.fails} refused)`);
+          G.id = null;
+        }
+        return;
+      }
+      if (G.id !== best.e.netId) {
+        G.id = best.e.netId; G.seenAt = now; G.picks = 0; G.fails = 0; G.firstPickAt = 0;
+        ev(`weapon seen ${Math.round(best.d)} tiles away -> grabbing`);
+      }
+      w.attackTarget = null; w.castRequest = null;
+      if (now - G.lastPick >= c.pickMs) {
+        G.lastPick = now; G.picks++; w.pickupTarget = best.e;
+        if (!G.firstPickAt) G.firstPickAt = now;
+      }
+    };
+    G.timer = setInterval(() => { try { G.tick(); } catch (e) { G.err = String(e).slice(0, 200); } }, cfg.loopMs);
+  }
+  G.cfg = cfg;
+  if (G.on !== cfg.on) {
+    G.on = cfg.on;
+    if (!cfg.on) { if (G.id !== null && W.__world) W.__world.pickupTarget = null; G.id = null; }
+  }
+  return {on: G.on, chasing: G.id !== null, id: G.id, picks: G.picks, fails: G.fails,
+          events: G.events.splice(0), err: G.err};
+}
+"""
+
 PICKUP_JS = """
 (id) => {
   const w = window.__world;

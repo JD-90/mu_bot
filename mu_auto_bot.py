@@ -64,6 +64,7 @@ Pause: P pauses / resumes EVERY character. Keys 1-5 pause / resume ONE character
 """
 import math
 import os
+import random
 import re
 import socket
 import sys
@@ -130,6 +131,16 @@ DEVIAS_MIN_LEVEL    = 20    # /move Devias (Spirit of Archangel) needs this leve
 BC_INVITE_MAX       = 2     # inside: invite the same stranger at most this many times
 BC_ENTER_FAILS_RELOAD = 4   # this many castle clicks without getting in -> reload + log in again (fixed it live)
 BC_ENTER_MAX_RELOADS  = 2   # ... at most this many times per castle
+
+# idle wiggle: while a character just stands around waiting (Lorencia bar before Blood Castle /
+# levelee waiting for its leveler, Devias before the door opens, inside the castle by the bridge,
+# Golden Invasion waiting spot) it takes a small random step now and then, so it doesn't stand
+# frozen on one tile like a bot (Juan 2026-10-11)
+IDLE_WIGGLE         = True
+IDLE_WIGGLE_EVERY   = (10, 25)  # seconds between steps (random in this range)
+IDLE_WIGGLE_STEP    = (1, 2)    # tiles per step (random in this range)
+IDLE_WIGGLE_LEASH   = 2         # never further than this many tiles from the waiting spot
+IDLE_WIGGLE_DOOR_SEC = 15       # Devias: stop wiggling and stand on the spot this long before the door opens
 
 # windows
 WINDOW_CHECK_EVERY  = 30    # seconds between window checks
@@ -312,6 +323,7 @@ class Agent:
         self.user_opened = False     # you restored this window by hand: keep_minimized leaves it open
         self.big = False             # window maximized for manual play (BIG_ON_PAUSE)
         self.msgwin_at = 0
+        self.helper_press_at = 0     # last non-blocking MU Helper key press (helper_async)
         self.open_logged = None
         self.npc_talk_since = 0      # when the Archangel's dialog was first seen open
         self.boxes = 0               # Boxes of Kundun (+1..+5) in my bag (checked every 30 s)
@@ -331,6 +343,8 @@ class Agent:
         self.leveler_off_since = None
         self.vit_check = 0
         self.vit_fails = 0
+        self.wig_home = None         # waiting spot I'm idle-wiggling around: (map, x, y)
+        self.wig_next = 0
         # Golden Invasion hunter (mu_gi.py): GI.GI_CHARS + every character with max stats (checked live)
         self.gi = GI.GoldenInvasion(self) if GI.GI_ENABLED else None
         # Chat replies to other players (mu_chat.py; dry run = log only, see CH.CHAT_SEND)
@@ -362,7 +376,7 @@ class Agent:
                             break
                         self.log(f"error: {e!r}")
                         time.sleep(5)
-                    time.sleep((self.gi.sleep() if self.gi else None) or G.TICK)   # 4x/s during the invasion
+                    time.sleep((self.gi.sleep() if self.gi else None) or self.bc_sleep() or G.TICK)   # 4x/s during the invasion / inside BC
                 try:
                     ctx.close()
                 except Exception:
@@ -1064,7 +1078,7 @@ class Agent:
             c.walk_target = None
             return True
         m, x, y = B.BAR_SPOT
-        if self.go(m, "Lorencia", x, y, radius=3):
+        if self.park(m, "Lorencia", x, y, radius=3):
             c.set_helper(False)
         return True
 
@@ -1538,6 +1552,7 @@ class Agent:
                     plan["started"].discard(self.name)
                 else:
                     plan["out"].add(self.name)
+        self.grab(self.bcs, False)
         self.bcs = None
         self.step_key = None
         self.c.walk_target = None
@@ -1609,6 +1624,8 @@ class Agent:
                 self.leave_party("going to Blood Castle")
                 self.prepare_and_enter(b, since_open)
                 return True
+        if b["phase"] != "inside":
+            self.grab(b, False)
         if b["phase"] == "inside":
             return self.inside(b, since_open)
         if b["phase"] == "end":
@@ -1641,6 +1658,51 @@ class Agent:
             return False
         self.ev(B.WALK_JS, [x, y])
         return False
+
+    def park(self, map_idx, alias, x, y, radius=2):
+        """go() for a spot where the character only WAITS: once there, it idle-wiggles around it
+        (and counts as arrived while within IDLE_WIGGLE_LEASH tiles of it)."""
+        c, s = self.c, self.c.s
+        home = (map_idx, x, y)
+        if (IDLE_WIGGLE and self.wig_home == home and s.get("map") == map_idx
+                and dist(s, x, y) <= max(radius, IDLE_WIGGLE_LEASH + 0.5)):
+            c.walk_target = None
+            self.idle_wiggle(home)
+            return True
+        if not self.go(map_idx, alias, x, y, radius):
+            return False
+        self.idle_wiggle(home)
+        return True
+
+    def idle_wiggle(self, home):
+        """Standing at a waiting spot: every IDLE_WIGGLE_EVERY seconds take a 1-2 tile step to a random
+        walkable tile, never further than IDLE_WIGGLE_LEASH from home = (map, x, y)."""
+        if not IDLE_WIGGLE:
+            return
+        s = self.c.s
+        now = time.time()
+        if self.wig_home != home:            # just arrived: first step only after a pause
+            self.wig_home = home
+            self.wig_next = now + random.uniform(*IDLE_WIGGLE_EVERY)
+            return
+        if now < self.wig_next:
+            return
+        self.wig_next = now + random.uniform(*IDLE_WIGGLE_EVERY)
+        x, y = s.get("x"), s.get("y")
+        if x is None or y is None or (s.get("hp") or 0) <= 0 or s.get("helper"):
+            return
+        _, hx, hy = home
+        step = random.randint(*IDLE_WIGGLE_STEP)
+        cands = [(x + dx, y + dy) for dx in range(-step, step + 1) for dy in range(-step, step + 1)
+                 if max(abs(dx), abs(dy)) == step
+                 and math.hypot(x + dx - hx, y + dy - hy) <= IDLE_WIGGLE_LEASH]
+        if not cands and step > 1:           # 2 tiles would leave the leash: try 1
+            cands = [(x + dx, y + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if (dx or dy)
+                     and math.hypot(x + dx - hx, y + dy - hy) <= IDLE_WIGGLE_LEASH]
+        random.shuffle(cands)
+        for tx, ty in cands[:8]:
+            if self.ev(B.WALK_JS, [int(tx), int(ty)]):
+                return
 
     def inv(self, item):
         g, n, l = (item + (None,))[:3]
@@ -1718,10 +1780,13 @@ class Agent:
                 self.bc_done(f"no cloak +{tier} and no time left to buy one")
             return
         if since_open < -75:
-            self.go(*bar)            # wait at the bar (safe zone, no EXP)
+            self.park(*bar)          # wait at the bar (safe zone, no EXP)
             return
         m, x, y = B.SPIRIT_SPOT
-        if not self.go(m, "Devias", x, y, radius=1):
+        if since_open < -IDLE_WIGGLE_DOOR_SEC:
+            self.park(m, "Devias", x, y, radius=1)     # wait by the Spirit, wiggling a little
+            return
+        if not self.go(m, "Devias", x, y, radius=1):   # back on the spot for the click
             return
         if since_open < 0:
             return
@@ -1784,21 +1849,70 @@ class Agent:
             c.reload_page(f"Blood Castle: {BC_ENTER_FAILS_RELOAD} clicks without getting in "
                           f"(reload {b['reloads']}/{BC_ENTER_MAX_RELOADS})")
 
+    def bc_sleep(self):
+        """Faster ticks while inside Blood Castle (the weapon grab itself runs in the page)."""
+        b = self.bcs
+        return B.BC_FAST_TICK if b and b.get("phase") == "inside" else None
+
+    def helper_async(self, on):
+        """Toggle MU Helper WITHOUT waiting for the server (set_helper blocks ~5 s per toggle).
+        Presses the key at most once per HELPER_ASYNC_GUARD so a slow confirm isn't toggled back."""
+        c = self.c
+        if bool(c.s.get("helper")) == on:
+            return
+        now = time.time()
+        if now - self.helper_press_at < B.HELPER_ASYNC_GUARD:
+            return
+        self.helper_press_at = now
+        self.log(f"helper -> {'ON' if on else 'OFF'} (no wait)")
+        try:
+            c.page.evaluate("() => { const c=document.querySelector('canvas'); c && c.focus(); }")
+            c.page.keyboard.press(G.HELPER_KEY)
+        except Exception as e:
+            self.log(f"helper key: {e!r}")
+
+    def grab(self, b, on):
+        """Arm/disarm the in-page weapon grabber (mu_bc.BC_GRAB_JS); logs its events.
+        Returns its status, or None if the page didn't answer."""
+        if not on and not b.get("grab_on"):
+            return None
+        cfg = {"version": B.GRAB_VERSION, "on": bool(on), "g": B.WEAPON[0], "n": B.WEAPON[1],
+               "re": B.WEAPON_NAME_RE, "radius": B.GRAB_RADIUS, "loopMs": B.GRAB_LOOP_MS,
+               "pickMs": B.GRAB_PICK_MS}
+        r = self.ev(B.BC_GRAB_JS, cfg)
+        if r is None:
+            return None
+        if on and not b.get("grab_on"):
+            self.log("BC: weapon grabber armed (in-page, every "
+                     f"{B.GRAB_LOOP_MS} ms, {B.GRAB_RADIUS} tiles)")
+        b["grab_on"] = bool(on)
+        for e in r.get("events") or []:
+            self.log(f"BC grab: {e}")
+        if r.get("err") and r["err"] != b.get("grab_err"):
+            b["grab_err"] = r["err"]
+            self.log(f"BC grab error: {r['err']}")
+        return r
+
     def walk_in_castle(self, b, x, y, radius=2):
         c, s = self.c, self.c.s
         now = time.time()
         d = dist(s, x, y)
+        # helper toggles never block here (helper_async): the old set_helper waited ~5 s for the
+        # server on every toggle, and the whole tick (weapon pickup included) waited with it
         if d <= radius:
             if s.get("helper") and now >= b["burst_until"]:
-                c.set_helper(False)
+                self.helper_async(False)
             c.walk_target = None
             return True
         if now < b["burst_until"]:
-            c.set_helper(True)
+            if not s.get("helper") and now - b.get("burst_at", now) < 8:
+                b["burst_until"] = now + B.HELPER_BURST     # count the burst from when the helper is really on
+            self.helper_async(True)
             return False
         if s.get("helper"):
-            c.set_helper(False)
+            self.helper_async(False)                        # walk once it has stopped (next ticks)
             c.walk_target = None
+            return False
         if c.walk_target != (x, y):
             c.walk_target, c.walk_best, c.walk_progress_at = (x, y), d, now
         if d < c.walk_best - 0.5:
@@ -1807,9 +1921,9 @@ class Agent:
             b["stuck_n"] = b.get("stuck_n", 0) + 1
             if b["stuck_n"] % 5 == 1:
                 self.log(f"BC: stuck at ({s.get('x')},{s.get('y')}), {d:.0f} tiles from ({x},{y}) -> helper burst")
-            b["burst_until"] = now + B.HELPER_BURST
+            b["burst_until"], b["burst_at"] = now + B.HELPER_BURST, now
             c.walk_target = None
-            c.set_helper(True)
+            self.helper_async(True)
             return False
         if not self.ev(B.WALK_JS, [int(x), int(y)]):
             for ox, oy in ((1, 0), (-1, 0), (0, -1), (1, -1), (-1, -1), (2, 0), (0, -2), (2, -2),
@@ -1997,6 +2111,7 @@ class Agent:
         in_bag = (self.ev(B.WEAPON_INV_JS, [list(x) for x in B.WEAPON_CODES]) or 0) > 0
         has_weapon = in_bag or b.get("we_have")
         if has_weapon:
+            self.grab(b, False)
             if not self.walk_in_castle(b, *B.ARCHANGEL, radius=2):
                 return True
             if in_bag:
@@ -2020,29 +2135,43 @@ class Agent:
             b["rush"] = True
             self.log("BC: another player has the weapon -> back to the Archangel")
         if b["rush"]:
+            self.grab(b, False)
             self.walk_in_castle(b, *B.ARCHANGEL, radius=2)
             return True
         if not st or st.get("st") not in (1, 4):
-            self.go(s.get("map"), "", *(self.ev(B.WAIT_SPOT_JS, [*B.BC_WAIT, *B.BC_START]) or B.BC_START),
-                    radius=2)   # waiting for the castle to start (by the bridge)
+            self.grab(b, False)
+            self.park(s.get("map"), "", *(self.ev(B.WAIT_SPOT_JS, [*B.BC_WAIT, *B.BC_START]) or B.BC_START),
+                      radius=2)   # waiting for the castle to start (by the bridge), wiggling a little
             return True
-        weapon = self.ev(B.WEAPON_SCAN_JS, [B.WEAPON[0], B.WEAPON[1], B.WEAPON_NAME_RE]) or []
-        if weapon:
-            now = time.time()
-            if now - b.get("pick_at", 0) > 2:
-                b["pick_at"] = now
+        # castle running: the in-page grabber watches the ground 20x/s and picks the weapon up
+        # the instant it drops (even while this Python tick is busy). Here: log + helper off.
+        gr = self.grab(b, True)
+        if gr and gr.get("chasing"):
+            self.helper_async(False)                  # the helper would keep attacking / walking away
+            if not b.get("pick_try") or b["pick_try"][0] != gr["id"]:
+                bag0 = self.ev(B.BAG_JS)
+                b["pick_try"] = (gr["id"], time.time(), list(bag0) if bag0 is not None else None)
+                self.log("BC: picking up the Archangel's weapon (in-page grabber)")
+            return True
+        if gr is None:
+            # grabber not answering (page busy / reloading): the old 1-tick path
+            weapon = self.ev(B.WEAPON_SCAN_JS, [B.WEAPON[0], B.WEAPON[1], B.WEAPON_NAME_RE]) or []
+            if weapon:
+                now = time.time()
                 w = weapon[0]
-                c.set_helper(False)
-                self.log(f"BC: picking up the Archangel's weapon: {w['name']!r} "
-                         f"[{w['g']}/{w['n']} lvl {w['lvl']}] matched by {w['by']}, {w['d']:.0f} tiles away")
+                self.helper_async(False)
+                if now - b.get("pick_at", 0) > 0.5:
+                    b["pick_at"] = now
+                    self.log(f"BC: picking up the Archangel's weapon: {w['name']!r} "
+                             f"[{w['g']}/{w['n']} lvl {w['lvl']}] matched by {w['by']}, {w['d']:.0f} tiles away")
                 if not b.get("pick_try") or b["pick_try"][0] != w["id"]:
                     bag0 = self.ev(B.BAG_JS)
                     b["pick_try"] = (w["id"], now, list(bag0) if bag0 is not None else None)
                 self.ev(B.PICKUP_JS, w["id"])
-            return True
+                return True
         tx, ty = B.STATUE
         if dist(s, tx, ty) <= B.STATUE_RADIUS:
-            c.set_helper(True)
+            self.helper_async(True)
             return True
         self.walk_in_castle(b, tx, ty, radius=B.STATUE_RADIUS)
         return True
