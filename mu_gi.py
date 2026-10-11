@@ -60,7 +60,8 @@ GI_COMBO_STEP_MS = 700              # next combo skill when the server showed th
 GI_BARRIER_TRIES = 4                # casts per safe-zone exit before giving up (each waits ~1.2 s for the server)
 GI_POTION_KEY    = 0                # item hotkey index: 0 = Q
 GI_POTION_ITEM   = (14, 3)          # Large Healing Potion (used if the Q slot can't be read)
-GI_POTION_STACK  = 255              # keep ONE slot of this many potions
+GI_POTION_STACK  = 255              # one full stack ...
+GI_POTION_TOTAL  = 510              # ... keep TWO full stacks in the bag (Juan 2026-10-11: 211 used in 1.5 min)
 GI_POTION_NPC    = 253              # Amy, Potion Girl (two of them in Noria)
 GI_POT_EVERY_MS  = 200              # potion every 0.2 s ...
 GI_HIT_WINDOW_MS = 2000             # ... while a player has hit us in the last 2 s
@@ -76,6 +77,8 @@ GI_RECORD        = True             # record the hunt with mu_recorder
 GI_SELL_CHEST_FOR_PK = True         # /pkclear short of zen -> sell ONE Zen Chest at the Lorencia bar
 MAP_LORENCIA, MAP_DEVIAS, MAP_NORIA = 0, 2, 3
 DEVIAS_WARPS     = ["Devias3", "Devias"]   # /move aliases to try (Devias 3 landed at (225,229) for 2500 zen)
+DEVIAS_OUT_WARPS = ["Devias4", "Devias2", "Devias3"]  # stuck in the Devias safe zone (respawn): warp out, next one if it fails
+GI_TOWN_MAX_SEC  = 3                # in the Devias safe zone this long during the hunt -> warp out (Juan 2026-10-11)
 NORIA_WARP       = "Noria"
 NORIA_TOWN       = (175, 100)       # roughly the middle of Noria town (search for the safe-zone edge from here)
 DEVIAS_MIN_LEVEL = 20
@@ -329,7 +332,8 @@ GI_INSTALL_JS = r"""
       goldens: goldens.length, dragon: dragon ? [Math.round(dragon.p.x), Math.round(dragon.p.y), Math.round(dragon.d)] : null,
       boxes: boxes.length, loot: loot.slice(0, 20), hp, maxHp: pd.maxHP, heroState: h.heroState,
       attackSkill: G.attackSkill, pots: G.pots, casts: G.casts, myCasts: G.myCasts, hitsOnMe: G.hitsOnMe, pickFails: G.pickFails,
-      skill: s.currentSkill, map: w.mapIndex, x: Math.round(me.x), y: Math.round(me.y)};
+      skill: s.currentSkill, map: w.mapIndex, x: Math.round(me.x), y: Math.round(me.y),
+      safe: w.getTerrainFlag ? (w.getTerrainFlag(Math.round(me.x), Math.round(me.y)) & 1) === 1 : null};
   };
   G.timer = setInterval(() => { try { G.tick(); } catch (e) { G.err = String(e).slice(0, 200); } }, cfg.loopMs);
   return 'installed';
@@ -355,8 +359,11 @@ POTION_SLOT_JS = """([key, g, n]) => { const s = window.__store, items = s.playe
   const hk = i;
   let it = i >= 0 ? items[i] : null;
   if (!it) { i = items.findIndex((x, j) => j >= 12 && x && x.group === g && x.num === n); it = i >= 0 ? items[i] : null; }
-  if (!it) return {slot: -1, hk, count: 0, group: g, num: n, lvl: 0};
-  return {slot: i, hk, count: it.durability ?? it.count ?? 1, group: it.group, num: it.num, lvl: it.lvl || 0}; }"""
+  const cnt = x => x.durability ?? x.count ?? 1;
+  const G = it ? it.group : g, N = it ? it.num : n;
+  const total = items.reduce((t, x, j) => t + (j >= 12 && x && x.group === G && x.num === N ? cnt(x) : 0), 0);
+  if (!it) return {slot: -1, hk, count: 0, total, group: g, num: n, lvl: 0};
+  return {slot: i, hk, count: cnt(it), total, group: it.group, num: it.num, lvl: it.lvl || 0}; }"""
 
 SHOP_FIND_JS = """([g, n, l]) => { const shop = window.__store.npcShop;
   if (!shop || !shop.items.some(Boolean)) return null;
@@ -402,7 +409,7 @@ WALKABLE_JS = """(pts) => { const w = window.__world; if (!w) return null;
 STATS_JS = """() => { const p = (window.__store && window.__store.playerData) || {};
   const f = (...k) => { for (const x of k) if (typeof p[x] === 'number') return p[x]; return null; };
   return {str: f('str', 'strength'), agi: f('agi', 'agility', 'dex', 'dexterity'), vit: f('sta', 'vit', 'vitality'),
-          ene: f('ene', 'energy'), keys: Object.keys(p).filter(k => typeof p[k] === 'number').join(',')}; }"""
+          ene: f('eng', 'ene', 'energy'), keys: Object.keys(p).filter(k => typeof p[k] === 'number').join(',')}; }"""
 
 HERO_STATE_JS = "() => { const h = window.__world && window.__world.playerEntity; return h ? h.heroState : null; }"
 
@@ -650,9 +657,9 @@ class GoldenInvasion:
         if pot.get("hk", 0) < 0 and not getattr(self, "hk_warned", False):
             self.hk_warned = True
             self.log("WARNING: no potion on the Q hotkey -> potion spam won't work. Put Large Healing Potions on Q once by hand.")
-        if pot.get("count", 0) >= GI_POTION_STACK:
+        if pot.get("total", 0) >= GI_POTION_TOTAL:
             if not self.potions_ok:
-                self.log(f"potions: {pot.get('count')} in the Q slot")
+                self.log(f"potions: {pot.get('total')} in the bag")
             self.potions_ok = True
             return
         if self.potions_ok:
@@ -662,7 +669,7 @@ class GoldenInvasion:
 
     def buy_potions(self, pot):
         c = self.c
-        before = pot.get("count", 0)
+        before = pot.get("total", 0)
         talked = self.ev(B.TALK_NPC_JS, GI_POTION_NPC)
         if not talked:
             # walk toward the nearest Potion Girl first
@@ -691,7 +698,7 @@ class GoldenInvasion:
             self.ev("() => window.__store.closeNpcShop()")
             return
         count, buys, stuck = before, 0, 0
-        while count < GI_POTION_STACK and buys < 300 and stuck < 3:
+        while count < GI_POTION_TOTAL and buys < 400 and stuck < 3:
             self.ev("(i) => window.__store.buyItemFromNpc(i)", idx)
             buys += 1
             for _ in range(10):
@@ -699,15 +706,15 @@ class GoldenInvasion:
                 if not self.ev("() => !!window.__store.shopBuyPending"):
                     break
             p2 = self.ev(POTION_SLOT_JS, [GI_POTION_KEY, *GI_POTION_ITEM]) or {}
-            if p2.get("count", 0) > count:
-                count, stuck = p2["count"], 0
+            if p2.get("total", 0) > count:
+                count, stuck = p2["total"], 0
             else:
                 stuck += 1
             if buys == 1:
                 self.log(f"potions: one purchase gave {count - before} (slot {p2.get('slot')})")
         self.ev("() => { window.__store.closeNpcShop(); window.__store.inventoryEnabled = false; }")
-        self.log(f"potions: {before} -> {count} in the Q slot ({buys} purchases"
-                 + (", stopped: the stack stopped growing (new slot? zen?)" if stuck >= 3 else "") + ")")
+        self.log(f"potions: {before} -> {count} in the bag ({buys} purchases"
+                 + (", stopped: the count stopped growing (bag full? zen?)" if stuck >= 3 else "") + ")")
 
     def warp(self, alias):
         c = self.c
@@ -833,6 +840,8 @@ class GoldenInvasion:
         if self.warp_tries:
             self.log(f"landed at ({s.get('x')},{s.get('y')}) on map {s.get('map')}")
             self.warp_tries = 0
+        if self.leave_town(s, status):
+            return
         self.mark_seen(s, status)
         if status.get("mode") == "search":
             self.search_step(s)
@@ -844,6 +853,22 @@ class GoldenInvasion:
                      f"(near {status.get('near')}) | goldens {status.get('goldens')} | hp {status.get('hp')}/"
                      f"{status.get('maxHp')} | pots {status.get('pots')} | casts {status.get('casts')}/"
                      f"{status.get('myCasts')} seen | skill {status.get('attackSkill')} | left {counts and counts.get('total')}")
+
+    def leave_town(self, s, status):
+        """Respawned (or wandered) into the Devias safe zone: warp to another Devias zone instead of walking out."""
+        now = time.time()
+        if s.get("map") != MAP_DEVIAS or not status.get("safe") or status.get("mode") not in ("search", None):
+            self.town_since = None
+            return False
+        self.town_since = getattr(self, "town_since", None) or now
+        if now - self.town_since < GI_TOWN_MAX_SEC or now - self.last_warp < 8:
+            return now - self.town_since >= GI_TOWN_MAX_SEC
+        self.out_try = (getattr(self, "out_try", -1) + 1) % len(DEVIAS_OUT_WARPS)
+        alias = DEVIAS_OUT_WARPS[self.out_try]
+        self.log(f"in the Devias safe zone at ({s.get('x')},{s.get('y')}) -> /move {alias}")
+        self.warp(alias)
+        self.goal = None
+        return True
 
     # ── searching the map (cells of GI_SEARCH_CELL tiles; shared by all our hunters on that map) ──
     @property

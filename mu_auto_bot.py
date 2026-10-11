@@ -105,7 +105,9 @@ LEVELEE_VIT_MAX     = 1500  # every levelee in PAIRS puts its free points into V
 LEVELEE_VIT_EVERY   = 60    # seconds between checks for free points
 
 # Blood Castle
-BC_AUTO             = True
+BC_AUTO             = False   # Blood Castle on/off AT STARTUP. Press B in the console to switch it live
+                              # (off until the bots seem human enough; Juan 2026-10-11)
+BC_TOGGLE_KEY       = "b"
 BC_TIERS            = B.BC_TIERS        # (castle, min lvl, max lvl): BC1 15-80 ... BC7 331-400
 BC_PLAN_SEC         = 900   # make the plan this long before the entry window opens
 BC_FARM_UNTIL_SEC   = 180   # holders keep farming until this long before the window opens (:57) ...
@@ -254,6 +256,7 @@ class Hub:
         self.pair_deaths = {}        # leveler -> [(time, name)] deaths of its levelees (for its spot switching)
         self.paused = set()
         self.pause_all = False       # P / PAUSE file: everyone paused, windows stay minimized
+        self.bc_on = BC_AUTO         # B in the console switches Blood Castle on/off
         self.stop = False
 
     def put(self, name, d):
@@ -550,8 +553,7 @@ class Agent:
             if self.name in hub.pair_round:
                 with hub.lock:
                     hub.pair_round.discard(self.name)    # my part of the pair's reset round is done
-        if BC_AUTO:
-            self.read_bc_timer()
+        self.read_bc_timer()                    # always: so switching BC on mid-hour works at once
         if self.gi and self.gi.tick():          # Golden Invasion (:49 -> :53) comes first
             self.publish()
             return
@@ -1202,11 +1204,10 @@ class Agent:
     def trade_quiet(self):
         """True around Blood Castle time: no new trades then."""
         o = self.hub.open_at
-        if o is None:
-            return False
-        until = o - time.time()
-        if -B.BC_DOOR_CLOSE_SEC - 60 <= until <= BC_PLAN_SEC + TRADE_BC_QUIET:
-            return True
+        if o is not None and self.hub.bc_on:        # Blood Castle off: trades go on through BC time
+            until = o - time.time()
+            if -B.BC_DOOR_CLOSE_SEC - 60 <= until <= BC_PLAN_SEC + TRADE_BC_QUIET:
+                return True
         return GI.GI_ENABLED and 47 <= time.localtime().tm_min <= 54     # Golden Invasion (:50)
 
     def maybe_start_trade(self):
@@ -1479,8 +1480,14 @@ class Agent:
 
     def bc_tick(self):
         """True while Blood Castle takes over this character (leveling paused)."""
-        if not BC_AUTO:
-            return False
+        if not self.hub.bc_on:
+            b = self.bcs
+            if b is None:
+                return False
+            if not b.get("entered"):            # switched off before getting in: drop it
+                self.bc_done("Blood Castle switched off")
+                return False
+            # already inside: finish this castle (leaving mid-event looks worse than staying)
         plan = self.hub.plan
         if self.bcs is None and plan:
             with self.hub.lock:
@@ -2170,7 +2177,10 @@ BC_REPLAN_EVERY = 20   # seconds: re-check characters that had no castle (they m
 
 def coordinator(hub, agents):
     now = time.time()
-    if not BC_AUTO or hub.open_at is None:
+    if not hub.bc_on:
+        hub.plan = None
+        return
+    if hub.open_at is None:
         return
     until = hub.open_at - now
     key = round(hub.open_at / 600)
@@ -2213,7 +2223,11 @@ def read_keys(hub, agents):
             import msvcrt
             while msvcrt.kbhit():
                 k = msvcrt.getwch().lower()
-                if k == G.PAUSE_KEY:
+                if k == BC_TOGGLE_KEY:
+                    hub.bc_on = not hub.bc_on
+                    log("=== BLOOD CASTLE " + ("ON" if hub.bc_on else
+                        "OFF (anyone already inside finishes that castle; nobody else goes)") + " ===")
+                elif k == G.PAUSE_KEY:
                     if all(a.name in hub.paused for a in agents):
                         hub.paused.clear()
                         hub.pause_all = False
@@ -2268,7 +2282,8 @@ def main():
         t.start()
         threads.append(t)
         time.sleep(3)    # stagger the browser launches
-    log("Keys in this window: P = pause/resume everyone, "
+    log(f"Blood Castle is {'ON' if hub.bc_on else 'OFF'} (B in this window switches it)")
+    log("Keys in this window: P = pause/resume everyone, B = Blood Castle on/off, "
         + ", ".join(f"{i + 1} = {a.name}" for i, a in enumerate(agents)) + " (pause/resume one)")
     last_summary = 0
     try:

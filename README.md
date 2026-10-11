@@ -19,6 +19,7 @@ Only one bot can run at a time.
 
 ## Controls (auto bot)
 - `P` in the console pauses / resumes everyone, `1`-`5` pause / resume one character (order of `accounts.json`) so you can play it.
+- `B` in the console switches Blood Castle on / off. It starts as `BC_AUTO` near the top of `mu_auto_bot.py` (currently off). Switching off drops anyone who hasn't entered a castle yet; anyone already inside finishes it.
 - Restart to load code changes, but not between :45 and :10 (Blood Castle time).
 
 ## Leveling pairs (grand resets)
