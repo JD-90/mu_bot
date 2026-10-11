@@ -52,6 +52,10 @@ Box trading (TRADE_BOXES):
     have fit marks him full until his free space goes up (or TRADE_FULL_SEC passes).
 
 Run:   run_auto.bat           Stop: Ctrl+C in the console window.
+       run_auto.bat starts mu_supervisor.py, which runs this bot and restarts it on request
+       (RESTART file / restart_bot.bat / R key), after a crash, or when it freezes.
+       STOP_BOT file (written by the supervisor) -> the bot closes its browsers and exits.
+       Exit codes: 0 = stopped on purpose, 2 = another bot holds the lock, 3 = every character stopped.
 Pause: P pauses / resumes EVERY character. Keys 1-5 pause / resume ONE character (order of
        accounts.json). A paused character's window is restored so you can play it; the others
        keep going. While paused, everything you do in that window is written to mu_record.log
@@ -59,6 +63,7 @@ Pause: P pauses / resumes EVERY character. Keys 1-5 pause / resume ONE character
        maximized window at full render scale while paused (back to 800x500 / low on resume).
 """
 import math
+import os
 import re
 import socket
 import sys
@@ -172,6 +177,13 @@ TRADE_MIN_FREE      = 1     # the main needs at least this many free bag cells, 
 TRADE_FULL_SEC      = 7200  # a trade the main failed to take while his bag looked big enough -> treat him
                             # as full until his free space goes up (or this long passes)
 TRADE_BC_QUIET      = 180   # no new trades from BC_PLAN_SEC + this before a castle opens until the door closes
+
+# restarts (mu_supervisor.py)
+SUPERVISED          = os.environ.get("MU_SUPERVISED") == "1"   # started by mu_supervisor.py
+STOP_BOT_FILE       = G.BASE_DIR / "STOP_BOT"   # supervisor -> bot: close the browsers and exit
+RESTART_FILE        = G.BASE_DIR / "RESTART"    # bot/you -> supervisor: restart ("now" inside = right away)
+RESTART_KEY         = "r"                       # in the console: restart right away (under the supervisor)
+EXIT_STOPPED, EXIT_OTHER_BOT, EXIT_ALL_DEAD = 0, 2, 3
 # ──────────────────────────────────────────────────────────────────
 
 _log_lock = threading.Lock()
@@ -2223,7 +2235,17 @@ def read_keys(hub, agents):
             import msvcrt
             while msvcrt.kbhit():
                 k = msvcrt.getwch().lower()
-                if k == BC_TOGGLE_KEY:
+                if k == RESTART_KEY:
+                    if SUPERVISED:
+                        try:
+                            RESTART_FILE.write_text("now", encoding="utf-8")
+                            log("=== R pressed: restarting the bot now (the supervisor closes and starts it) ===")
+                        except OSError as e:
+                            log(f"R pressed but could not write the RESTART file: {e!r}")
+                    else:
+                        log("R pressed, but this bot was not started by the supervisor (run_auto.bat) -> "
+                            "close it and start run_auto.bat to get restarts")
+                elif k == BC_TOGGLE_KEY:
                     hub.bc_on = not hub.bc_on
                     log("=== BLOOD CASTLE " + ("ON" if hub.bc_on else
                         "OFF (anyone already inside finishes that castle; nobody else goes)") + " ===")
@@ -2267,9 +2289,14 @@ def main():
         lock.bind(("127.0.0.1", 47291))   # same lock as mu_group_bot.py: never both at once
     except OSError:
         print("A MU bot (group or auto) is already running in another window. Close that one first.")
-        input("Press Enter to exit...")
-        return
-    log("=== MU auto bot starting ===")
+        if not SUPERVISED:              # the supervisor retries by itself: no prompt to block it
+            input("Press Enter to exit...")
+        return EXIT_OTHER_BOT
+    try:
+        STOP_BOT_FILE.unlink()          # a leftover from an earlier stop must not stop this run
+    except OSError:
+        pass
+    log("=== MU auto bot starting ===" + (" (under the supervisor)" if SUPERVISED else ""))
     names = [a["character"] for a in G.ACCOUNTS]
     hub = Hub(names)
     if CH.CHAT_ENABLED:
@@ -2283,11 +2310,16 @@ def main():
         threads.append(t)
         time.sleep(3)    # stagger the browser launches
     log(f"Blood Castle is {'ON' if hub.bc_on else 'OFF'} (B in this window switches it)")
-    log("Keys in this window: P = pause/resume everyone, B = Blood Castle on/off, "
+    log("Keys in this window: P = pause/resume everyone, B = Blood Castle on/off, R = restart now, "
         + ", ".join(f"{i + 1} = {a.name}" for i, a in enumerate(agents)) + " (pause/resume one)")
     last_summary = 0
+    rc = EXIT_ALL_DEAD             # the loop ends by itself only when every character thread stopped
     try:
         while any(t.is_alive() for t in threads):
+            if STOP_BOT_FILE.exists():
+                log("=== STOP_BOT file -> closing the browsers and exiting (restart / stop requested) ===")
+                rc = EXIT_STOPPED
+                break
             read_keys(hub, agents)
             try:
                 coordinator(hub, agents)
@@ -2299,16 +2331,24 @@ def main():
                 log("summary: " + " | ".join(
                     f"{n} lvl {i.get('level')} {i.get('mode')}" for n, i in snap.items()))
             time.sleep(0.3)
+        else:
+            log("every character stopped -> exiting")
     except KeyboardInterrupt:
         log("stopped by user")
+        rc = EXIT_STOPPED
     finally:
         hub.stop = True
         for t in threads:
             t.join(timeout=10)
+    try:
+        STOP_BOT_FILE.unlink()
+    except OSError:
+        pass
+    return rc
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main() or 0)
     except KeyboardInterrupt:
         sys.exit(0)

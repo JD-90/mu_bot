@@ -3,3 +3,6 @@ browser_profile*/
 *.log
 .deps_ok
 __pycache__/
+RESTART
+STOP_ALL
+STOP_BOT

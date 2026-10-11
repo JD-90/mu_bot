@@ -37,3 +37,12 @@ Until the levelee has `ASSIST_UNTIL_RESETS` (5) resets:
 - the levelee puts its free points into VIT (`/add vit <amount>`) up to `LEVELEE_VIT_MAX` (1500).
 
 At 5 resets the pair splits by itself; the next grand reset (detected when the reset counter drops to 0) starts it again.
+
+## Restarting without the console (supervisor)
+
+`run_auto.bat` starts `mu_supervisor.py`, which runs `mu_auto_bot.py` in the same window (P / B / 1-5 still work) and logs to `supervisor.log`.
+
+- `restart_bot.bat` (double-click) or `R` in the console: restart right away. If the bot isn't running, `restart_bot.bat` starts it.
+- Empty file named `RESTART` in this folder: restart at the next safe time (only between :10 and :45). `RESTART` containing `now`: right away.
+- File named `STOP_ALL`: stop the bot and the supervisor.
+- On its own: every `.py` is compiled before a (re)start (broken code -> the running bot is left alone), a crash restarts it after 30 s (4 crashes in 15 min -> it waits for a `RESTART` file), and a bot whose log is silent for 10 min is killed and restarted.

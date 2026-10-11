@@ -25,8 +25,10 @@ if not exist ".deps_ok" (
   echo ok> .deps_ok
 )
 
-"%PY%" mu_auto_bot.py
-pause
+rem mu_supervisor.py runs the bot and restarts it on request (RESTART file / restart_bot.bat / R key),
+rem after a crash or when it freezes. See supervisor.log.
+"%PY%" mu_supervisor.py mu_auto_bot.py
+if errorlevel 1 pause
 exit /b 0
 
 :findpy
