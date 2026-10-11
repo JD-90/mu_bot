@@ -56,7 +56,7 @@ BC_WAIT       = (13, 13)            # wait here (by the bridge) until the castle
 ARCHANGEL     = (12, 12)            # stand here to deliver / wait for the boxes (Archangel ≈ 12,11)
 ARCHANGEL_NPC = 232
 WEAPON        = (5, 10)             # Archangel's weapon: "Weapon of Archangel" [5/10 lvl 0] (seen 2026-10-10, BC3)
-WEAPON_CODES  = [(5, 10), (0, 19), (4, 18)]   # 5/10 confirmed; sword 0/19 / crossbow 4/18 = classic codes, unconfirmed
+WEAPON_CODES  = [(5, 10), (13, 19), (0, 19), (4, 18)]   # 5/10 = how it shows on the ground; 13/19 = in the bag (confirmed 2026-10-10 15:07, bruto BC7); 0/19, 4/18 = classic codes, unconfirmed
 BOX           = (14, 11, 12)        # Box of Kundun +5
 STATUE        = (13, 93)            # walk towards the statue (weapon drops at ≈13,95)
 STATUE_RADIUS = 3                   # this close -> helper on to destroy the statue
@@ -97,11 +97,30 @@ BC_HOOK_JS = """
                         own: u[10] | u[11] << 8, wpn: u[12], t: Date.now()};
   } catch (e) {} });
   window.__eventBus.on('ItemPickUpRequestFailed', () => { window.__bcPickFail++; });
+  // the server's answer to an entry click (0 = ok; anything else = refused, see BC_ENTER_RESULTS)
+  window.__eventBus.on('BloodCastleEnterResult', d => { try {
+    const u = new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+    window.__bcEnter = {hex: [...u].map(b => b.toString(16).padStart(2, '0')).join(' '), code: u[u.length - 1], t: Date.now()};
+  } catch (e) {} });
+  window.__eventBus.on('ServerMessage', d => { try {
+    const u = new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+    const txt = new TextDecoder().decode(u.slice(4)).replace(/\\0.*$/s, '');
+    if (!/entered the game/.test(txt)) window.__bcServerMsg = {txt, t: Date.now()};
+  } catch (e) {} });
   return true;
 }
 """
 
 BC_STATE_JS = "() => window.__bcState"
+
+# last entry answer + last server message (both since time t, epoch ms)
+BC_ENTER_RESULT_JS = """
+(t) => ({enter: window.__bcEnter && window.__bcEnter.t >= t ? window.__bcEnter : null,
+         msg: window.__bcServerMsg && window.__bcServerMsg.t >= t ? window.__bcServerMsg.txt : null})
+"""
+# classic MU BloodCastleEnterResult codes (this server's may differ: the raw bytes are logged too)
+BC_ENTER_RESULTS = {0: "ok", 1: "wrong cloak / no cloak", 2: "not open", 3: "level too low",
+                    4: "level too high", 5: "castle full", 6: "no more entries today"}
 
 INV_COUNT_JS = """
 ([g, n, l]) => (window.__store.playerData.items || []).filter((it, i) =>
@@ -151,6 +170,74 @@ MSGWIN_JS = """
 }
 """
 MSGWIN_CHECK_SEC = 5                  # look for an open message window this often
+
+# The Archangel's "Ah! Great warrior..." dialog after the delivery is NOT msgWin: it is the store's
+# pendingNpcTalk, and its OK is not a <button> (text is letter-spaced "O K"), so neither MSGWIN_JS
+# nor CLICK_OK_JS caught it. Closes it by: a store close/clear function, clearing the field, and
+# clicking any visible element whose text is "OK" once spaces are removed. null = nothing open.
+NPC_TALK_CLOSE_JS = """
+(types) => {
+  const s = window.__store; if (!s || !s.pendingNpcTalk) return null;
+  const t = s.pendingNpcTalk;
+  if (types && types.length && !types.includes(t.npcType)) return null;
+  const how = [];
+  for (const k of Object.keys(s)) {
+    if (typeof s[k] !== 'function' || k === 'talkToNpc') continue;
+    if (/^(close|clear|cancel|end|dismiss|reset).*(npc|talk|dialog)/i.test(k)) {
+      try { s[k](); how.push(k + '()'); } catch (e) {}
+    }
+  }
+  const fire = (el) => {
+    for (const ev of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'])
+      el.dispatchEvent(new MouseEvent(ev, {bubbles: true, cancelable: true, view: window}));
+  };
+  for (const el of document.querySelectorAll('body *')) {
+    if (el.children.length > 1) continue;
+    const txt = (el.textContent || '').replace(/\\s+/g, '');
+    if (!/^(ok|aceptar)$/i.test(txt)) continue;
+    const r = el.getBoundingClientRect(); if (!r.width || !r.height) continue;
+    fire(el); how.push('clicked <' + el.tagName.toLowerCase() + '>'); break;
+  }
+  if (s.pendingNpcTalk) { try { s.pendingNpcTalk = null; how.push('cleared'); } catch (e) {} }
+  return {name: t.name, npcType: t.npcType, how: how.join(', '), still: !!s.pendingNpcTalk};
+}
+"""
+NPC_TALK_CLOSE_TYPES = [232]          # Archangel only (don't touch BC entry / shop talks)
+NPC_TALK_CLOSE_AFTER = 8              # seconds it must stay open before we close it (delivery done)
+
+# The Archangel's "Ah! Great warrior..." dialog after the delivery is NOT msgWin: it is the store's
+# pendingNpcTalk, and its OK is not a <button> (text is letter-spaced "O K"), so neither MSGWIN_JS
+# nor CLICK_OK_JS caught it. Closes it by: a store close/clear function, clearing the field, and
+# clicking any visible element whose text is "OK" once spaces are removed. null = nothing open.
+NPC_TALK_CLOSE_JS = """
+(types) => {
+  const s = window.__store; if (!s || !s.pendingNpcTalk) return null;
+  const t = s.pendingNpcTalk;
+  if (types && types.length && !types.includes(t.npcType)) return null;
+  const how = [];
+  for (const k of Object.keys(s)) {
+    if (typeof s[k] !== 'function' || k === 'talkToNpc') continue;
+    if (/^(close|clear|cancel|end|dismiss|reset).*(npc|talk|dialog)/i.test(k)) {
+      try { s[k](); how.push(k + '()'); } catch (e) {}
+    }
+  }
+  const fire = (el) => {
+    for (const ev of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'])
+      el.dispatchEvent(new MouseEvent(ev, {bubbles: true, cancelable: true, view: window}));
+  };
+  for (const el of document.querySelectorAll('body *')) {
+    if (el.children.length > 1) continue;
+    const txt = (el.textContent || '').replace(/\\s+/g, '');
+    if (!/^(ok|aceptar)$/i.test(txt)) continue;
+    const r = el.getBoundingClientRect(); if (!r.width || !r.height) continue;
+    fire(el); how.push('clicked <' + el.tagName.toLowerCase() + '>'); break;
+  }
+  if (s.pendingNpcTalk) { try { s.pendingNpcTalk = null; how.push('cleared'); } catch (e) {} }
+  return {name: t.name, npcType: t.npcType, how: how.join(', '), still: !!s.pendingNpcTalk};
+}
+"""
+NPC_TALK_CLOSE_TYPES = [232]          # Archangel only (don't touch BC entry / shop talks)
+NPC_TALK_CLOSE_AFTER = 8              # seconds it must stay open before we close it (delivery done)
 
 # click a visible OK / Close button (fallback when closing the store windows didn't clear the dialog)
 CLICK_OK_JS = """

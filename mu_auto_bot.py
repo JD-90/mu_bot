@@ -15,7 +15,9 @@ Leveling (each character, independently):
 
 Blood Castle (15 minutes before every castle, BC_PLAN_SEC):
   * One character per castle level (BC1..BC7, lower castles first).
-  * Already inside a castle's level range -> HOLD: stop farming, buy the cloak, wait at the bar.
+  * Already inside a castle's level range -> HOLD: keep farming until BC_FARM_UNTIL_SEC before the
+    castle opens (or BC_FARM_TOP_MARGIN levels below the top of the range, whichever comes first),
+    then stop, buy the cloak, wait at the bar. Climbers that get into their range early do the same.
     (two of ours in the same range: the lower level one holds, the other climbs)
   * The others CLIMB to the nearest free castle above them that they can reach in time
     (or reset and climb to BC1 when close to the reset level and BC1 is free). Once inside the
@@ -24,6 +26,16 @@ Blood Castle (15 minutes before every castle, BC_PLAN_SEC):
     no invite -> invite every player in view, and keep inviting new arrivals. Then walk up the
     corridor, destroy the statue, take the weapon and deliver it (or rush back to the
     Archangel when someone else has it), pick up the Box of Kundun +5, back to leveling.
+
+Leveling pairs (PAIRS, for characters you grand reset by hand):
+  * PAIRS = {levelee: leveler}. Until the levelee has ASSIST_UNTIL_RESETS resets, the two farm
+    together in their own party at the spot for the LOWER of their levels (the leveler picks and
+    switches spots, the levelee follows him), and /reset together once the levelee reaches the reset
+    level (the leveler holds at the reset level meanwhile).
+  * The levelee skips Blood Castle. The leveler only takes a castle he is already in range of
+    (never climbs / resets for one); the levelee waits at the Lorencia bar while he is away,
+    paused or offline.
+  * A grand reset is noticed when the reset counter drops to 0 (mu_group_bot.py Char.refresh).
 
 Box trading (TRADE_BOXES):
   * An alt carrying Boxes of Kundun (+1..+5) that meets the main character (first account in
@@ -71,10 +83,29 @@ SEND_AUTOPARTY_OFF  = True  # the group bot turned /autoparty ON for the alts; t
 # spot rules for a character on its own (the group bot's rules for the rest, see mu_group_bot.py)
 SOLO_DEATHS_TO_SWITCH = 3   # my deaths at one spot within DEATH_WINDOW_SEC -> switch (not on the best spot)
 
+# leveling pairs (after a grand reset a character can't kill anything: another one carries it)
+# levelee: leveler. While the levelee has fewer than ASSIST_UNTIL_RESETS resets:
+#   * both farm together (spot picked by the LOWER level of the two; the leveler decides the spot),
+#     in their own party, and /reset together once both are at the reset level
+#     (the leveler holds at the reset level until the levelee gets there)
+#   * the levelee never goes to Blood Castle; the leveler may (only if already in a castle's range,
+#     it never climbs or resets for one) and the levelee waits at the Lorencia bar meanwhile
+#   * at ASSIST_UNTIL_RESETS resets the pair breaks up by itself; a later grand reset starts it again
+PAIRS               = {
+    "bruto": "invalido",
+}
+ASSIST_UNTIL_RESETS = 5
+PAIR_LEVELER_GRACE  = 30    # leveler offline (reload / map change) this long -> the levelee waits at the bar
+LEVELEE_VIT_MAX     = 1500  # every levelee in PAIRS puts its free points into VIT ("/add vit N") until it has
+                            # this much (also after it graduates); above it nothing is added
+LEVELEE_VIT_EVERY   = 60    # seconds between checks for free points
+
 # Blood Castle
 BC_AUTO             = True
 BC_TIERS            = B.BC_TIERS        # (castle, min lvl, max lvl): BC1 15-80 ... BC7 331-400
 BC_PLAN_SEC         = 900   # make the plan this long before the entry window opens
+BC_FARM_UNTIL_SEC   = 180   # holders keep farming until this long before the window opens (:57) ...
+BC_FARM_TOP_MARGIN  = 5     # ... or until they are this many levels below the top of the range (Juan 2026-10-11)
 BC_CLIMB_DEADLINE   = 120   # a climber not in its range this long before the window opens -> skips it
 BC_ENTER_MARGIN     = 3     # climbers stop this many levels inside the range (not right at its edge)
 BC_DEFAULT_RATE     = 15    # levels/min assumed when a character's recent rate is unknown
@@ -85,6 +116,8 @@ BC_INVITE_EVERY     = 10    # seconds between invites to the same player
 BC_SHOW_WINDOW_AFTER = 2    # entry dialog not found this many times -> restore the window so you can click
 DEVIAS_MIN_LEVEL    = 20    # /move Devias (Spirit of Archangel) needs this level: BC1 entries wait for it
 BC_INVITE_MAX       = 2     # inside: invite the same stranger at most this many times
+BC_ENTER_FAILS_RELOAD = 4   # this many castle clicks without getting in -> reload + log in again (fixed it live)
+BC_ENTER_MAX_RELOADS  = 2   # ... at most this many times per castle
 
 # windows
 WINDOW_CHECK_EVERY  = 30    # seconds between window checks
@@ -212,6 +245,8 @@ class Hub:
         self.trade = None            # box trade in progress: {"alt", "lead", "phase", "start", "phase_at", "n", ...}
         self.trade_to = TRADE_TO or (names[0] if names else None)
         self.lead_full = None        # {"free", "at"}: the main couldn't take boxes -> no trades until he has more room
+        self.pair_round = set()      # paired characters that /reset now (the whole pair reached the reset level)
+        self.pair_deaths = {}        # leveler -> [(time, name)] deaths of its levelees (for its spot switching)
         self.paused = set()
         self.pause_all = False       # P / PAUSE file: everyone paused, windows stay minimized
         self.stop = False
@@ -258,6 +293,7 @@ class Agent:
         self.big = False             # window maximized for manual play (BIG_ON_PAUSE)
         self.msgwin_at = 0
         self.open_logged = None
+        self.npc_talk_since = 0      # when the Archangel's dialog was first seen open
         self.boxes = 0               # Boxes of Kundun (+1..+5) in my bag (checked every 30 s)
         self.bag_free = None         # main only: free bag cells (checked every 30 s)
         self.bag_free_at = 0
@@ -269,6 +305,12 @@ class Agent:
         self.trade_fails = 0
         self.trade_sent = 0
         self.trade_filled = False
+        self.leveler_name = PAIRS.get(self.name)    # who carries me after a grand reset (None = nobody)
+        self.was_assisted = None
+        self.pair_parked = False     # levelee waiting at the bar (leveler in Blood Castle / paused / offline)
+        self.leveler_off_since = None
+        self.vit_check = 0
+        self.vit_fails = 0
 
     def log(self, msg):
         log(msg, self.name)
@@ -407,8 +449,8 @@ class Agent:
         c, s = self.c, self.c.s
         target = None
         if self.step_key is not None and self.mode == "level":
-            _, _, _, m, spots = G.ROUTE[self.step_key]
-            target = (m,) + tuple(spots[self.spot_idx])
+            sp = G.ROUTE[self.step_key][4][self.spot_idx]
+            target = (sp.map,) + tuple(sp)
         self.hub.put(self.name, {
             "name": self.name, "online": bool(c.online), "paused": self.paused, "mode": self.mode,
             "map": s.get("map"), "x": s.get("x"), "y": s.get("y"), "level": s.get("level"),
@@ -416,7 +458,10 @@ class Agent:
             "step": self.step_key, "spot": None if self.scouting else self.spot_idx,
             "scouting": self.scouting, "step_since": self.step_since, "arrived": self.arrived,
             "target": target, "rate": self.recent_rate(),
-            "bc": self.bcs is not None, "boxes": self.boxes, "bag_free": self.bag_free,
+            "bc": self.bcs is not None,
+            "bc_away": self.bcs is not None and self.bcs.get("phase") not in ("climb", "farm"), "boxes": self.boxes, "bag_free": self.bag_free,
+            "assisted": self.assisted(), "leveler": self.leveler_name if self.assisted() else None,
+            "pair_lead": bool(self.my_levelees()), "parked": self.pair_parked,
         })
 
     def recent_rate(self):
@@ -484,6 +529,12 @@ class Agent:
         if hub.reset_level is None:
             self.detect_reset_level()
             return
+        self.pair_check(hub.snapshot())
+        if lvl < hub.reset_level:
+            self.hold_logged = False
+            if self.name in hub.pair_round:
+                with hub.lock:
+                    hub.pair_round.discard(self.name)    # my part of the pair's reset round is done
         if BC_AUTO:
             self.read_bc_timer()
         if self.bc_tick():
@@ -495,7 +546,8 @@ class Agent:
                 self.last_status = now
                 self.status()
             return
-        if lvl >= hub.reset_level:
+        self.add_vit()
+        if lvl >= hub.reset_level and self.pair_may_reset():
             self.mode = "reset"
             self.publish()
             return self.reset_tick()
@@ -504,6 +556,12 @@ class Agent:
             self.publish()
             if c.shop_tick():
                 c.shop_pending = False
+            return
+        if self.pair_wait_tick():
+            self.publish()
+            if now - self.last_status > 60:
+                self.last_status = now
+                self.status()
             return
         self.mode = "level"
         self.level_tick()
@@ -531,6 +589,13 @@ class Agent:
             bc += f" | box trade {t['alt']} -> {t['lead']} ({t['phase']})"
         elif self.boxes:
             bc += f" | {self.boxes} Kundun box(es)"
+        if self.assisted():
+            bc += (f" | carried by {self.leveler_name} (r{self.c.known[0]}/{ASSIST_UNTIL_RESETS})"
+                   + (" - waiting at the bar" if self.pair_parked else ""))
+        elif getattr(self, "was_levelees", None):
+            bc += f" | carrying {', '.join(self.was_levelees)}"
+        if self.name in PAIRS:
+            bc += f" | VIT {s.get('vit')} ({s.get('points')} free pts)"
         if self.name == self.hub.trade_to and self.bag_free is not None:
             bc += f" | bag {self.bag_free} free" + (" (FULL for trades)" if self.hub.lead_full else "")
         self.log(f"lvl {s.get('level')} r{s.get('resets')} | {where} | "
@@ -613,7 +678,8 @@ class Agent:
     def peers_on_step(self):
         snap = self.hub.snapshot()
         return [i for n, i in snap.items() if n != self.name and i.get("online") and i.get("mode") == "level"
-                and i.get("step") == self.step_key and not i.get("paused")]
+                and i.get("step") == self.step_key and not i.get("paused")
+                and not i.get("assisted") and not i.get("pair_lead")]   # pairs farm on their own
 
     def find_anchor(self):
         """The first of ours who came to this leg (decides the spot); None if that's me."""
@@ -624,19 +690,41 @@ class Agent:
     def level_tick(self):
         c, s = self.c, self.c.s
         lvl = s.get("level") or 1
-        key = next((i for i, st in enumerate(G.ROUTE) if st[0] <= lvl < st[1]), len(G.ROUTE) - 1)
+        snap = self.hub.snapshot()
+        grp = self.pair_group(snap)
+        levelee = bool(grp) and grp[0] != self.name
+        leg_lvl = lvl
+        if grp:
+            # the pair farms where its LOWEST level can go (so the /move level limits fit both)
+            others = [(snap.get(n) or {}).get("level") for n in [grp[0]] + grp[1] if n != self.name]
+            leg_lvl = min([lvl] + [l for l in others if l])
+            if not levelee:
+                with self.hub.lock:
+                    self.deaths += self.hub.pair_deaths.pop(self.name, [])   # my levelees' deaths count too
+
+        def anchor_now():
+            if not grp:
+                return self.find_anchor()
+            if not levelee:
+                return None                  # the leveler decides the pair's spot
+            L = snap.get(grp[0]) or {}
+            if L.get("online") and not L.get("paused") and L.get("mode") == "level" and L.get("step") == self.step_key:
+                return L
+            return None
+
+        key = next((i for i, st in enumerate(G.ROUTE) if st[0] <= leg_lvl < st[1]), len(G.ROUTE) - 1)
         frm, to, alias, map_idx, spots = G.ROUTE[key]
         if key != self.step_key:
             self.step_key, self.step_since = key, time.time()
             self.scouting = False
             self.spot_idx = self.hub.stats.ranked(stats_alias(alias, False), spots)[0]
             self.new_spot()
-            anchor = self.find_anchor()
+            anchor = anchor_now()
             if anchor:
                 self.log(f"{alias}: {anchor['name']} is already here -> going to the same spot")
-            elif G.SCOUT_ON_NEW_ZONE and len(spots) > 1:
+            elif G.SCOUT_ON_NEW_ZONE and len(spots) > 1 and not levelee:
                 self.start_scouting(alias, spots)
-        anchor = self.find_anchor()
+        anchor = anchor_now()
         self.anchor_name = anchor["name"] if anchor else None
         if anchor:
             if self.scouting:
@@ -651,12 +739,15 @@ class Agent:
             if anchor.get("spot") is not None and anchor["spot"] != self.spot_idx:
                 self.spot_idx = anchor["spot"]
                 self.new_spot()
-        step = (frm, to, alias, map_idx) + tuple(spots[self.spot_idx])
+        step = G.spot_step(G.ROUTE[key], self.spot_idx)     # alias / map of THIS spot (Arena4 spots in the Arena3 leg)
 
         dead = (s.get("hp") or 0) <= 0
         if dead and not c.was_dead:
             self.deaths.append((time.time(), self.name))
             self.log(f"died at {alias} {spots[self.spot_idx]}")
+            if levelee:
+                with self.hub.lock:
+                    self.hub.pair_deaths.setdefault(grp[0], []).append((time.time(), self.name))
         c.was_dead = dead
         if dead:
             c.walk_target = None
@@ -665,11 +756,11 @@ class Agent:
         if self.scouting:
             return self.scout_tick(step, spots)
         follow = None
-        if anchor and anchor.get("map") == map_idx and (anchor.get("hp") or 0) > 0 and anchor.get("x") is not None \
+        if anchor and anchor.get("map") == step[3] and (anchor.get("hp") or 0) > 0 and anchor.get("x") is not None \
                 and math.hypot(anchor["x"] - step[4], anchor["y"] - step[5]) <= G.LEASH_RADIUS:
             follow = (anchor["x"], anchor["y"])
         c.move_tick(step, follow=follow)
-        self.check_spot(step, spots, is_anchor=anchor is None)
+        self.check_spot(step, spots, is_anchor=anchor is None and not levelee)
 
     def new_spot(self):
         self.spot_since = time.time()
@@ -707,14 +798,15 @@ class Agent:
             return self.finish_scouting(alias, spots, "took too long")
         if sc["i"] >= len(sc["order"]):
             return self.finish_scouting(alias, spots, "all spots occupied")
+        si = sc["order"][sc["i"]]
+        map_idx, warp = spots[si].map, spots[si].alias     # the spot being checked may be on another map
         if s.get("map") != map_idx:
             if now - c.last_warp > 15:
                 c.set_helper(False)
-                c.chat(f"/move {alias}")
+                c.chat(f"/move {warp}")
                 c.last_warp = now
             sc["started"], sc["arrived_at"], sc["best"], sc["progress_at"] = now, None, 999.0, now
             return
-        si = sc["order"][sc["i"]]
         tx, ty = spots[si]
         d = math.hypot(s["x"] - tx, s["y"] - ty)
         if d > G.ARRIVE_RADIUS:
@@ -804,6 +896,178 @@ class Agent:
             self.spot_idx = best
             self.new_spot()
 
+    # ── leveling pairs (PAIRS) ──
+    def assisted(self):
+        """I'm a levelee that still needs carrying (fewer than ASSIST_UNTIL_RESETS resets).
+        Uses the last reset count seen in game, so a reload doesn't break the pair up."""
+        if not self.leveler_name or self.leveler_name not in self.hub.names or self.c is None:
+            return False
+        rs = self.c.known[0]
+        return 0 <= rs < ASSIST_UNTIL_RESETS
+
+    def my_levelees(self, snap=None):
+        """Characters I'm carrying right now (not paused, running)."""
+        snap = snap if snap is not None else self.hub.snapshot()
+        return sorted(n for n, i in snap.items() if n != self.name and i.get("assisted")
+                      and i.get("leveler") == self.name and not i.get("paused") and i.get("mode") != "stopped")
+
+    def pair_group(self, snap):
+        """(leveler, [levelees]) when I'm in an active pair, else None."""
+        if self.assisted():
+            L = snap.get(self.leveler_name) or {}
+            if L.get("assisted"):
+                return None              # my leveler needs carrying himself: config mistake, level alone
+            others = [n for n, i in snap.items() if n != self.name and i.get("assisted")
+                      and i.get("leveler") == self.leveler_name and not i.get("paused") and i.get("mode") != "stopped"]
+            return self.leveler_name, sorted(others + [self.name])
+        lev = self.my_levelees(snap)
+        return (self.name, lev) if lev else None
+
+    def pair_check(self, snap):
+        """Logs when a pair starts / ends (grand reset done, graduated, partner paused...)."""
+        a = self.assisted()
+        if a != self.was_assisted:
+            rs = self.c.known[0]
+            if a:
+                self.log(f"PAIR: {self.leveler_name} levels me until {ASSIST_UNTIL_RESETS} resets (now r{rs}); "
+                         "no Blood Castle until then")
+            elif self.was_assisted is not None:
+                self.log(f"PAIR: reached {rs} resets -> leveling on my own, Blood Castle from now on")
+            self.was_assisted = a
+            self.step_key = None
+            self.pair_parked = False
+        lev = self.my_levelees(snap)
+        if lev != getattr(self, "was_levelees", []):
+            self.log(f"PAIR: carrying {', '.join(lev)}" if lev else "PAIR: nobody to carry -> leveling on my own")
+            self.was_levelees = lev
+            self.step_key = None
+
+    def pair_may_reset(self):
+        """Paired characters /reset together: a round starts when every levelee is at the reset
+        level (the leveler joins it if he is there too; otherwise he keeps going). Outside a round a
+        paired character at the reset level holds at the spot."""
+        snap = self.hub.snapshot()
+        grp = self.pair_group(snap)
+        if not grp:
+            return True
+        leveler, levelees = grp
+        rl = self.hub.reset_level
+        lv = lambda n: (self.c.s.get("level") or 0) if n == self.name else ((snap.get(n) or {}).get("level") or 0)
+        started = None
+        with self.hub.lock:
+            if self.name not in self.hub.pair_round and all(lv(n) >= rl for n in levelees):
+                started = set(levelees) | ({leveler} if lv(leveler) >= rl else set())
+                self.hub.pair_round |= started
+            ok = self.name in self.hub.pair_round
+        if started:
+            self.log(f"PAIR: {', '.join(levelees)} at {rl} -> resetting: {', '.join(sorted(started))}")
+        elif not ok and not getattr(self, "hold_logged", False):
+            self.hold_logged = True
+            self.log(f"PAIR: at {rl}, holding until {', '.join(levelees)} get{'s' if len(levelees) == 1 else ''} there")
+        return ok
+
+    def add_vit(self):
+        """Levelees in PAIRS (grand-reset characters): every LEVELEE_VIT_EVERY s, free level-up points
+        -> VIT until VIT reaches LEVELEE_VIT_MAX. Carried or not (also after graduating)."""
+        now = time.time()
+        if self.name not in PAIRS or now < self.vit_check:
+            return
+        self.vit_check = now + LEVELEE_VIT_EVERY
+        c, s = self.c, self.c.s
+        vit, pts = s.get("vit"), s.get("points")
+        if vit is None or not pts or pts <= 0 or vit >= LEVELEE_VIT_MAX or (s.get("hp") or 0) <= 0:
+            return
+        n = int(min(pts, LEVELEE_VIT_MAX - vit))
+        c.chat(f"/add vit {n}")
+        time.sleep(1.5)
+        after = c.refresh().get("vit")
+        if after is not None and after > vit:
+            self.vit_fails = 0
+            self.log(f"VIT {vit} -> {after} (+{after - vit} of {pts} free points, up to {LEVELEE_VIT_MAX})")
+            return
+        self.vit_fails += 1
+        lines = self.ev(G.CHAT_LINES_JS) or []
+        self.log(f"/add vit {n} did not raise VIT ({vit}) - server: {' | '.join(lines[-2:])}")
+        if self.vit_fails >= 3:
+            self.vit_fails = 0
+            self.vit_check = now + 600
+            self.log("VIT: 3 failures in a row -> trying again in 10 min")
+
+    def pair_wait_tick(self):
+        """Levelee whose leveler can't carry it (Blood Castle, paused, offline): wait at the bar."""
+        if not self.assisted():
+            self.pair_parked = False
+            return False
+        L = self.hub.snapshot().get(self.leveler_name) or {}
+        now = time.time()
+        why = None
+        if L.get("online"):
+            self.leveler_off_since = None
+        if not L or L.get("mode") == "stopped":
+            why = "is not running"
+        elif L.get("paused"):
+            why = "is paused"
+        elif L.get("bc_away"):
+            why = "is busy with Blood Castle"
+        elif not L.get("online"):
+            self.leveler_off_since = self.leveler_off_since or now
+            if now - self.leveler_off_since > PAIR_LEVELER_GRACE:
+                why = "is offline"
+        c, s = self.c, self.c.s
+        if why is None:
+            if self.pair_parked:
+                self.pair_parked = False
+                self.step_key, c.walk_target, c.spot = None, None, None
+                self.log(f"PAIR: {self.leveler_name} is back -> leveling with him again")
+            return False
+        if not self.pair_parked:
+            self.pair_parked = True
+            self.log(f"PAIR: {self.leveler_name} {why} -> waiting at the Lorencia bar")
+        self.mode = "wait"
+        if (s.get("hp") or 0) <= 0:
+            c.walk_target = None
+            return True
+        m, x, y = B.BAR_SPOT
+        if self.go(m, "Lorencia", x, y, radius=3):
+            c.set_helper(False)
+        return True
+
+    def pair_party_tick(self, grp, snap):
+        """The pair's own party: the leveler invites his levelees, levelees accept only him,
+        nobody else gets in."""
+        leveler, levelees = grp
+        c, s = self.c, self.c.s
+        party = s.get("party") or []
+        mine = {leveler, *levelees}
+        now = time.time()
+        if s.get("partyRequest"):
+            text = s.get("partyRequestText", "")
+            if self.name != leveler and len(party) <= 1 and f'"{leveler}"' in text:
+                self.log(f"accepting {leveler}'s party invite")
+                self.ev("() => window.__social.partyRespond(true)")
+            else:
+                self.ev("() => window.__social.partyRespond(false)")
+        if len(party) > 1:
+            if any(n not in mine for n in party):
+                return self.leave_party("pair: someone else is in it")
+            if self.name != leveler and leveler not in party:
+                return self.leave_party(f"pair: {leveler} is not in it")
+        if self.name != leveler or len(party) >= 5:
+            return
+        for n in levelees:
+            o = snap.get(n) or {}
+            if n in party or not o.get("online") or o.get("paused") or o.get("parked"):
+                continue
+            if o.get("party") and len(o["party"]) > 1:
+                continue           # he leaves that party on his own first
+            if o.get("map") != s.get("map") or o.get("x") is None or \
+                    math.hypot(o["x"] - s["x"], o["y"] - s["y"]) > PARTY_MEET_RADIUS:
+                continue
+            if now - self.invited.get(n, 0) < G.INVITE_EVERY:
+                continue
+            self.invited[n] = now
+            self.log(f"pair: party invite {n}: {self.ev(G.INVITE_JS, n)}")
+
     # ── parties while leveling ──
     def leave_party(self, why):
         party = self.c.s.get("party") or []
@@ -819,6 +1083,9 @@ class Agent:
         ours = set(self.hub.names)
         snap = self.hub.snapshot()
         me = snap.get(self.name) or {}
+        grp = self.pair_group(snap)
+        if grp:
+            return self.pair_party_tick(grp, snap)
 
         # invites: accept only our own characters, and only when not in a party
         if s.get("partyRequest"):
@@ -860,6 +1127,8 @@ class Agent:
                 continue
             if o.get("party") and len(o["party"]) > 1:
                 continue
+            if o.get("assisted") or o.get("pair_lead"):
+                continue           # pairs keep their own party
             if o.get("step") != self.step_key:
                 continue           # different leg of the route: we won't farm together
             if o.get("map") != s.get("map") or o.get("x") is None or \
@@ -1199,7 +1468,7 @@ class Agent:
             if a:
                 tier, role = a
                 self.bcs = {"tier": tier, "role": role, "open_at": plan["open_at"],
-                            "phase": "prep" if role == "hold" else "climb",
+                            "phase": "farm" if role == "hold" else "climb",
                             "cloak": False, "talk_at": 0, "no_dialog": 0, "entered": False,
                             "burst_until": 0, "tried": set(), "box": False, "box_try": None,
                             "first_stranger": None, "invited": {}, "end_at": None, "rush": False}
@@ -1243,18 +1512,36 @@ class Agent:
             if b["role"] == "reset" and (s.get("resets") or 0) == b.setdefault("resets0", s.get("resets") or 0):
                 pass              # not reset yet: the level is still the old one
             elif bc_entry_level(tier) <= lvl <= hi:
-                self.log(f"BC{tier}: level {lvl} is in range ({lo}-{hi}) -> stop leveling, holding")
-                b["phase"] = "prep"
+                self.log(f"BC{tier}: level {lvl} is in range ({lo}-{hi}) -> holding")
+                b["phase"] = "farm"
             elif lvl > hi:
                 self.bc_done(f"level {lvl} went past the range ({lo}-{hi})")
                 return False
-            if b["phase"] == "prep":
+            if b["phase"] == "farm":
                 pass
             elif since_open > -BC_CLIMB_DEADLINE:
                 self.bc_done(f"did not reach level {bc_entry_level(tier)} in time (level {lvl})", late=True)
                 return False
             else:
                 return False      # keep leveling (and resetting) toward the range
+        if b["phase"] == "farm":
+            # in range: keep farming (no EXP at the bar) until :57 or a few levels below the top
+            top = max(hi - BC_FARM_TOP_MARGIN, lo)
+            if in_bc(s.get("map")):
+                b["phase"] = "prep"
+            elif lvl > hi:
+                self.bc_done(f"level {lvl} went past the range ({lo}-{hi})")
+                return False
+            elif since_open >= -BC_FARM_UNTIL_SEC or lvl >= top:
+                why = f"level {lvl} (stop at {top})" if lvl >= top else f"{int(-since_open)}s before the door"
+                self.log(f"BC{tier}: {why} -> stop farming, cloak + bar")
+                b["phase"] = "prep"
+            else:
+                if not b.get("farm_logged"):
+                    b["farm_logged"] = True
+                    self.log(f"BC{tier}: level {lvl}, farming until level {top} or "
+                             f"{BC_FARM_UNTIL_SEC // 60} min before the door")
+                return False
         self.mode = "bc"
         if b["phase"] == "prep" and lvl < DEVIAS_MIN_LEVEL and not in_bc(s.get("map")):
             self.log(f"BC{tier}: level {lvl} is too low for /move Devias ({DEVIAS_MIN_LEVEL}) -> leveling a bit first")
@@ -1416,11 +1703,42 @@ class Agent:
                     c.set_window("normal")
                 self.log(f"BC: >>> please click 'Castle {tier}' in {self.name}'s window <<<")
             return
-        self.log(f"BC: clicking '{btn.get('label')}'")
+        b["clicks"] = b.get("clicks", 0) + 1
+        if b["clicks"] <= 2 or b["clicks"] % 6 == 0:
+            self.log(f"BC: clicking '{btn.get('label')}' (try {b['clicks']})")
+        t_click = int(time.time() * 1000)
         try:
             c.page.mouse.click(btn["x"], btn["y"])
         except Exception as e:
             self.log(f"BC: click failed {e!r}")
+        self.bc_entry_check(b, t_click)
+
+    def bc_entry_check(self, b, t_click):
+        """After a castle click: log what the server answered (the bot used to be blind here: at
+        06:00 wizzardo and cucaracha clicked 57 times each and never got in), and after
+        BC_ENTER_FAILS_RELOAD clicks without getting in, reload + log in again -- that is what got
+        wizzardo in at 07:03 after the server hiccup that made every client show level 10."""
+        c = self.c
+        time.sleep(1.5)
+        if in_bc((c.refresh() or {}).get("map")):
+            return
+        r = self.ev(B.BC_ENTER_RESULT_JS, t_click) or {}
+        e, msg = r.get("enter"), r.get("msg")
+        if e or msg:
+            what = (f"enter result {e['code']} = {B.BC_ENTER_RESULTS.get(e['code'], '?')} [{e['hex']}]"
+                    if e else "no enter result")
+            line = f"{what}" + (f" | server: {msg}" if msg else "")
+            if line != b.get("enter_said"):
+                b["enter_said"] = line
+                self.log(f"BC: not in yet - {line} | client level {c.s.get('level')}")
+        elif b["clicks"] in (2, BC_ENTER_FAILS_RELOAD):
+            self.log(f"BC: not in yet - the server sent no answer to the click | client level {c.s.get('level')}")
+        if b["clicks"] >= BC_ENTER_FAILS_RELOAD and b.get("reloads", 0) < BC_ENTER_MAX_RELOADS:
+            b["reloads"] = b.get("reloads", 0) + 1
+            b["clicks"] = 0
+            b["talk_at"] = time.time() + 20     # don't count the cloak as consumed while logging back in
+            c.reload_page(f"Blood Castle: {BC_ENTER_FAILS_RELOAD} clicks without getting in "
+                          f"(reload {b['reloads']}/{BC_ENTER_MAX_RELOADS})")
 
     def walk_in_castle(self, b, x, y, radius=2):
         c, s = self.c, self.c.s
@@ -1626,6 +1944,22 @@ class Agent:
         r = self.ev(B.MSGWIN_JS)
         if r:
             self.log(f"message window closed ({r.get('how')}){' - STILL OPEN' if r.get('still') else ''}: {r.get('txt')}")
+        open_t = self.ev("(ts) => { const t = window.__store && window.__store.pendingNpcTalk; "
+                         "return !!t && ts.includes(t.npcType); }", B.NPC_TALK_CLOSE_TYPES)
+        if not open_t:
+            self.npc_talk_since = 0
+        elif not self.npc_talk_since:
+            self.npc_talk_since = now
+        elif now - self.npc_talk_since >= B.NPC_TALK_CLOSE_AFTER:
+            self.close_npc_talk("stuck on screen")
+
+    def close_npc_talk(self, tag):
+        r = self.ev(B.NPC_TALK_CLOSE_JS, B.NPC_TALK_CLOSE_TYPES)
+        if r:
+            self.log(f"{r.get('name')} dialog closed ({tag}: {r.get('how')})"
+                     f"{' - STILL OPEN' if r.get('still') else ''}")
+            if not r.get("still"):
+                self.npc_talk_since = 0
 
     def close_dialogs(self, b, tag):
         """The Archangel leaves a dialog on screen after the delivery: log what is open, close the
@@ -1642,6 +1976,8 @@ class Agent:
         if after.get("flags"):
             hit = self.ev(B.CLICK_OK_JS)
             self.log(f"BC: still open after closing: {after.get('flags')} -> clicked {hit!r}")
+            if tag != "1s after the end":      # give the delivery a moment before forcing it shut
+                self.close_npc_talk(f"BC {tag}")
 
     def end_phase(self, b, since_end):
         c, s = self.c, self.c.s
@@ -1690,19 +2026,22 @@ def build_plan(hub, open_at, taken=None, skip=()):
     now = time.time()
     snap = hub.snapshot()
     avail = {n: i for n, i in snap.items()
-             if i.get("online") and not i.get("paused") and i.get("level") and n not in skip}
+             if i.get("online") and not i.get("paused") and i.get("level") and n not in skip
+             and not i.get("assisted")}          # being carried after a grand reset: no Blood Castle
+    pinned = {n for n, i in avail.items() if i.get("pair_lead")}   # carrying someone: may only hold
     rl = hub.reset_level or G.ROUTE[-1][1]
     left_min = (open_at - BC_CLIMB_DEADLINE - now) / 60
     taken, assign, why = dict(taken or {}), {}, {}
     for t, lo, hi in BC_TIERS:                       # holders: already in a castle's range
-        inside = sorted((n for n, i in avail.items() if lo <= i["level"] <= hi),
+        inside = sorted((n for n, i in avail.items() if lo <= i["level"] <= hi
+                         and not (n in pinned and i["level"] < DEVIAS_MIN_LEVEL)),
                         key=lambda n: (avail[n]["level"], n))
         if inside and t not in taken:
             taken[t] = inside[0]
             assign[inside[0]] = (t, "hold" if avail[inside[0]]["level"] >= DEVIAS_MIN_LEVEL else "climb")
             why[inside[0]] = f"lvl {avail[inside[0]]['level']}"
     # climbers: nearest free castle above them they can reach in time (lowest levels pick first)
-    for n in sorted((n for n in avail if n not in assign), key=lambda n: (avail[n]["level"], n)):
+    for n in sorted((n for n in avail if n not in assign and n not in pinned), key=lambda n: (avail[n]["level"], n)):
         lvl = avail[n]["level"]
         rate = max(avail[n].get("rate") or BC_DEFAULT_RATE, 1.0)
         for t, lo, hi in BC_TIERS:
@@ -1718,7 +2057,7 @@ def build_plan(hub, open_at, taken=None, skip=()):
     if 1 not in taken:
         lo1 = BC_TIERS[0][1]
         best = None
-        for n in (n for n in avail if n not in assign):
+        for n in (n for n in avail if n not in assign and n not in pinned):
             lvl = avail[n]["level"]
             rate = max(avail[n].get("rate") or BC_DEFAULT_RATE, 1.0)
             mins = max(rl - lvl, 0) / rate + BC_RESET_OVERHEAD + bc_entry_level(1) / BC_LOW_RATE

@@ -49,13 +49,49 @@ ZEN_CHEST_SLOT   = 0                    # first slot of her shop (used if the na
 SHOP_GIVE_UP_SEC = 180                  # stop trying after this long
 
 # (from_level, to_level, /move alias, map index, [main spot, alternate spots...])
-# Map indexes from the client: Lorencia=0, Arena2=83, Arena3=84, Arena4=85
+# Map indexes from the client: Lorencia=0, Arena ("Stadium")=6, Arena2=83, Arena3=84, Arena4=85
 ROUTE = [
-    (1,   100, "Lorencia", 0,  [(34, 50)]),
-    (100, 200, "Arena2",   83, [(47, 83), (65, 76), (51, 57)]),
-    (200, 300, "Arena3",   84, [(48, 74), (70, 113), (85, 77)]),
-    (300, 400, "Arena3",   84, [(48, 37), (48, 56), (67, 70)]),
+    # (from lvl, to lvl, /move alias, map index, spots). Juan 2026-10-11: out of Lorencia at 50.
+    (1,   50,  "Lorencia", 0,  [(38, 58), (30, 31)]),   # (63,80) and (33,65) dropped: no good
+    (50,  100, "Stadium",  6,  [(69, 81), (48, 94), (46, 74), (49, 56), (49, 39)]),   # "Arena" (/move stadium, lvl 50);
+                                                                                      # coords copied from Arena4
+    (100, 200, "Arena2",   83, [(47, 83), (69, 81), (51, 57)]),
+    (200, 300, "Arena3",   84, [(48, 87), (69, 81), (85, 77)]),
+    (300, 400, "Arena4",   85, [(69, 81), (48, 94), (46, 74), (49, 56), (49, 39)]),   # order = learned rates
 ]
+# A spot is (x, y) on the leg's own map, or ("<alias>", x, y) on another map of this list
+# (/move <alias> is used to get there). The leg's map stays the default.
+MAP_INDEX = {"Lorencia": 0, "Devias": 2, "Stadium": 6, "Arena2": 83, "Arena3": 84, "Arena4": 85}
+
+
+class Spot(tuple):
+    """(x, y) that also knows its map: unpacks / compares as (x, y), prints as "Arena4 (69, 81)"
+    when it is not on the leg's own map."""
+
+    def __new__(cls, xy, alias, map_idx, other_map=False):
+        t = super().__new__(cls, xy)
+        t.alias, t.map, t.other_map = alias, map_idx, other_map
+        return t
+
+    def __repr__(self):
+        return f"{self.alias} ({self[0]}, {self[1]})" if self.other_map else f"({self[0]}, {self[1]})"
+
+    __str__ = __repr__
+
+
+def _spot(leg_alias, leg_map, sp):
+    if len(sp) == 3:
+        return Spot((sp[1], sp[2]), sp[0], MAP_INDEX[sp[0]], other_map=sp[0] != leg_alias)
+    return Spot((sp[0], sp[1]), leg_alias, leg_map)
+
+
+ROUTE = [(f, t, a, m, [_spot(a, m, sp) for sp in spots]) for f, t, a, m, spots in ROUTE]
+
+
+def spot_step(entry, i):
+    """(frm, to, alias, map_idx, x, y) for spot i of a ROUTE entry (alias / map of that spot)."""
+    sp = entry[4][i]
+    return (entry[0], entry[1], sp.alias, sp.map, sp[0], sp[1])
 
 # ── when to switch to an alternate spot ──
 # A spot is judged by LEVELS PER MINUTE of the slowest character still below the reset level
@@ -99,6 +135,7 @@ LEASH_RADIUS     = 25       # tiles: helper drifted further than this -> walk ba
 STUCK_SECONDS    = 45       # no walking progress this long -> re-warp
 DISCONNECT_RELOAD_SECONDS = 60  # out of game this long with no progress -> reload the page
 SELECT_TRIES     = 3        # character-select attempts before falling back to a page reload
+GRAND_RESET_CONFIRM_SEC = 20  # r0 / lvl <= 10 must read this long in a row before it counts as a grand reset
 HELPER_FAILS_RELOAD = 3     # MU Helper toggle failed this many times in a row -> reload that window
 INVITE_EVERY     = 10       # seconds between party invites to the same member
 TICK             = 1.0      # seconds between group checks
@@ -135,6 +172,7 @@ STATE_JS = """
     name: p.name, level: p.level, resets: p.resets, exp: Number(p.exp) || 0,
     x: hero ? Math.floor(hero.transform.pos.x) : p.x,
     y: hero ? Math.floor(hero.transform.pos.z) : p.y, hp: p.currentHP, maxHP: p.maxHP, money: p.money,
+    vit: p.sta, points: p.points,
     map: w ? w.mapIndex : -1,
     helper: !!(s.muHelper && s.muHelper.active),
     loginVisible: !!document.querySelector('input[type=password]'),
@@ -212,6 +250,9 @@ class SpotStats:
 
     @staticmethod
     def key(alias, spot):
+        # a ROUTE spot always knows its own map ("Arena4" spots in the Arena3 leg are stored as Arena4)
+        if isinstance(spot, Spot):
+            alias = spot.alias + ("/solo" if alias.endswith("/solo") else "")
         return f"{alias} {spot[0]},{spot[1]}"
 
     def add(self, alias, spot, levels, minutes):
@@ -309,6 +350,7 @@ class Char:
         self.follow_strikes = 0     # consecutive follow checks too far from the main
         self.helper_fails = 0       # consecutive failed MU Helper toggles
         self.known = (-1, 0)       # (resets, highest level seen at that reset count)
+        self.grand_seen = self.grand_last = None  # first / last time the client read r0 / lvl <= 10 (possible grand reset)
         self.stale_logged = False
         self.minimized = False
         self.bc = None              # Blood Castle per-character state (mu_bc.py)
@@ -339,10 +381,13 @@ class Char:
         # The client's level can go stale after a map-server switch / reconnect (it re-reads the
         # character list from login time, e.g. "10" right after a reset) and characters that
         # don't kill anything never get a level-up packet to correct it.
-        # Rule: within the same reset count, the level can only go up.
+        # Rule: within the same reset count, the level can only go up. The reset count only goes
+        # down on a grand reset (0 resets, level 1); any other drop is stale data.
         lvl, rs = self.s.get("level"), self.s.get("resets")
         if self.s.get("inGame") and lvl and rs is not None:
             k_rs, k_lvl = self.known
+            if rs >= k_rs:
+                self.grand_seen = None
             if rs > k_rs:
                 if k_rs >= 0:  # reset counter went up -> a reset really happened
                     self.log(f"RESET confirmed -> resets={rs}")
@@ -350,6 +395,29 @@ class Char:
                     if SHOP_AFTER_RESET:
                         self.shop_pending, self.shop_started = True, time.time()
                 self.known = (rs, lvl)
+            elif rs < k_rs:
+                now = time.time()
+                if rs == 0 and k_rs >= 2 and lvl <= 10 and self.s.get("maxHP") and self.grand_seen \
+                        and now - self.grand_last <= 10 and now - self.grand_seen >= GRAND_RESET_CONFIRM_SEC:
+                    # grand reset (done by hand): back to level 1 / 0 resets -> start tracking from scratch.
+                    # Only after it reads "r0" for GRAND_RESET_CONFIRM_SEC in a row: a single r0/lvl 1
+                    # read while the client loads made three false "GRAND RESET" on wizzardo.
+                    self.log(f"GRAND RESET detected (resets {k_rs} -> 0, level {lvl})")
+                    self.known, self.stale_logged, self.grand_seen = (rs, lvl), False, None
+                    self.walk_target = None
+                    self.spot = None
+                else:
+                    if rs == 0 and k_rs >= 2 and lvl <= 10:
+                        if not self.grand_seen or now - self.grand_last > 10:
+                            self.grand_seen = now          # (re)start: the reads must be back to back
+                        self.grand_last = now
+                    else:
+                        self.grand_seen = None
+                    # a lower reset count that isn't a grand reset = stale client data: keep what we know
+                    if not self.stale_logged:
+                        self.log(f"client shows r{rs} lvl {lvl}, keeping known r{k_rs} lvl {k_lvl}")
+                        self.stale_logged = True
+                    self.s["resets"], self.s["level"] = k_rs, k_lvl
             elif rs == k_rs and lvl < k_lvl:
                 if not self.stale_logged:
                     self.log(f"client shows level {lvl}, keeping known level {k_lvl}")
@@ -814,9 +882,7 @@ class Group:
             self._arrived_new_spot()
             if SCOUT_ON_NEW_ZONE and len(spots) > 1:
                 self.start_scouting()
-        frm, to, alias, map_idx, spots = ROUTE[key]
-        x, y = spots[self.spot_idx]
-        return (frm, to, alias, map_idx, x, y), spots
+        return spot_step(ROUTE[key], self.spot_idx), ROUTE[key][4]
 
     def rate_text(self, alias, spot):
         r = self.stats.rate(alias, spot)
@@ -857,11 +923,12 @@ class Group:
         c = self.leader
         s = c.s
         now = time.time()
-        _, _, alias, map_idx, _, _ = step
         if now - self.scout_started > SCOUT_GIVE_UP_SEC:
             return self.finish_scouting(spots, "took too long")
         if self.scout_i >= len(self.scout_order):
             return self.finish_scouting(spots, "all spots occupied")
+        sp = spots[self.scout_order[self.scout_i]]
+        alias, map_idx = sp.alias, sp.map          # the spot being checked may be on another map
         if s["map"] != map_idx:
             if now - c.last_warp > 15:
                 c.set_helper(False)

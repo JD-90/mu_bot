@@ -16,6 +16,8 @@ What it records (only changes, so the file stays readable):
     of each new monster type once
   * items dropping on the ground near you, your bag gaining / losing items, zen changes
   * your map, position (every few seconds while moving), HP, deaths, MU Helper on/off
+  * other players within RECORD_PLAYER_RADIUS: arriving / leaving / dying / outlaw state changes,
+    who you are attacking, the selected skill, and your HP while a player is close (PvP)
   * on stop: a summary (monsters seen by name, events by count, items gained / lost)
 """
 import threading
@@ -28,11 +30,13 @@ RECORD_FILE        = Path(__file__).with_name("mu_record.log")
 RECORD_EVERY       = 1.0     # seconds between samples
 RECORD_RADIUS      = 30      # tiles: monsters / ground items further than this are ignored
 RECORD_POS_EVERY   = 5       # seconds between position lines while moving
+RECORD_PLAYER_RADIUS = 15    # tiles: other players closer than this are logged (enter / leave / die / outlaw)
+RECORD_FIGHT_RADIUS  = 10    # tiles: with a player this close, log my HP changes and a 'near' line every 3 s
 
 _lock = threading.Lock()
 
 REC_JS = r"""
-([cmd, R_RADIUS, POS_EVERY]) => {
+([cmd, R_RADIUS, POS_EVERY, P_RADIUS, F_RADIUS]) => {
   const out = [];
   const W = window, s = W.__store, w = W.__world, soc = W.__social, bus = W.__eventBus;
   if (!s || !w) return ['(game not loaded)'];
@@ -82,6 +86,8 @@ REC_JS = r"""
                    drops: new Map(), bag: bag(), money: p.money, map: w.mapIndex, lastPos: pos, lastPosAt: 0,
                    hp: p.currentHP, helper: !!(s.muHelper && s.muHelper.active), rows: {}, rowsAt: now,
                    evCount: {}, evMin: {}, evMinAt: now, evLines: {}, dom: [], mobTotal: {}, kills: {},
+                   players: new Map(), playersSeen: {}, playerDeaths: {}, nearAt: 0, target: null,
+                   skill: s.currentSkill, fightHp: p.currentHP,
                    bag0: bag(), money0: p.money};
     W.__recOn = true;
     out.push(rearm ? '(page was reloaded: recorder re-armed)' :
@@ -153,6 +159,7 @@ REC_JS = r"""
     out.push(`STOP after ${mins} min | map ${w.mapIndex} pos (${pos.x},${pos.y}) lvl ${p.level} | zen ${(p.money || 0) - (R.money0 || 0) >= 0 ? '+' : ''}${(p.money || 0) - (R.money0 || 0)}`);
     out.push('summary monsters seen: ' + short(R.mobTotal, 1500));
     out.push('summary monsters died: ' + short(R.kills, 1500));
+    out.push('summary players seen: ' + short(R.playersSeen, 1500) + ' | died near me: ' + short(R.playerDeaths, 800));
     out.push('summary items gained: ' + short(gained, 800) + ' | lost: ' + short(lost, 800));
     out.push('summary events: ' + short(Object.entries(R.evCount).sort((a, b) => b[1] - a[1]), 3000));
     W.__rec = null;
@@ -202,7 +209,7 @@ REC_JS = r"""
   }
   R.bag = b;
   // monsters and ground items in range
-  const seen = new Set(), seenDrops = new Set();
+  const seen = new Set(), seenDrops = new Set(), seenPlayers = new Set(), fight = [];
   for (const e of ents) {
     if (e.localPlayer) continue;
     const d = near(e);
@@ -215,6 +222,28 @@ REC_JS = r"""
         R.drops.set(e.netId, 1);
         out.push(`ground + ${it.isMoney ? 'zen' : (e.objectNameInWorld || '?')} ${it.isMoney ? '' : `[${it.group}/${it.num}${it.item && it.item.lvl ? ' +' + it.item.lvl : ''}]`} at (${x},${y}) ${Math.round(d)} tiles`);
       }
+      continue;
+    }
+    const isPlayer = e.npcType === undefined && e.netId !== undefined && (!!e.playerAnimation || e.skin !== undefined);
+    if (isPlayer) {
+      if (d > P_RADIUS) continue;
+      seenPlayers.add(e.netId);
+      const name = e.objectNameInWorld || ('#' + e.netId);
+      const cls = e.charAppearance ? e.charAppearance.charClass : '?';
+      const hs = e.heroState;
+      const pl = R.players.get(e.netId);
+      if (!pl) {
+        R.players.set(e.netId, {name, x, y, hs, dying: !!e.dying});
+        R.playersSeen[name] = (R.playersSeen[name] || 0) + 1;
+        out.push(`player + ${name} [class ${cls} state ${hs} #${e.netId}] at (${x},${y}) ${Math.round(d)} tiles`);
+      } else {
+        pl.x = x; pl.y = y;
+        if (hs !== pl.hs) { out.push(`player ${name} state ${pl.hs} -> ${hs}`); pl.hs = hs; }
+        if (e.dying && !pl.dying) { pl.dying = true; R.playerDeaths[name] = (R.playerDeaths[name] || 0) + 1;
+          out.push(`player DIED ${name} at (${x},${y}) ${Math.round(d)} tiles`); }
+        else if (!e.dying && pl.dying) pl.dying = false;
+      }
+      if (d <= F_RADIUS) fight.push(`${name}(${Math.round(d)}${hs > 3 ? ' outlaw' + hs : ''})`);
       continue;
     }
     if (e.npcType === undefined || !e.monsterAnimation) continue;
@@ -237,6 +266,20 @@ REC_JS = r"""
     if (!m.dying) out.push(`mob - ${m.name} #${id} left view at (${m.x},${m.y})`);
   }
   for (const id of [...R.drops.keys()]) if (!seenDrops.has(id)) R.drops.delete(id);
+  for (const [id, pl] of R.players) if (!seenPlayers.has(id)) {
+    R.players.delete(id);
+    if (!pl.dying) out.push(`player - ${pl.name} left (${pl.x},${pl.y})`);
+  }
+  // what I'm attacking (players and monsters) and which skill is selected
+  const t = w.attackTarget;
+  const tName = t ? (t.objectNameInWorld || ('#' + t.netId)) + (t.npcType === undefined ? ' [player]' : '') : null;
+  if (tName !== R.target) { out.push('my target: ' + (tName || 'none')); R.target = tName; }
+  if (s.currentSkill !== R.skill) { out.push('skill selected: ' + short(s.currentSkill, 120)); R.skill = s.currentSkill; }
+  // fight: a player close by -> my HP changes and who is near
+  if (fight.length) {
+    if (hp !== R.fightHp) { out.push(`my hp ${R.fightHp} -> ${hp}/${p.maxHP}`); R.fightHp = hp; }
+    if (now - R.nearAt >= 3000) { R.nearAt = now; out.push(`near: ${fight.join(', ')} | my hp ${hp}/${p.maxHP}`); }
+  } else R.fightHp = hp;
   return out;
 }
 """
@@ -263,7 +306,7 @@ class Recorder:
 
     def _run(self, cmd):
         try:
-            return self.page.evaluate(REC_JS, [cmd, RECORD_RADIUS, RECORD_POS_EVERY]) or []
+            return self.page.evaluate(REC_JS, [cmd, RECORD_RADIUS, RECORD_POS_EVERY, RECORD_PLAYER_RADIUS, RECORD_FIGHT_RADIUS]) or []
         except Exception as e:
             return [f"(recorder error: {str(e)[:200]})"]
 
