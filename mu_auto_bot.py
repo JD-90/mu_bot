@@ -22,8 +22,9 @@ Blood Castle (15 minutes before every castle, BC_PLAN_SEC):
   * The others CLIMB to the nearest free castle above them that they can reach in time
     (or reset and climb to BC1 when close to the reset level and BC1 is free). Once inside the
     range they stop and hold. Not there 2 minutes before the castle -> skip it, keep leveling.
-  * Inside: wait for an invite for BC_WAIT_INVITE_SEC after the first other player shows up;
-    no invite -> invite every player in view, and keep inviting new arrivals. Then walk up the
+  * Inside: once another player shows up, say "party?" and wait BC_WAIT_INVITE_SEC for an invite;
+    no invite -> invite the players in view who are NOT already in a party (the game's reply to
+    an invite tells us), and keep inviting new arrivals. Then walk up the
     corridor, destroy the statue, take the weapon and deliver it (or rush back to the
     Archangel when someone else has it), pick up the Box of Kundun +5, back to leveling.
 
@@ -58,6 +59,7 @@ Pause: P pauses / resumes EVERY character. Keys 1-5 pause / resume ONE character
        maximized window at full render scale while paused (back to 800x500 / low on resume).
 """
 import math
+import re
 import socket
 import sys
 import threading
@@ -69,6 +71,7 @@ from playwright.sync_api import sync_playwright, Error as PWError
 import mu_group_bot as G
 import mu_bc as B
 import mu_gi as GI
+import mu_chat as CH
 from mu_bc import in_bc, dist
 
 # ───────────────────────────── CONFIG ─────────────────────────────
@@ -112,7 +115,8 @@ BC_ENTER_MARGIN     = 3     # climbers stop this many levels inside the range (n
 BC_DEFAULT_RATE     = 15    # levels/min assumed when a character's recent rate is unknown
 BC_RESET_OVERHEAD   = 1.5   # minutes for /reset + Zen Chests + walking out of town
 BC_LOW_RATE         = 25    # levels/min right after a reset (Lorencia)
-BC_WAIT_INVITE_SEC  = 30    # inside: wait this long for a stranger's invite before inviting ourselves
+BC_WAIT_INVITE_SEC  = 8     # inside: after asking "party?", wait this long for an invite before inviting ourselves (was 30; Juan 2026-10-11)
+BC_ASK_PARTY_TEXT   = "party?"   # said once in normal chat when the first other player shows up
 BC_INVITE_EVERY     = 10    # seconds between invites to the same player
 BC_SHOW_WINDOW_AFTER = 2    # entry dialog not found this many times -> restore the window so you can click
 DEVIAS_MIN_LEVEL    = 20    # /move Devias (Spirit of Archangel) needs this level: BC1 entries wait for it
@@ -312,8 +316,10 @@ class Agent:
         self.leveler_off_since = None
         self.vit_check = 0
         self.vit_fails = 0
-        # Golden Invasion hunter (mu_gi.py): only the characters in GI.GI_CHARS
-        self.gi = GI.GoldenInvasion(self) if GI.GI_ENABLED and self.name.lower() in GI.GI_CHARS else None
+        # Golden Invasion hunter (mu_gi.py): GI.GI_CHARS + every character with max stats (checked live)
+        self.gi = GI.GoldenInvasion(self) if GI.GI_ENABLED else None
+        # Chat replies to other players (mu_chat.py; dry run = log only, see CH.CHAT_SEND)
+        self.chat = CH.ChatAgent(self, hub.chat) if getattr(hub, "chat", None) else None
 
     def log(self, msg):
         log(msg, self.name)
@@ -465,7 +471,7 @@ class Agent:
             "bc_away": self.bcs is not None and self.bcs.get("phase") not in ("climb", "farm"), "boxes": self.boxes, "bag_free": self.bag_free,
             "assisted": self.assisted(), "leveler": self.leveler_name if self.assisted() else None,
             "pair_lead": bool(self.my_levelees()), "parked": self.pair_parked,
-            "gi_hunter": self.gi is not None,
+            "gi_hunter": bool(self.gi and self.gi.is_hunter()),
         })
 
     def recent_rate(self):
@@ -523,6 +529,11 @@ class Agent:
             return
         s = c.s
         now = time.time()
+        if self.chat:                       # before everything else: also answers during Blood Castle
+            try:
+                self.chat.tick()
+            except Exception as e:
+                self.log(f"chat error: {e!r}")
         lvl = s.get("level") or 1
         if not self.history or now - self.history[-1][0] >= 10:
             self.history.append((now, lvl, s.get("resets")))
@@ -1018,6 +1029,8 @@ class Agent:
             why = "is paused"
         elif L.get("bc_away"):
             why = "is busy with Blood Castle"
+        elif L.get("mode") == "gi":
+            why = "is hunting the Golden Invasion"
         elif not L.get("online"):
             self.leveler_off_since = self.leveler_off_since or now
             if now - self.leveler_off_since > PAIR_LEVELER_GRACE:
@@ -1482,7 +1495,8 @@ class Agent:
                             "phase": "farm" if role == "hold" else "climb",
                             "cloak": False, "talk_at": 0, "no_dialog": 0, "entered": False,
                             "burst_until": 0, "tried": set(), "box": False, "box_try": None,
-                            "first_stranger": None, "invited": {}, "end_at": None, "rush": False}
+                            "first_stranger": None, "invited": {}, "end_at": None, "rush": False,
+                            "asked": False, "in_party": set()}
                 self.ev("() => { window.__bcState = null; }")
         b = self.bcs
         if b is None:
@@ -1785,9 +1799,60 @@ class Agent:
                     break
         return False
 
+    # new system / error chat lines and game notifications since the last call (marks what it
+    # returns, so it never touches mu_chat's own cursor); prime=True only marks, returns nothing
+    SYS_MSGS_JS = """(prime) => {
+      const out = [], soc = window.__social, st = window.__store;
+      for (const l of (soc && soc.chatLines) || []) {
+        if (typeof l !== 'object' || l.__bcSeen) continue;
+        l.__bcSeen = true;
+        if (!prime && (l.type === 3 || l.type === 4 || !l.sender)) out.push(l.text || '');
+      }
+      for (const n of (st && st.notifications) || []) {
+        if (typeof n !== 'object' || n.__bcSeen) continue;
+        n.__bcSeen = true;
+        if (!prime) out.push(n.text || n.message || JSON.stringify(n));
+      }
+      return out;
+    }"""
+
+    # diagnostic, once per run: what the client knows about another player (looking for a party flag)
+    PLAYER_DUMP_JS = """(ours) => {
+      const w = window.__world;
+      const e = w.netObjsQuery.entities.find(e => !e.localPlayer && e.charAppearance &&
+                  e.objectNameInWorld && !ours.includes(e.objectNameInWorld));
+      if (!e) return null;
+      const hits = {};
+      for (const k of Object.keys(e)) {
+        if (/party|guild|team|group|leader/i.test(k)) {
+          try { hits[k] = JSON.stringify(e[k]).slice(0, 120); } catch (_) { hits[k] = '?'; }
+        }
+      }
+      return {name: e.objectNameInWorld, hits, keys: Object.keys(e).join(',')};
+    }"""
+    player_dumped = False
+
+    IN_PARTY_RE = re.compile(r"(already|ya\s+(est[aá]|tiene|pertenece)|otro|another|in a party|en un (grupo|party))", re.I)
+
+    def bc_party_replies(self, b):
+        """Read the game's answers to our invites: a player who is already in a party is skipped."""
+        msgs = self.ev(self.SYS_MSGS_JS, False) or []
+        for m in msgs:
+            if not m:
+                continue
+            if b.get("inviting"):
+                self.log(f"BC: game says: {m[:120]}")
+            if not re.search(r"party|grupo", m, re.I) or not self.IN_PARTY_RE.search(m):
+                continue
+            for n in b["invited"]:
+                if n in m and n not in b["in_party"]:
+                    b["in_party"].add(n)
+                    self.log(f"BC: {n} is already in a party -> not inviting him again")
+
     def bc_party(self, b):
-        """Wait BC_WAIT_INVITE_SEC for a stranger's invite once someone shows up; then invite
-        everyone in view (and keep inviting new arrivals) while we lead and have room."""
+        """Once another player shows up: say "party?" and wait BC_WAIT_INVITE_SEC for an invite;
+        then invite the players in view who aren't already in a party (and keep inviting new arrivals)
+        while we lead and have room."""
         s = self.c.s
         now = time.time()
         party = s.get("party") or []
@@ -1798,10 +1863,25 @@ class Agent:
             else:
                 self.ev("() => window.__social.partyRespond(false)")
             return
+        if not b.get("sys_primed"):
+            b["sys_primed"] = True
+            self.ev(self.SYS_MSGS_JS, True)
+        self.bc_party_replies(b)
         players = (self.ev(B.SCAN_JS, [self.hub.names, B.CLEAR_RADIUS, 0, 0, None]) or {}).get("players", [])
+        if players and not Agent.player_dumped:
+            dump = self.ev(self.PLAYER_DUMP_JS, self.hub.names)
+            if dump:
+                Agent.player_dumped = True
+                self.log(f"BC diag: player entity {dump.get('name')}: party-ish fields {dump.get('hits')} | keys {dump.get('keys')}")
         if players and b["first_stranger"] is None:
             b["first_stranger"] = now
-            self.log(f"BC: other players here ({', '.join(players[:4])}) -> waiting {BC_WAIT_INVITE_SEC}s for an invite")
+            if len(party) <= 1 and not b["asked"]:
+                b["asked"] = True
+                self.log(f"BC: other players here ({', '.join(players[:4])}) -> asking '{BC_ASK_PARTY_TEXT}', "
+                         f"waiting {BC_WAIT_INVITE_SEC}s for an invite")
+                self.c.chat(BC_ASK_PARTY_TEXT)
+            else:
+                self.log(f"BC: other players here ({', '.join(players[:4])})")
         if b["first_stranger"] is None or now - b["first_stranger"] < BC_WAIT_INVITE_SEC:
             return
         if len(party) > 1 and party[0] != self.name:
@@ -1810,10 +1890,12 @@ class Agent:
             return
         if not b.get("inviting"):
             b["inviting"] = True
-            self.log("BC: no invite came -> inviting the players here myself")
+            self.log("BC: no invite came -> inviting the players here who aren't in a party")
         counts = b.setdefault("invite_n", {})
         for n in players:
-            if n in party or now - b["invited"].get(n, 0) < BC_INVITE_EVERY or counts.get(n, 0) >= BC_INVITE_MAX:
+            if n in party or n in b["in_party"]:
+                continue
+            if now - b["invited"].get(n, 0) < BC_INVITE_EVERY or counts.get(n, 0) >= BC_INVITE_MAX:
                 continue
             b["invited"][n] = now
             counts[n] = counts.get(n, 0) + 1
@@ -2176,6 +2258,9 @@ def main():
     log("=== MU auto bot starting ===")
     names = [a["character"] for a in G.ACCOUNTS]
     hub = Hub(names)
+    if CH.CHAT_ENABLED:
+        hub.chat = CH.ChatHub(names)
+        log(hub.chat.startup_line())
     agents = [Agent(acc, i, hub) for i, acc in enumerate(G.ACCOUNTS)]
     threads = []
     for a in agents:

@@ -12,6 +12,8 @@ Timeline (start = the event start read from the event panel, normally :50:00):
                       * no PvP over small golden mobs (a small golden with a player next to it is skipped)
                       * a player that hits us is fought back
                       * Ice Storm (skill GI_SKILL) on every target
+                      * mages: Soul Barrier (GI_BARRIER_SKILL) on themselves every time they step out of
+                        a safe zone (waiting spot, after a warp, after a respawn), from PREP to the end
                       * potion (hotkey Q) every 0.2 s while a player has hit us in the last 2 s
                       * Box of Kundun on the ground -> pick it up; a locked box (someone else's) ->
                         keep trying for GI_BOX_WAIT_SEC while fighting players who come close
@@ -34,13 +36,28 @@ import mu_group_bot as G
 
 # ───────────────────────────── CONFIG ─────────────────────────────
 GI_ENABLED       = True
-GI_CHARS         = {"wizzardo"}     # who hunts (lower case); alts have too little HP
+GI_CHARS         = {"wizzardo"}     # always hunt (lower case) ...
+GI_MAX_STATS     = True             # ... plus every character with ALL 4 stats >= GI_MIN_STAT (Juan 2026-10-11)
+GI_MIN_STAT      = 65000            # "max stats": STR, AGI, VIT and ENE all at least this
+GI_STATS_EVERY   = 300              # seconds between stat checks
+GI_SKILLS        = {}               # fixed skill per character (lower-case name -> skill number); empty = by class:
+                                    # Ice Storm if owned (Soul Masters), else the Dark Knight combo, else the selected skill
 GI_START_MINUTE  = 50               # fallback when the event panel can't be read (PC clock)
 GI_PREP_SEC      = 60               # start preparing this long before the start (:49:00)
 GI_WAIT_SEC      = 30               # be at the waiting spot this long before the start (:49:30)
 GI_HUNT_SEC      = 180              # hunt this long (:50:00 -> :53:00)
 GI_WAIT_DIST     = 20               # waiting spot: this many tiles outside the Noria safe zone
-GI_SKILL         = 39               # Ice Storm
+GI_SKILL         = 39               # default for GI_SKILLS (Ice Storm)
+GI_BARRIER       = True             # mages: Soul Barrier on yourself every time you leave a safe zone (Juan 2026-10-11)
+GI_BARRIER_SKILL = 16               # Soul Barrier (only characters that have it cast it)
+GI_FORTITUDE_SKILL = 48             # Dark Knight: Greater Fortitude (Swell Life), cast like the barrier ...
+GI_FORTITUDE_REFRESH = 60           # ... and again before a fight with a player if it's older than this (s)
+GI_MAGE_SKILL    = 39               # anyone who has Ice Storm uses it (Soul Masters, like wizzardo)
+GI_KNIGHT_COMBO  = [[22, 20, 19, 21, 23], 43, 41]   # Dark Knight combo (Juan 2026-10-11):
+                                    # weapon skill (Cyclone 22 / Lunge 20 / ... first one owned) ->
+                                    # Death Stab 43 -> Twisting Slash 41, repeated on every target
+GI_COMBO_STEP_MS = 700              # next combo skill when the server showed the last one, or after this
+GI_BARRIER_TRIES = 4                # casts per safe-zone exit before giving up (each waits ~1.2 s for the server)
 GI_POTION_KEY    = 0                # item hotkey index: 0 = Q
 GI_POTION_ITEM   = (14, 3)          # Large Healing Potion (used if the Q slot can't be read)
 GI_POTION_STACK  = 255              # keep ONE slot of this many potions
@@ -91,7 +108,12 @@ GI_INSTALL_JS = r"""
     potUntil: 0, lastPot: 0, pots: 0, casts: 0, myCasts: 0, lastCast: 0, lastHp: null,
     hostile: new Map(), target: null, targetIsPlayer: false, lastTargetName: null,
     box: null, boxFirstFail: new Map(), boxGaveUp: new Set(), lastPick: 0, pickFails: 0,
-    hitsOnMe: 0, events: [], status: {}, recentTargets: new Map(), chatSeen: new WeakSet()};
+    hitsOnMe: 0, events: [], status: {}, recentTargets: new Map(), chatSeen: new WeakSet(),
+    barrier: false, wasSafe: null, bQueue: [], bTries: 0, bAt: 0, bDone: 0, bEvents: [], buffAt: {},
+    comboIdx: 0, comboAt: 0, attackSkill: null};
+  const SKILL_NAMES = {16: 'Soul Barrier', 48: 'Greater Fortitude'};
+  const sname = n => SKILL_NAMES[n] || ('skill ' + n);
+  const bev = s => { if (G.bEvents.length < 50) G.bEvents.push(s); };
   const ev = s => { if (G.events.length < 300) G.events.push(s); };
   const bus = W.__eventBus;
   const u8 = d => new Uint8Array(d.buffer || d, d.byteOffset || 0, d.byteLength);
@@ -104,23 +126,85 @@ GI_INSTALL_JS = r"""
     // c3 09 19 00 <skill> <caster u16> <target u16>: a player's skill on me = a hit
     bus.on('SkillAnimation', d => { try {
       const u = u8(d), caster = (u[5] << 8) | u[6], target = ((u[7] & 0x7f) << 8) | u[8];
+      const skill = (u[3] << 8) | u[4];
+      // my own buff (Soul Barrier / Greater Fortitude) went through
+      if (G.bQueue.length && G.myId !== null && caster === G.myId && skill === G.bQueue[0]) {
+        G.buffAt[skill] = Date.now(); G.bQueue.shift(); G.bDone++; bev(sname(skill) + ' cast (try ' + G.bTries + ')');
+        G.bTries = 0; G.bAt = 0;
+      }
       if (!G.on || G.myId === null) return;
-      if (caster === G.myId) { G.myCasts++; return; }
+      if (caster === G.myId) { G.myCasts++; G.lastMySkill = skill; G.lastMySkillAt = Date.now(); return; }
       if (target !== G.myId) return;
       const e = (W.__world.byNetId && W.__world.byNetId.get ? W.__world.byNetId.get(caster) : null)
         || W.__world.netObjsQuery.entities.find(x => x.netId === caster);
       if (e && e.npcType === undefined) { G.hostile.set(e.netId, Date.now()); G.potUntil = Date.now() + G.cfg.hitWindow; G.hitsOnMe++; }
     } catch (e) {} });
     bus.on('AreaSkillAnimation', d => { try { const u = u8(d);
-      if (G.on && G.myId !== null && ((u[5] << 8) | u[6]) === G.myId) G.myCasts++; } catch (e) {} });
+      if (G.on && G.myId !== null && ((u[5] << 8) | u[6]) === G.myId) {
+        G.myCasts++; G.lastMySkill = (u[3] << 8) | u[4]; G.lastMySkillAt = Date.now(); } } catch (e) {} });
     bus.on('ItemPickUpRequestFailed', () => { G.pickFails++;
       if (G.box !== null && !G.boxFirstFail.has(G.box)) { G.boxFirstFail.set(G.box, Date.now()); ev('box locked (someone else\'s) -> trying for ' + G.cfg.boxWait / 1000 + ' s'); } });
   }
   const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
   const P = e => ({x: e.transform.pos.x, y: e.transform.pos.z});
+  // Buffs on myself (Soul Barrier for mages, Greater Fortitude for knights) every time I step out of a safe
+  // zone (also when switched on outside, and after a respawn: the respawn is in town). G.wantBuff() queues
+  // a refresh before a fight. True = casting, skip the fight this tick.
+  const owns = (s, n) => !!(n && s.skills && s.skills.some(k => k.number === n));
+  G.wantBuff = (s, n, why) => {
+    if (!owns(s, n) || G.bQueue.includes(n)) return;
+    G.bQueue.push(n); bev(why + ' -> ' + sname(n));
+  };
+  G.barrierTick = (now, w, s) => {
+    const cfg = G.cfg, h = w.playerEntity, pd = s.playerData || {};
+    const buffs = cfg.buffs || [];
+    if (!G.barrier || !buffs.length || !h || !w.getTerrainFlag) { G.wasSafe = null; G.bQueue = []; return false; }
+    if (h.dying || (pd.currentHP || 0) <= 0) { G.wasSafe = true; G.bQueue = []; return false; }
+    G.myId = h.netId;
+    const me = P(h), safe = (w.getTerrainFlag(Math.round(me.x), Math.round(me.y)) & 1) === 1;
+    if (!safe && G.wasSafe !== false)
+      for (const n of buffs) G.wantBuff(s, n, `left the safe zone at (${Math.round(me.x)},${Math.round(me.y)})`);
+    G.wasSafe = safe;
+    if (safe) { G.bQueue = []; return false; }
+    if (!G.bQueue.length) return false;
+    const n = G.bQueue[0];
+    if (now - G.bAt < 1200) return true;                  // waiting for the server to show the cast
+    if (G.bTries >= cfg.barrierTries) { G.bQueue.shift(); bev(sname(n) + ': no cast seen after ' + G.bTries + ' tries -> giving up'); G.bTries = 0; return false; }
+    G.bTries++; G.bAt = now;
+    try {
+      if (s.currentSkill !== n) s.selectSkill(n);
+      w.attackTarget = null;
+      w.castRequest = {target: h, point: {x: me.x, y: me.y}, forced: false, pvp: false};
+    } catch (e) { bev(sname(n) + ' error: ' + String(e).slice(0, 120)); }
+    return true;
+  };
+  // attack skill: GI_SKILLS for this character, else Ice Storm if owned, else the knight combo
+  // (weapon skill -> Death Stab -> Twisting Slash, each owned one in turn), else the selected skill
+  G.pickSkill = (now, s) => {
+    const cfg = G.cfg;
+    if (cfg.skill && owns(s, cfg.skill)) return cfg.skill;
+    if (owns(s, cfg.mageSkill)) return cfg.mageSkill;
+    const combo = [];
+    for (const step of cfg.combo || []) {
+      const opts = Array.isArray(step) ? step : [step];
+      const n = opts.find(o => owns(s, o));
+      if (n) combo.push(n);
+    }
+    if (!combo.length) return null;
+    if (G.comboIdx >= combo.length) G.comboIdx = 0;
+    const cur = combo[G.comboIdx];
+    // the server showed the current one (after we selected it) or it took too long -> next one
+    if ((G.lastMySkill === cur && G.lastMySkillAt > G.comboAt) || now - G.comboAt > cfg.comboStep) {
+      if (G.comboAt) G.comboIdx = (G.comboIdx + 1) % combo.length;
+      G.comboAt = now;
+    }
+    return combo[G.comboIdx];
+  };
   G.tick = () => {
     const now = Date.now(), cfg = G.cfg, w = W.__world, s = W.__store, soc = W.__social;
-    if (!G.on || !w || !s) return;
+    if (!w || !s) return;
+    if (G.barrierTick(now, w, s)) return;
+    if (!G.on) return;
     const h = w.playerEntity, pd = s.playerData || {};
     if (!h) { G.status = {dead: true}; return; }
     G.myId = h.netId;
@@ -208,6 +292,11 @@ GI_INSTALL_JS = r"""
       }
     }
     const isPlayer = !!(target && target.e.npcType === undefined);
+    if (cfg.refreshSkill && (isPlayer || players.some(x => x.d <= cfg.pvpRadius))
+        && now - (G.buffAt[cfg.refreshSkill] || 0) > cfg.refreshMs) {
+      G.buffAt[cfg.refreshSkill] = now;                    // one request per refresh period
+      G.wantBuff(s, cfg.refreshSkill, 'player close');
+    }
     const tName = target ? target.name : null;
     if (tName !== G.lastTargetName) {
       G.lastTargetName = tName;
@@ -221,7 +310,7 @@ GI_INSTALL_JS = r"""
     }
     if (target) {
       G.box = null;
-      try { if (s.currentSkill !== cfg.skill && s.skills && s.skills.some(k => k.number === cfg.skill)) s.selectSkill(cfg.skill); } catch (e) {}
+      try { const sk = G.pickSkill(now, s); G.attackSkill = sk; if (sk && s.currentSkill !== sk) s.selectSkill(sk); } catch (e) {}
       if (!isPlayer) w.attackTarget = target.e;
       if (!w.castRequest && now - G.lastCast > 100) {
         w.castRequest = {target: target.e, point: {x: target.p.x, y: target.p.y}, forced: false, pvp: isPlayer};
@@ -239,7 +328,7 @@ GI_INSTALL_JS = r"""
       target: tName, why, players: players.length, near: players.filter(x => x.d <= cfg.pvpRadius).length,
       goldens: goldens.length, dragon: dragon ? [Math.round(dragon.p.x), Math.round(dragon.p.y), Math.round(dragon.d)] : null,
       boxes: boxes.length, loot: loot.slice(0, 20), hp, maxHp: pd.maxHP, heroState: h.heroState,
-      pots: G.pots, casts: G.casts, myCasts: G.myCasts, hitsOnMe: G.hitsOnMe, pickFails: G.pickFails,
+      attackSkill: G.attackSkill, pots: G.pots, casts: G.casts, myCasts: G.myCasts, hitsOnMe: G.hitsOnMe, pickFails: G.pickFails,
       skill: s.currentSkill, map: w.mapIndex, x: Math.round(me.x), y: Math.round(me.y)};
   };
   G.timer = setInterval(() => { try { G.tick(); } catch (e) { G.err = String(e).slice(0, 200); } }, cfg.loopMs);
@@ -251,6 +340,10 @@ GI_STATUS_JS = """() => { const G = window.__gi; if (!G) return null;
   const ev = G.events.splice(0); return {status: G.status, events: ev, counts: G.counts, countsAt: G.countsAt,
   err: G.err || null, on: G.on}; }"""
 
+# Soul Barrier watcher on/off; returns its events (null = not installed, e.g. the page reloaded)
+GI_BARRIER_JS = """(on) => { const G = window.__gi; if (!G || !G.barrierTick) return null; G.barrier = on;
+  if (!on) { G.bQueue = []; G.wasSafe = null; } return G.bEvents.splice(0); }"""
+
 GI_SET_JS = """(on) => { const G = window.__gi; if (!G) return false; G.on = on;
   if (!on) { const w = window.__world; if (w) { w.castRequest = null; w.attackTarget = null; w.pickupTarget = null; }
              G.target = null; G.box = null; G.potUntil = 0; }
@@ -259,10 +352,11 @@ GI_SET_JS = """(on) => { const G = window.__gi; if (!G) return false; G.on = on;
 # potion slot behind the Q hotkey: {slot, count, group, num, lvl}
 POTION_SLOT_JS = """([key, g, n]) => { const s = window.__store, items = s.playerData.items || [];
   let i = -1; try { i = s.hotkeyItemSlot(key); } catch (e) {}
+  const hk = i;
   let it = i >= 0 ? items[i] : null;
   if (!it) { i = items.findIndex((x, j) => j >= 12 && x && x.group === g && x.num === n); it = i >= 0 ? items[i] : null; }
-  if (!it) return {slot: -1, count: 0, group: g, num: n, lvl: 0};
-  return {slot: i, count: it.durability ?? it.count ?? 1, group: it.group, num: it.num, lvl: it.lvl || 0}; }"""
+  if (!it) return {slot: -1, hk, count: 0, group: g, num: n, lvl: 0};
+  return {slot: i, hk, count: it.durability ?? it.count ?? 1, group: it.group, num: it.num, lvl: it.lvl || 0}; }"""
 
 SHOP_FIND_JS = """([g, n, l]) => { const shop = window.__store.npcShop;
   if (!shop || !shop.items.some(Boolean)) return null;
@@ -304,6 +398,12 @@ WALKABLE_JS = """(pts) => { const w = window.__world; if (!w) return null;
       const a = x + dx, b = y + dy; if (a > 2 && b > 2 && a < 253 && b < 253 && w.isWalkable(a, b)) return [a, b]; }
     return null; }); }"""
 
+# STR / AGI / VIT / ENE (field names differ between clients: take the first one that exists)
+STATS_JS = """() => { const p = (window.__store && window.__store.playerData) || {};
+  const f = (...k) => { for (const x of k) if (typeof p[x] === 'number') return p[x]; return null; };
+  return {str: f('str', 'strength'), agi: f('agi', 'agility', 'dex', 'dexterity'), vit: f('sta', 'vit', 'vitality'),
+          ene: f('ene', 'energy'), keys: Object.keys(p).filter(k => typeof p[k] === 'number').join(',')}; }"""
+
 HERO_STATE_JS = "() => { const h = window.__world && window.__world.playerEntity; return h ? h.heroState : null; }"
 
 BAG_BOXES_JS = """() => { const r = {}; (window.__store.playerData.items || []).forEach((it, i) => {
@@ -322,6 +422,9 @@ class GoldenInvasion:
 
     def __init__(self, agent):
         self.a = agent
+        self.max_stats = None        # True/False once read (GI_MAX_STATS)
+        self.stats_at = 0
+        self.stats_logged = None
         self.phase = "idle"
         self.start_at = None
         self.timer_at = 0
@@ -330,7 +433,6 @@ class GoldenInvasion:
         self.potions_ok = False
         self.wait_spot = None
         self.map_target = None
-        self.grid = {}
         self.goal = None
         self.goal_best = 1e9
         self.goal_progress_at = 0
@@ -382,9 +484,35 @@ class GoldenInvasion:
         if t and t.get("text") != self.last_text and t.get("active"):
             self.last_text = t.get("text")
 
+    def check_stats(self):
+        """Every GI_STATS_EVERY s: are all 4 stats >= GI_MIN_STAT? (cached in self.max_stats)"""
+        if not GI_MAX_STATS or not self.c or not self.c.s.get("inGame"):
+            return
+        now = time.time()
+        if now - self.stats_at < GI_STATS_EVERY:
+            return
+        self.stats_at = now
+        st = self.ev(STATS_JS) or {}
+        vals = [st.get(k) for k in ("str", "agi", "vit", "ene")]
+        if any(v is None for v in vals):
+            if self.stats_logged != "missing":
+                self.stats_logged = "missing"
+                self.log(f"can't read all 4 stats ({st}) -> max-stats check off for me")
+            self.max_stats = False
+            return
+        ok = all(v >= GI_MIN_STAT for v in vals)
+        if ok != self.max_stats:
+            self.log(f"stats STR {vals[0]} AGI {vals[1]} VIT {vals[2]} ENE {vals[3]} -> "
+                     + ("MAX: I hunt the Golden Invasion" if ok else f"not max ({GI_MIN_STAT}): no Golden Invasion"))
+        self.max_stats = ok
+
+    def is_hunter(self):
+        name = self.a.name.lower()
+        return GI_ENABLED and (name in GI_CHARS or bool(self.max_stats))
+
     def eligible(self):
         a, s = self.a, self.c.s
-        if not GI_ENABLED or a.name.lower() not in GI_CHARS:
+        if not self.is_hunter():
             return False
         if a.bcs is not None and a.bcs.get("phase") in ("inside", "end"):
             return False                          # inside a castle (BC prep can wait: invasion first)
@@ -401,8 +529,12 @@ class GoldenInvasion:
     # ── main ──
     def tick(self):
         """True while the Golden Invasion owns the character (the caller skips everything else)."""
-        if not GI_ENABLED or self.a.name.lower() not in GI_CHARS:
+        if not GI_ENABLED:
             return False
+        if self.phase == "idle":
+            self.check_stats()
+            if not self.is_hunter():
+                return False
         now = time.time()
         if self.phase != "idle" and now - self.cur_start > GI_HUNT_SEC + 300:
             return self.finish("took too long after the hunt")      # safety net
@@ -433,7 +565,11 @@ class GoldenInvasion:
         self.potions_ok = False
         self.wait_spot = None
         self.map_target = None
-        self.grid = {}
+        hub = self.a.hub
+        with hub.lock:
+            sh = getattr(hub, "gi_shared", None)
+            if not sh or sh.get("key") != key:
+                hub.gi_shared = {"key": key, "grids": {}, "assign": {}}   # shared by all our hunters
         self.goal = None
         self.deaths = 0
         self.was_dead = False
@@ -452,13 +588,29 @@ class GoldenInvasion:
         a.show_window = True
 
     def cfg(self):
-        return {"version": 3, "ours": list(self.a.hub.names), "skill": GI_SKILL, "potKey": GI_POTION_KEY,
+        return {"version": 5, "ours": list(self.a.hub.names), "skill": GI_SKILLS.get(self.a.name.lower(), 0), "potKey": GI_POTION_KEY,
                 "potEvery": GI_POT_EVERY_MS, "hitWindow": GI_HIT_WINDOW_MS, "pvpRadius": GI_PVP_RADIUS,
-                "view": GI_VIEW, "boxWait": GI_BOX_WAIT_SEC * 1000, "loopMs": GI_LOOP_MS}
+                "view": GI_VIEW, "boxWait": GI_BOX_WAIT_SEC * 1000, "loopMs": GI_LOOP_MS,
+                "barrierTries": GI_BARRIER_TRIES,
+                "buffs": [GI_BARRIER_SKILL, GI_FORTITUDE_SKILL] if GI_BARRIER else [],
+                "refreshSkill": GI_FORTITUDE_SKILL if GI_BARRIER else 0, "refreshMs": GI_FORTITUDE_REFRESH * 1000,
+                "mageSkill": GI_MAGE_SKILL, "combo": GI_KNIGHT_COMBO, "comboStep": GI_COMBO_STEP_MS}
+
+    def barrier(self, on):
+        """Switch the in-page Soul Barrier watcher on/off and log what it did."""
+        if not GI_BARRIER:
+            return
+        ev = self.ev(GI_BARRIER_JS, on)
+        if ev is None and on:
+            self.ev(GI_INSTALL_JS, self.cfg())          # page reloaded: install the loop again
+            ev = self.ev(GI_BARRIER_JS, on)
+        for e in ev or []:
+            self.log(e)
 
     def run(self, rel):
         a, c, s = self.a, self.c, self.c.s
         a.mode = "gi"
+        self.barrier(True)
         if self.phase == "prep":
             if rel >= 0:
                 self.phase = "hunt"
@@ -495,6 +647,9 @@ class GoldenInvasion:
             self.warp(NORIA_WARP)
             return
         pot = self.ev(POTION_SLOT_JS, [GI_POTION_KEY, *GI_POTION_ITEM]) or {}
+        if pot.get("hk", 0) < 0 and not getattr(self, "hk_warned", False):
+            self.hk_warned = True
+            self.log("WARNING: no potion on the Q hotkey -> potion spam won't work. Put Large Healing Potions on Q once by hand.")
         if pot.get("count", 0) >= GI_POTION_STACK:
             if not self.potions_ok:
                 self.log(f"potions: {pot.get('count')} in the Q slot")
@@ -599,17 +754,35 @@ class GoldenInvasion:
         self.log(f"=== HUNT START (map {c.s.get('map')} at ({c.s.get('x')},{c.s.get('y')}), "
                  f"hp {c.s.get('hp')}, lvl {c.s.get('level')}) ===")
 
+    def assign_map(self, m):
+        sh = getattr(self.a.hub, "gi_shared", None)
+        if sh is not None:
+            with self.a.hub.lock:
+                sh["assign"][self.a.name] = m
+
     def choose_map(self, counts):
+        """Devias or Noria: the most golden mobs per hunter of ours already there (spreads our hunters)."""
         maps = (counts or {}).get("maps") or {}
         dev, nor = int(maps.get(str(MAP_DEVIAS), maps.get(MAP_DEVIAS, 0)) or 0), \
             int(maps.get(str(MAP_NORIA), maps.get(MAP_NORIA, 0)) or 0)
         lvl = self.c.s.get("level") or 0
-        if dev > nor and lvl >= DEVIAS_MIN_LEVEL:
-            return MAP_DEVIAS, f"Devias {dev} > Noria {nor}"
-        return MAP_NORIA, f"Noria {nor} >= Devias {dev}" if dev <= nor else f"level {lvl} too low for Devias"
+        sh = getattr(self.a.hub, "gi_shared", None) or {"assign": {}}
+        with self.a.hub.lock:
+            others = [m for n, m in sh["assign"].items() if n != self.a.name]
+        on_dev, on_nor = others.count(MAP_DEVIAS), others.count(MAP_NORIA)
+        if lvl < DEVIAS_MIN_LEVEL:
+            return MAP_NORIA, f"level {lvl} too low for Devias (Noria {nor}, Devias {dev})"
+        if dev / (1 + on_dev) > nor / (1 + on_nor):
+            return MAP_DEVIAS, f"Devias {dev} ({on_dev} of ours there) vs Noria {nor} ({on_nor} of ours)"
+        return MAP_NORIA, f"Noria {nor} ({on_nor} of ours there) vs Devias {dev} ({on_dev} of ours)"
 
     def hunt(self, rel):
         c, s = self.c, self.c.s
+        if GI_RECORD:
+            try:
+                c.rec.tick()              # the recorder only ticks by itself while paused
+            except Exception:
+                pass
         st = self.ev(GI_STATUS_JS) or {}
         if not st.get("on"):
             # page reloaded (disconnect) -> install again
@@ -631,8 +804,9 @@ class GoldenInvasion:
         if dead:
             return
         if self.map_target is None:
-            if counts or rel > 6:
+            if (counts and counts.get("total")) or rel > 8:
                 self.map_target, why = self.choose_map(counts)
+                self.assign_map(self.map_target)
                 self.log(f"map: {'Devias' if self.map_target == MAP_DEVIAS else 'Noria'} ({why}; "
                          f"counts {counts and counts.get('maps')})")
             else:
@@ -645,7 +819,8 @@ class GoldenInvasion:
             there = int(maps.get(str(other), 0) or 0)
             if here == 0 and there >= 5 and (other != MAP_DEVIAS or (s.get("level") or 0) >= DEVIAS_MIN_LEVEL):
                 self.log(f"map: nothing left here, {there} left on the other map -> switching")
-                self.map_target, self.grid, self.goal = other, {}, None
+                self.map_target, self.goal = other, None
+                self.assign_map(other)
         if s.get("map") != self.map_target:
             if self.map_target == MAP_DEVIAS:
                 alias = DEVIAS_WARPS[min(self.warp_tries // 2, len(DEVIAS_WARPS) - 1)]
@@ -668,9 +843,14 @@ class GoldenInvasion:
             self.log(f"{status.get('mode')} | target {status.get('target')} | players {status.get('players')} "
                      f"(near {status.get('near')}) | goldens {status.get('goldens')} | hp {status.get('hp')}/"
                      f"{status.get('maxHp')} | pots {status.get('pots')} | casts {status.get('casts')}/"
-                     f"{status.get('myCasts')} seen | left {counts and counts.get('total')}")
+                     f"{status.get('myCasts')} seen | skill {status.get('attackSkill')} | left {counts and counts.get('total')}")
 
-    # ── searching the map (cells of GI_SEARCH_CELL tiles) ──
+    # ── searching the map (cells of GI_SEARCH_CELL tiles; shared by all our hunters on that map) ──
+    @property
+    def grid(self):
+        sh = getattr(self.a.hub, "gi_shared", None) or {"grids": {}}
+        return sh["grids"].setdefault(self.map_target if self.map_target is not None else self.c.s.get("map"), {})
+
     def cell(self, x, y):
         return (int(x) // GI_SEARCH_CELL, int(y) // GI_SEARCH_CELL)
 
@@ -822,7 +1002,12 @@ class GoldenInvasion:
 
     def finish(self, why):
         a, c = self.a, self.c
+        sh = getattr(a.hub, "gi_shared", None)
+        if sh is not None:
+            with a.hub.lock:
+                sh["assign"].pop(a.name, None)
         self.log(f"=== GOLDEN INVASION finished ({why}) -> back to normal ===")
+        self.barrier(False)
         self.phase = "idle"
         a.show_window = False
         a.step_key = None
