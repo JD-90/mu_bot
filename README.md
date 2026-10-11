@@ -5,6 +5,7 @@ Bots for the MU Online browser client at https://mu.mormon.garden (Playwright + 
 - `mu_auto_bot.py` / `run_auto.bat` - **main bot**: every character levels, resets and runs Blood Castle on its own; alts trade their Boxes of Kundun to the main; leveling pairs for grand-reset characters (see below)
 - `mu_group_bot.py` / `run_group.bat` - party bot that levels several characters together
 - `mu_bc.py` - Blood Castle logic (used by both bots)
+- `mu_gi.py` - Golden Invasion hunter (used by the auto bot): every hour at :50 wizzardo tops up potions in Noria, hunts golden mobs for 3 minutes (players first at a Golden Dragon), then `/pkclear`
 - `mu_recorder.py` - records what you do while a character is paused (`mu_record.log`)
 - `mu_bot.py` / `run.bat` - old single-character reset bot (not maintained)
 

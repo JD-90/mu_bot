@@ -68,6 +68,7 @@ from playwright.sync_api import sync_playwright, Error as PWError
 
 import mu_group_bot as G
 import mu_bc as B
+import mu_gi as GI
 from mu_bc import in_bc, dist
 
 # ───────────────────────────── CONFIG ─────────────────────────────
@@ -311,6 +312,8 @@ class Agent:
         self.leveler_off_since = None
         self.vit_check = 0
         self.vit_fails = 0
+        # Golden Invasion hunter (mu_gi.py): only the characters in GI.GI_CHARS
+        self.gi = GI.GoldenInvasion(self) if GI.GI_ENABLED and self.name.lower() in GI.GI_CHARS else None
 
     def log(self, msg):
         log(msg, self.name)
@@ -338,7 +341,7 @@ class Agent:
                             break
                         self.log(f"error: {e!r}")
                         time.sleep(5)
-                    time.sleep(G.TICK)
+                    time.sleep((self.gi.sleep() if self.gi else None) or G.TICK)   # 4x/s during the invasion
                 try:
                     ctx.close()
                 except Exception:
@@ -462,6 +465,7 @@ class Agent:
             "bc_away": self.bcs is not None and self.bcs.get("phase") not in ("climb", "farm"), "boxes": self.boxes, "bag_free": self.bag_free,
             "assisted": self.assisted(), "leveler": self.leveler_name if self.assisted() else None,
             "pair_lead": bool(self.my_levelees()), "parked": self.pair_parked,
+            "gi_hunter": self.gi is not None,
         })
 
     def recent_rate(self):
@@ -537,6 +541,9 @@ class Agent:
                     hub.pair_round.discard(self.name)    # my part of the pair's reset round is done
         if BC_AUTO:
             self.read_bc_timer()
+        if self.gi and self.gi.tick():          # Golden Invasion (:49 -> :53) comes first
+            self.publish()
+            return
         if self.bc_tick():
             self.publish()
             return
@@ -655,6 +662,8 @@ class Agent:
         if self.show_window and self.name.lower() in {n.lower() for n in BIG_ON_PAUSE} and not G.HEADLESS:
             self.go_big()
         c.rec.start()               # write down what you do while you play it (mu_recorder.py)
+        if self.gi:
+            self.gi.on_pause()          # the in-page fight loop must not fight while you play
 
     def resume(self):
         self.paused = False
@@ -1183,7 +1192,9 @@ class Agent:
         if o is None:
             return False
         until = o - time.time()
-        return -B.BC_DOOR_CLOSE_SEC - 60 <= until <= BC_PLAN_SEC + TRADE_BC_QUIET
+        if -B.BC_DOOR_CLOSE_SEC - 60 <= until <= BC_PLAN_SEC + TRADE_BC_QUIET:
+            return True
+        return GI.GI_ENABLED and 47 <= time.localtime().tm_min <= 54     # Golden Invasion (:50)
 
     def maybe_start_trade(self):
         hub, c, s = self.hub, self.c, self.c.s
@@ -2028,7 +2039,8 @@ def build_plan(hub, open_at, taken=None, skip=()):
     avail = {n: i for n, i in snap.items()
              if i.get("online") and not i.get("paused") and i.get("level") and n not in skip
              and not i.get("assisted")}          # being carried after a grand reset: no Blood Castle
-    pinned = {n for n, i in avail.items() if i.get("pair_lead")}   # carrying someone: may only hold
+    # carrying someone, or hunting the Golden Invasion at :50 (no time to climb): may only hold
+    pinned = {n for n, i in avail.items() if i.get("pair_lead") or i.get("gi_hunter")}
     rl = hub.reset_level or G.ROUTE[-1][1]
     left_min = (open_at - BC_CLIMB_DEADLINE - now) / 60
     taken, assign, why = dict(taken or {}), {}, {}

@@ -88,7 +88,7 @@ REC_JS = r"""
                    evCount: {}, evMin: {}, evMinAt: now, evLines: {}, dom: [], mobTotal: {}, kills: {},
                    players: new Map(), playersSeen: {}, playerDeaths: {}, nearAt: 0, target: null,
                    skill: s.currentSkill, fightHp: p.currentHP,
-                   bag0: bag(), money0: p.money};
+                   bag0: bag(), money0: p.money, pickFail: W.__recPickFail};
     W.__recOn = true;
     out.push(rearm ? '(page was reloaded: recorder re-armed)' :
       `START map ${w.mapIndex} pos (${pos.x},${pos.y}) lvl ${p.level} hp ${p.currentHP}/${p.maxHP} zen ${p.money} helper ${R.helper}`);
@@ -116,6 +116,7 @@ REC_JS = r"""
           try {
             const r = W.__rec;
             if (W.__recOn && r && typeof ev === 'string') {
+              if (ev === 'ItemPickUpRequestFailed') W.__recPickFail = (W.__recPickFail || 0) + 1;
               const first = !(ev in r.evCount);
               r.evCount[ev] = (r.evCount[ev] || 0) + 1;
               r.evMin[ev] = (r.evMin[ev] || 0) + 1;
@@ -219,7 +220,7 @@ REC_JS = r"""
       seenDrops.add(e.netId);
       if (!R.drops.has(e.netId)) {
         const it = e.droppedItem;
-        R.drops.set(e.netId, 1);
+        R.drops.set(e.netId, {name: e.objectNameInWorld || '?', t: now, x, y, box: !it.isMoney && it.group === 14 && it.num === 11});
         out.push(`ground + ${it.isMoney ? 'zen' : (e.objectNameInWorld || '?')} ${it.isMoney ? '' : `[${it.group}/${it.num}${it.item && it.item.lvl ? ' +' + it.item.lvl : ''}]`} at (${x},${y}) ${Math.round(d)} tiles`);
       }
       continue;
@@ -265,7 +266,14 @@ REC_JS = r"""
     R.mobs.delete(id);
     if (!m.dying) out.push(`mob - ${m.name} #${id} left view at (${m.x},${m.y})`);
   }
-  for (const id of [...R.drops.keys()]) if (!seenDrops.has(id)) R.drops.delete(id);
+  // a Kundun box leaving the ground: picked up (by me: see 'bag +') or by someone else, or out of view
+  for (const [id, dr] of [...R.drops]) if (!seenDrops.has(id)) {
+    R.drops.delete(id);
+    if (dr.box) out.push(`ground - ${dr.name} at (${dr.x},${dr.y}) gone after ${Math.round((now - dr.t) / 1000)} s` +
+                         (hero && Math.hypot(dr.x - pos.x, dr.y - pos.y) > R_RADIUS - 2 ? ' (out of view)' : ''));
+  }
+  // my failed pickups (box owned by someone else), counted per second
+  if (R.pickFail !== W.__recPickFail) { out.push(`pickup FAILED x${(W.__recPickFail || 0) - (R.pickFail || 0)}`); R.pickFail = W.__recPickFail; }
   for (const [id, pl] of R.players) if (!seenPlayers.has(id)) {
     R.players.delete(id);
     if (!pl.dying) out.push(`player - ${pl.name} left (${pl.x},${pl.y})`);
