@@ -5,8 +5,12 @@ Timeline (start = the event start read from the event panel, normally :50:00):
   start-60s  PREP   warp to Noria, buy Large Healing Potions at Amy until the Q slot holds 255
   start-30s  WAIT   stand ~GI_WAIT_DIST tiles outside the Noria safe zone
   start      HUNT   read the per-map counts (InvasionMonsters packet): stay in Noria, or warp to Devias
-                    when Devias has more. Hunt for GI_HUNT_SEC (3 min):
+                    when Devias has more. Hunt until the event is over (GI_HUNT_SEC = 15 min, or every
+                    golden dead) or until no golden mob was in view for GI_IDLE_SEC (90 s):
                       * targets are ONLY golden mobs ("Golden ...") and other players; normal mobs ignored
+                      * GI_PVP_MODE "defense" (default): players are fought ONLY when they hit us; the
+                        dragon / boxes / goldens are taken even with players around. The three PvP rules
+                        below are GI_PVP_MODE "attack" only (except fighting back, which both do)
                       * Golden Dragon in view + players within GI_PVP_RADIUS of us or of the dragon ->
                         kill the players first (one at a time), then the dragon, then grab the +5
                       * no PvP over small golden mobs (a small golden with a player next to it is skipped)
@@ -45,7 +49,10 @@ GI_SKILLS        = {}               # fixed skill per character (lower-case name
 GI_START_MINUTE  = 50               # fallback when the event panel can't be read (PC clock)
 GI_PREP_SEC      = 90               # start preparing this long before the start (:48:30: potions in Noria, then the waiting map)
 GI_WAIT_SEC      = 30               # be at the waiting spot this long before the start (:49:30)
-GI_HUNT_SEC      = 180              # hunt this long (:50:00 -> :53:00)
+GI_HUNT_SEC      = 900              # the event lasts 15 min (:50 -> :05): hunt until the end ... (Juan 2026-10-11:
+                                    # dragons are much tougher now, 3 min was too short)
+GI_IDLE_SEC      = 90               # ... or until no golden mob was in view this long (dead / warping don't count)
+GI_SEARCH_AGE    = 180              # a searched area counts as unsearched again after this long (long hunts)
 GI_WAIT_DIST     = 20               # waiting spot: this many tiles outside the Noria safe zone
 GI_SKILL         = 39               # default for GI_SKILLS (Ice Storm)
 GI_BARRIER       = True             # mages: Soul Barrier on yourself every time you leave a safe zone (Juan 2026-10-11)
@@ -63,12 +70,43 @@ GI_POTION_ITEM   = (14, 3)          # Large Healing Potion (used if the Q slot c
 GI_POTION_STACK  = 255              # one full stack ...
 GI_POTION_TOTAL  = 510              # ... keep TWO full stacks in the bag (Juan 2026-10-11: 211 used in 1.5 min)
 GI_POTION_NPC    = 253              # Amy, Potion Girl (two of them in Noria)
+GI_CLEAR         = False             # (Juan 2026-10-12) dragon about to die + 1..3 other players hitting it -> kill them
+GI_CLEAR_ETA     = 24               # ... when the dragon has this many seconds left or fewer (estimated from its HP bar)
+GI_CLEAR_MIN_ETA = 6                # ... but not under this: then everybody stays on the dragon
+GI_CLEAR_MAX     = 3                # more players than this hitting the dragon -> don't bother, stay on the dragon
+GI_CLEAR_KILL_SEC = 8               # a player not dead after this long -> back to the dragon, don't try him again
+GI_CLEAR_LEASH   = 8                # only players within this many tiles of the dragon (no chasing)
+GI_POT_HP        = 0.8              # (Juan 2026-10-12) also drink whenever HP < 80 % of max, players near or not
+GI_CALL          = True             # (Juan 2026-10-12) a hunter that sees a Golden Dragon calls the others: any of our
+GI_CALL_DIST     = 50               # hunters on the same map within this many tiles of it (and no dragon of its own)
+GI_CALL_FRESH    = 5                # walks over to help (more chances at the last hit + backup vs players);
+                                    # a sighting older than this (s) no longer counts
 GI_POT_EVERY_MS  = 200              # potion every 0.2 s ...
 GI_HIT_WINDOW_MS = 2000             # ... while a player has hit us in the last 2 s
-GI_PVP_RADIUS    = 12               # players this close to us or to the dragon -> fight them first
+GI_PVP_MODE      = "defense"        # how we treat other players (Juan, 2026-10-12):
+                                    #   "defense" = only fight back players who hit us; never attack anyone on sight
+                                    #               (dragons, boxes and small goldens are taken even with players around)
+                                    #   "attack"  = old behaviour: kill players at a dragon / guarding a locked box first
+GI_PVP_RADIUS    = 12               # players this close to us or to the dragon -> fight them first (attack mode)
 GI_VIEW          = 30               # tiles: ignore anything further away
 GI_BOX_WAIT_SEC  = 20               # a locked Box of Kundun: keep trying this long
-GI_LOOP_MS       = 50               # in-page fight loop period (20x/s)
+GI_DRAGON_LOCK   = True             # (Juan, 2026-10-12) fighting over a Golden Dragon (+5): never leave it - no event end,
+                                   # idle end, map switch or Blood Castle - until we have the +5 box, it's gone, or we die
+GI_DRAGON_LOCK_DIST = 14            # "fighting over it" = targeting the dragon, or a player while the dragon is this close
+GI_DRAGON_BOX_GRACE = 8             # dragon gone from view: wait this long for its box to show up before letting go
+GI_DRAGON_LOCK_MAX = 900            # safety cap: the lock never keeps a hunt alive longer than this past the normal end
+GI_BIG_BOX_RADIUS = 8               # a free Box +5 this close is picked up BEFORE fighting players (Juan, 2026-10-12)
+GI_IGNORE_AFTER  = 20               # a target that got this many casts with <= 1 seen by the server ...
+GI_IGNORE_SEC    = 20               # ... is skipped this long (2026-10-11 23:50: 218 casts at the Noria gate, 1 seen)
+GI_CAST_GAP_MS   = 0                # min. ms between two cast requests (was 100); 0 = refill as soon as the client takes one
+GI_AREA_HIT_RADIUS = 6             # attacker detection (v10): a player's area skill aimed within this many tiles
+GI_AREA_HIT_MS   = 1200             # of me (or cast from that close) followed by damage on me within this = hostile
+GI_LOOP_MS       = 20               # in-page fight loop period (50x/s; was 50 ms - Juan 2026-10-12: cast as soon as the
+                                   # client is free). The client itself holds a cast until the previous animation ends.
+GI_SHOW_WINDOW   = True             # True = restore the game windows during the invasion. Back to True
+                                   # (Juan, 2026-10-12): with them minimized (00:50-08:50 runs) the characters
+                                   # landed ~1 hit per 3 s instead of ~0.4 s (see claude/gi-loot-drop-2026-10-12.md).
+                                   # False = they stay minimized, and a window a relog restores is minimized again
 GI_SEARCH_CELL   = 16               # search grid cell size (tiles)
 GI_SIGHT         = 18               # tiles around us that count as "searched"
 GI_LOOT_RADIUS   = 10               # leftover loot marks this area as searched
@@ -125,7 +163,9 @@ GI_INSTALL_JS = r"""
     box: null, boxFirstFail: new Map(), boxGaveUp: new Set(), lastPick: 0, pickFails: 0,
     hitsOnMe: 0, events: [], status: {}, recentTargets: new Map(), chatSeen: new WeakSet(),
     barrier: false, wasSafe: null, bQueue: [], bTries: 0, bAt: 0, bDone: 0, bEvents: [], buffAt: {},
-    comboIdx: 0, comboAt: 0, attackSkill: null};
+    comboIdx: 0, comboAt: 0, attackSkill: null, ignored: new Map(), tStats: new Map(), tPrev: null, safeSkipped: 0,
+    areaCasts: new Map(), hitMatch: new Map(),
+    dHp: [], dHpId: null, dragonId: null, dragonPos: null, dHitters: new Map(), clr: null, clrFailed: new Set(), clrDragon: null, clrNote: ''};
   const SKILL_NAMES = {16: 'Soul Barrier', 48: 'Greater Fortitude'};
   const sname = n => SKILL_NAMES[n] || ('skill ' + n);
   const bev = s => { if (G.bEvents.length < 50) G.bEvents.push(s); };
@@ -152,16 +192,95 @@ GI_INSTALL_JS = r"""
       if (target !== G.myId) return;
       const e = (W.__world.byNetId && W.__world.byNetId.get ? W.__world.byNetId.get(caster) : null)
         || W.__world.netObjsQuery.entities.find(x => x.netId === caster);
-      if (e && e.npcType === undefined) { G.hostile.set(e.netId, Date.now()); G.potUntil = Date.now() + G.cfg.hitWindow; G.hitsOnMe++; }
+      if (e && e.npcType === undefined) { G.markHostile(e, 'skill ' + skill); G.hitsOnMe++; }
+    } catch (e) {} });
+    // dragon HP bar (c1 06 fc <netId u16> <hp 0-255>) -> time-to-death estimate (G.dragonEta)
+    bus.on('MonsterHealthStatus', d => { try { const u = u8(d);
+      const id = ((u[3] & 0x7f) << 8) | u[4];
+      if (G.dragonId === null || id !== G.dragonId) return;
+      if (G.dHpId !== id) { G.dHpId = id; G.dHp = []; }
+      const now = Date.now(); G.dHp.push([now, u[5]]);
+      while (G.dHp.length && now - G.dHp[0][0] > 15000) G.dHp.shift();
+    } catch (e) {} });
+    // who is hitting the dragon: a player's skill on it, an area skill on/next to it, a plain attack on it
+    G.dragonHit = (caster, how) => {
+      if (caster === G.myId) return;
+      const e = G.ent(caster);
+      if (e && e.npcType === undefined && e.transform) G.dHitters.set(caster, Date.now());
+    };
+    bus.on('SkillAnimation', d => { try { const u = u8(d);
+      if (G.dragonId !== null && (((u[7] & 0x7f) << 8) | u[8]) === G.dragonId) G.dragonHit((u[5] << 8) | u[6], 'skill');
+    } catch (e) {} });
+    bus.on('ObjectAnimation', d => { try { const u = u8(d);
+      if (G.dragonId !== null && u.length >= 9 && (((u[7] & 0x7f) << 8) | u[8]) === G.dragonId) G.dragonHit(((u[3] & 0x7f) << 8) | u[4], 'attack');
     } catch (e) {} });
     bus.on('AreaSkillAnimation', d => { try { const u = u8(d);
-      if (G.on && G.myId !== null && ((u[5] << 8) | u[6]) === G.myId) {
-        G.myCasts++; G.lastMySkill = (u[3] << 8) | u[4]; G.lastMySkillAt = Date.now(); } } catch (e) {} });
+      if (G.dragonId === null || !G.dragonPos) return;
+      const caster = ((u[5] & 0x7f) << 8) | u[6], e = G.ent(caster);
+      if (!e || !e.transform) return;
+      if (dist({x: u[7], y: u[8]}, G.dragonPos) <= 4 || dist(P(e), G.dragonPos) <= 4) G.dragonHit(caster, 'area');
+    } catch (e) {} });
+    // c3 0a 1e <skill u16> <caster u16> <x> <y> <rot>: area skills name no target -> remember where
+    // players cast them; an ObjectHit on me right after ties the hit to them (see ObjectHit)
+    bus.on('AreaSkillAnimation', d => { try { const u = u8(d);
+      const caster = ((u[5] & 0x7f) << 8) | u[6];
+      if (G.on && G.myId !== null && caster === G.myId) {
+        G.myCasts++; G.lastMySkill = (u[3] << 8) | u[4]; G.lastMySkillAt = Date.now(); return; }
+      if (!G.on) return;
+      const e = G.ent(caster);
+      if (e && e.npcType === undefined && e.transform)
+        G.areaCasts.set(caster, {at: Date.now(), x: u[7], y: u[8], skill: (u[3] << 8) | u[4]});
+    } catch (e) {} });
+    // c1 09 18 <attacker u16> <dir> <anim> <target u16>: a normal (no skill) attack; on me = hostile
+    bus.on('ObjectAnimation', d => { try { const u = u8(d);
+      if (!G.on || G.myId === null || u.length < 9) return;
+      const att = ((u[3] & 0x7f) << 8) | u[4], tgt = ((u[7] & 0x7f) << 8) | u[8];
+      if (tgt !== G.myId || att === G.myId) return;
+      const e = G.ent(att);
+      if (e && e.npcType === undefined) { G.markHostile(e, 'normal attack'); G.hitsOnMe++; }
+    } catch (e) {} });
+    // c1 0a 11 <obj u16> <hp dmg u16> <kind> <shield dmg u16>: damage on me -> potions; players that
+    // cast an area skill on/next to me in the last cfg.areaHitMs are the attackers (with a monster
+    // right next to me the hit could be the monster's: then it takes 2 such hits within 3 s)
+    bus.on('ObjectHit', d => { try { const u = u8(d);
+      if (!G.on || G.myId === null || u.length < 10) return;
+      if ((((u[3] & 0x7f) << 8) | u[4]) !== G.myId) return;
+      const dmg = ((u[5] << 8) | u[6]) + ((u[8] << 8) | u[9]);
+      if (dmg <= 0) return;
+      const now = Date.now(), w = W.__world, h = w && w.playerEntity;
+      if (!h || !h.transform) return;
+      const me = P(h), r = G.cfg.areaHitRadius || 4, win = G.cfg.areaHitMs || 1200;
+      let monsterNext = false;
+      for (const e of w.netObjsQuery.entities)
+        if (e.monsterAnimation && !e.dying && e.transform && dist(P(e), me) <= 3) { monsterNext = true; break; }
+      for (const [id, c] of G.areaCasts) {
+        if (now - c.at > win) { if (now - c.at > 5000) G.areaCasts.delete(id); continue; }
+        const e = G.ent(id);
+        if (!e || !e.transform || e.dying) continue;
+        if (dist({x: c.x, y: c.y}, me) > r && dist(P(e), me) > r) continue;
+        if (monsterNext) {
+          const m = G.hitMatch.get(id);
+          if (!m || now - m > 3000) { G.hitMatch.set(id, now); continue; }
+        }
+        G.hitMatch.delete(id);
+        G.markHostile(e, 'area skill ' + c.skill);
+      }
+    } catch (e) {} });
     bus.on('ItemPickUpRequestFailed', () => { G.pickFails++;
       if (G.box !== null && !G.boxFirstFail.has(G.box)) { G.boxFirstFail.set(G.box, Date.now()); ev('box locked (someone else\'s) -> trying for ' + G.cfg.boxWait / 1000 + ' s'); } });
   }
   const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
   const P = e => ({x: e.transform.pos.x, y: e.transform.pos.z});
+  G.ent = id => { const w = W.__world; if (!w) return null;
+    return (w.byNetId && w.byNetId.get ? w.byNetId.get(id) : null) || w.netObjsQuery.entities.find(x => x.netId === id) || null; };
+  // a player hit me: target them right away (also potions); logged once per attack spell
+  G.markHostile = (e, how) => {
+    const now = Date.now(), name = (e.objectNameInWorld || '').trim();
+    if (G.cfg.ours && G.cfg.ours.some(n => n.toLowerCase() === name.toLowerCase())) return;
+    const prev = G.hostile.get(e.netId);
+    G.hostile.set(e.netId, now); G.potUntil = now + G.cfg.hitWindow;
+    if (!prev || now - prev > 8000) ev(`attacked by ${name} (${how})`);
+  };
   // Buffs on myself (Soul Barrier for mages, Greater Fortitude for knights) every time I step out of a safe
   // zone (also when switched on outside, and after a respawn: the respawn is in town). G.wantBuff() queues
   // a refresh before a fight. True = casting, skip the fight this tick.
@@ -248,6 +367,10 @@ GI_INSTALL_JS = r"""
       }
     }
     const players = [], goldens = [], boxes = [], loot = [];
+    const isSafe = p => !!(w.getTerrainFlag && (w.getTerrainFlag(Math.round(p.x), Math.round(p.y)) & 1) === 1);
+    const meSafe = isSafe(me);
+    for (const [id, t] of G.ignored) if (now > t) G.ignored.delete(id);
+    let safeN = 0;
     for (const e of w.netObjsQuery.entities) {
       if (e.localPlayer || !e.transform) continue;
       const p = P(e), d = dist(p, me);
@@ -265,15 +388,19 @@ GI_INSTALL_JS = r"""
       if (e.npcType === undefined) {
         if (e.netId === undefined || !(e.playerAnimation || e.skin !== undefined)) continue;
         if (ours.has(name.toLowerCase()) || party.has(name.toLowerCase())) continue;
+        if (isSafe(p)) { safeN++; continue; }               // in a safe zone: can't be hit -> never a target
+        if (G.ignored.has(e.netId)) continue;               // the server kept ignoring our casts on it
         players.push({e, p, d, name});
       } else if (e.monsterAnimation && /^Golden/i.test(name)) {
+        if (G.ignored.has(e.netId)) continue;
         goldens.push({e, p, d, name, dragon: e.npcType === 79});
       }
     }
     // HP going down with a player close -> potions (a monster hit alone does not start them)
     if (G.lastHp !== null && hp < G.lastHp && players.some(x => x.d <= cfg.pvpRadius)) G.potUntil = now + cfg.hitWindow;
     G.lastHp = hp;
-    if (now < G.potUntil && now - G.lastPot >= cfg.potEvery) {
+    const lowHp = !!(cfg.potHp && pd.maxHP && hp < cfg.potHp * pd.maxHP);
+    if ((now < G.potUntil || lowHp) && now - G.lastPot >= cfg.potEvery) {
       G.lastPot = now;
       try { s.useItemHotkey(cfg.potKey); G.pots++; } catch (e) {}
     }
@@ -281,13 +408,63 @@ GI_INSTALL_JS = r"""
     const byD = (a, b) => a.d - b.d;
     players.sort(byD); goldens.sort(byD); boxes.sort((a, b) => (b.lvl - a.lvl) || (a.d - b.d));
     const dragon = goldens.find(g => g.dragon) || null;
+    // another of our hunters called us to its dragon (GI_CALL_JS): walk there (Python), skip the small stuff
+    const helping = !!(G.call && now < G.call.until && !dragon);
+    // ── clearing a dying dragon (Juan 2026-10-12) ──
+    if (dragon) { if (G.dragonId !== dragon.e.netId) { G.dragonId = dragon.e.netId; G.dHitters.clear(); G.clr = null;
+                    G.clrFailed = new Set(); G.clrNote = ''; } G.dragonPos = dragon.p; }
+    else { G.dragonId = null; G.dragonPos = null; }
+    let eta = null;
+    if (dragon && G.dHpId === dragon.e.netId && G.dHp.length >= 2) {
+      const last = G.dHp[G.dHp.length - 1], first = G.dHp.find(x => last[0] - x[0] <= 10000) || G.dHp[0];
+      const dt = (last[0] - first[0]) / 1000, dh = first[1] - last[1];
+      if (dt >= 3 && dh > 0) eta = Math.max(0, last[1] / (dh / dt) - (now - last[0]) / 1000);
+    }
+    G.dragonEta = eta;
+    let clearT = null;
+    if (cfg.clear && dragon && eta !== null && eta <= cfg.clearEta && eta >= cfg.clearMinEta) {
+      for (const [id, t] of G.dHitters) if (now - t > 3000) G.dHitters.delete(id);
+      const enemies = players.filter(x => G.dHitters.has(x.e.netId) && dist(x.p, dragon.p) <= cfg.clearLeash);
+      if (enemies.length > cfg.clearMax) {
+        if (G.clrNote !== 'many') { G.clrNote = 'many'; ev(`dragon ~${Math.round(eta)} s from dying, ${enemies.length} players hitting it -> too many, staying on the dragon`); }
+      } else {
+        if (G.clr && now - G.clr.since > cfg.clearKillMs && enemies.some(x => x.e.netId === G.clr.id)) {
+          G.clrFailed.add(G.clr.id); ev(`could not kill ${G.clr.name} in ${cfg.clearKillMs / 1000} s -> back to the dragon`); G.clr = null;
+        }
+        // same order on all our characters -> they gang up on the same player
+        const cand = enemies.filter(x => !G.clrFailed.has(x.e.netId))
+                            .sort((a, b) => (dist(a.p, dragon.p) - dist(b.p, dragon.p)) || (a.e.netId - b.e.netId));
+        if (cand.length) {
+          const cur = G.clr && cand.find(x => x.e.netId === G.clr.id);
+          clearT = cur || cand[0];
+          if (!cur) { G.clr = {id: clearT.e.netId, name: clearT.name, since: now};
+            ev(`dragon ~${Math.round(eta)} s from dying, ${enemies.length} player(s) hitting it -> clearing ${clearT.name}`); }
+        } else G.clr = null;
+      }
+    } else if (G.clr) G.clr = null;
     const hostiles = players.filter(x => G.hostile.has(x.e.netId));
+    const defense = cfg.pvpMode !== 'attack';
     let target = null, why = '', pick = null;
-    if (dragon) {
+    // 0. a free Box +5 close by: grab it before any fight (2026-10-11: two +5s lost while fighting players)
+    const bigBox = boxes.find(b => b.lvl >= 12 && b.d <= cfg.bigBoxRadius && !G.boxFirstFail.has(b.e.netId)
+                                   && !G.boxGaveUp.has(b.e.netId));
+    if (bigBox) { pick = bigBox; }
+    else if (defense && hostiles.length && !(dragon && cfg.dragonLock)) {
+      // defense mode: only players who hit me are ever targets, and they come first
+      target = hostiles[0]; why = 'hit me';
+    } else if (defense && dragon && cfg.dragonLock) {
+      // dragon lock (Juan 2026-10-12): never leave a +5 dragon - fight back only against players at it
+      const hot = hostiles.filter(x => x.d <= cfg.pvpRadius || dist(x.p, dragon.p) <= cfg.pvpRadius);
+      if (clearT) { target = clearT; why = `clearing the dragon (~${Math.round(eta)} s left)`; }
+      else if (hot.length) { target = hot[0]; why = 'hit me (at a dragon)'; }
+      else { target = dragon; why = 'dragon'; }
+    } else if (dragon) {
       // 1. at a dragon: players first (whoever hit me first, else the closest), then the dragon
-      const threats = players.filter(x => x.d <= cfg.pvpRadius || dist(x.p, dragon.p) <= cfg.pvpRadius);
+      //    (defense mode: nobody hit me -> no threats, straight to the dragon)
+      const threats = defense ? [] : players.filter(x => x.d <= cfg.pvpRadius || dist(x.p, dragon.p) <= cfg.pvpRadius);
       const hot = threats.filter(x => G.hostile.has(x.e.netId));
-      if (hot.length) { target = hot[0]; why = 'hit me (at a dragon)'; }
+      if (clearT) { target = clearT; why = `clearing the dragon (~${Math.round(eta)} s left)`; }
+      else if (hot.length) { target = hot[0]; why = 'hit me (at a dragon)'; }
       else if (threats.length) { target = threats[0]; why = 'player at the dragon'; }
       else { target = dragon; why = 'dragon'; }
     } else if (hostiles.length) {
@@ -298,26 +475,43 @@ GI_INSTALL_JS = r"""
       //    players coming close to it get fought
       for (const b of boxes) {
         if (G.boxGaveUp.has(b.e.netId)) continue;
+        if (helping && b.lvl < 12) continue;               // on the way to a called dragon: only +5 boxes
         const ff = G.boxFirstFail.get(b.e.netId);
         if (ff && now - ff > cfg.boxWait) { G.boxGaveUp.add(b.e.netId); ev('gave up a locked Box +' + (b.lvl - 7)); continue; }
         pick = b; break;
       }
-      if (pick && G.boxFirstFail.has(pick.e.netId)) {
+      if (pick && !defense && G.boxFirstFail.has(pick.e.netId)) {
         const guard = players.filter(x => dist(x.p, pick.p) <= cfg.pvpRadius || x.d <= cfg.pvpRadius);
         if (guard.length) { target = guard[0]; why = 'guarding a locked box'; pick = null; }
       }
-      // 4. small golden mobs with no player next to them (no PvP over small ones)
-      if (!target && !pick) {
+      // 4. small golden mobs with no player next to them (no PvP over small ones);
+      //    defense mode: those first, then contested ones too (we don't fight the players there)
+      if (!target && !pick && !helping) {
         const free = goldens.filter(g => !players.some(x => dist(x.p, g.p) <= cfg.pvpRadius));
         if (free.length) { target = free[0]; why = 'golden'; }
+        else if (defense && goldens.length) { target = goldens[0]; why = 'golden (players near)'; }
       }
     }
-    const isPlayer = !!(target && target.e.npcType === undefined);
+    let isPlayer = !!(target && target.e.npcType === undefined);
     if (cfg.refreshSkill && (isPlayer || players.some(x => x.d <= cfg.pvpRadius))
         && now - (G.buffAt[cfg.refreshSkill] || 0) > cfg.refreshMs) {
       G.buffAt[cfg.refreshSkill] = now;                    // one request per refresh period
       G.wantBuff(s, cfg.refreshSkill, 'player close');
     }
+    // casts the server ignores: count sent vs seen per target (only outside a safe zone, where
+    // casting can work at all); too many ignored -> skip that target for cfg.ignoreMs
+    if (G.tPrev && !meSafe) {
+      const st = G.tStats.get(G.tPrev.id) || {sent: 0, seen: 0, name: G.tPrev.name};
+      st.sent += G.casts - G.tPrev.casts; st.seen += G.myCasts - G.tPrev.seen;
+      G.tStats.set(G.tPrev.id, st);
+      if (st.sent >= cfg.ignoreAfter && st.seen <= 1 && !(cfg.dragonLock && G.tPrev.dragon)) {
+        G.ignored.set(G.tPrev.id, now + cfg.ignoreMs); G.tStats.delete(G.tPrev.id);
+        ev(`skipping ${st.name} for ${cfg.ignoreMs / 1000} s: ${st.sent} casts, ${st.seen} seen by the server`);
+        if (target && target.e.netId === G.tPrev.id) { target = null; why = ''; isPlayer = false; }
+      } else if (st.seen > 1) G.tStats.delete(G.tPrev.id);   // it works on this one
+    }
+    G.tPrev = target ? {id: target.e.netId, name: target.name, casts: G.casts, seen: G.myCasts, dragon: target.e.npcType === 79} : null;
+    if (G.tStats.size > 200) G.tStats.clear();
     const tName = target ? target.name : null;
     if (tName !== G.lastTargetName) {
       G.lastTargetName = tName;
@@ -333,7 +527,7 @@ GI_INSTALL_JS = r"""
       G.box = null;
       try { const sk = G.pickSkill(now, s); G.attackSkill = sk; if (sk && s.currentSkill !== sk) s.selectSkill(sk); } catch (e) {}
       if (!isPlayer) w.attackTarget = target.e;
-      if (!w.castRequest && now - G.lastCast > 100) {
+      if (!w.castRequest && now - G.lastCast >= (cfg.castGap || 0)) {
         w.castRequest = {target: target.e, point: {x: target.p.x, y: target.p.y}, forced: false, pvp: isPlayer};
         G.lastCast = now; G.casts++;
       }
@@ -345,10 +539,11 @@ GI_INSTALL_JS = r"""
     }
     if (!target && G.target !== null) { w.attackTarget = null; w.castRequest = null; }
     G.target = target ? target.e.netId : null;
-    G.status = {mode: target ? (isPlayer ? 'pvp' : (target.e.npcType === 79 ? 'dragon' : 'golden')) : (pick ? 'box' : 'search'),
+    G.status = {safePlayers: safeN, ignored: G.ignored.size, mode: target ? (isPlayer ? 'pvp' : (target.e.npcType === 79 ? 'dragon' : 'golden')) : (pick ? 'box' : 'search'),
       target: tName, why, players: players.length, near: players.filter(x => x.d <= cfg.pvpRadius).length,
       goldens: goldens.length, dragon: dragon ? [Math.round(dragon.p.x), Math.round(dragon.p.y), Math.round(dragon.d)] : null,
-      boxes: boxes.length, loot: loot.slice(0, 20), hp, maxHp: pd.maxHP, heroState: h.heroState,
+      helping, eta: eta === null ? null : Math.round(eta), hitters: G.dHitters.size, boxes: boxes.length, loot: loot.slice(0, 20), hp, maxHp: pd.maxHP, heroState: h.heroState,
+      big5: (() => { const b = boxes.find(x => x.lvl >= 12 && !G.boxGaveUp.has(x.e.netId)); return b ? Math.round(b.d) : null; })(),
       attackSkill: G.attackSkill, pots: G.pots, casts: G.casts, myCasts: G.myCasts, hitsOnMe: G.hitsOnMe, pickFails: G.pickFails,
       skill: s.currentSkill, map: w.mapIndex, x: Math.round(me.x), y: Math.round(me.y),
       safe: w.getTerrainFlag ? (w.getTerrainFlag(Math.round(me.x), Math.round(me.y)) & 1) === 1 : null};
@@ -374,6 +569,10 @@ GI_STATUS_JS = """() => { const G = window.__gi; if (!G) return null;
 # Soul Barrier watcher on/off; returns its events (null = not installed, e.g. the page reloaded)
 GI_BARRIER_JS = """(on) => { const G = window.__gi; if (!G || !G.barrierTick) return null; G.barrier = on;
   if (!on) { G.bQueue = []; G.wasSafe = null; } return G.bEvents.splice(0); }"""
+
+# a dragon call from another of our hunters: {x, y, ms} (null = none)
+GI_CALL_JS = """(c) => { const G = window.__gi; if (!G) return false;
+  G.call = c ? {x: c.x, y: c.y, until: Date.now() + c.ms} : null; return true; }"""
 
 GI_SET_JS = """(on) => { const G = window.__gi; if (!G) return false; G.on = on;
   if (!on) { const w = window.__world; if (w) { w.castRequest = null; w.attackTarget = null; w.pickupTarget = null; }
@@ -570,7 +769,7 @@ class GoldenInvasion:
             if not self.is_hunter():
                 return False
         now = time.time()
-        if self.phase != "idle" and now - self.cur_start > GI_HUNT_SEC + 300:
+        if self.phase != "idle" and now - self.cur_start > GI_HUNT_SEC + 300 + (GI_DRAGON_LOCK_MAX if self.locked() else 0):
             return self.finish("took too long after the hunt")      # safety net
         if self.phase != "idle":
             try:
@@ -617,15 +816,17 @@ class GoldenInvasion:
         self.zen0 = c.s.get("money") or 0
         install = self.ev(GI_INSTALL_JS, self.cfg())
         self.log(f"=== GOLDEN INVASION at {time.strftime('%H:%M:%S', time.localtime(self.start_at))} "
-                 f"-> preparing, waiting in {MAP_NAMES[self.pre_map]} (fight loop {install}) ===")
+                 f"-> preparing, waiting in {MAP_NAMES[self.pre_map]} (fight loop {install}, PvP {GI_PVP_MODE}) ===")
         a.leave_party("Golden Invasion")
         c.set_helper(False)
-        if c.minimized and not G_HEADLESS():
-            c.set_window("normal")
-        a.show_window = True
+        self.showed = bool(GI_SHOW_WINDOW)
+        if GI_SHOW_WINDOW:
+            if c.minimized and not G_HEADLESS():
+                c.set_window("normal")
+            a.show_window = True
 
     def cfg(self):
-        return {"version": 7, "ours": list(self.a.hub.names), "skill": GI_SKILLS.get(self.a.name.lower(), 0), "potKey": GI_POTION_KEY,
+        return {"version": 14, "clear": GI_CLEAR, "clearEta": GI_CLEAR_ETA, "clearMinEta": GI_CLEAR_MIN_ETA, "clearMax": GI_CLEAR_MAX, "clearKillMs": GI_CLEAR_KILL_SEC * 1000, "clearLeash": GI_CLEAR_LEASH, "potHp": GI_POT_HP, "castGap": GI_CAST_GAP_MS, "dragonLock": GI_DRAGON_LOCK, "areaHitRadius": GI_AREA_HIT_RADIUS, "areaHitMs": GI_AREA_HIT_MS, "pvpMode": GI_PVP_MODE, "bigBoxRadius": GI_BIG_BOX_RADIUS, "ignoreAfter": GI_IGNORE_AFTER, "ignoreMs": GI_IGNORE_SEC * 1000, "ours": list(self.a.hub.names), "skill": GI_SKILLS.get(self.a.name.lower(), 0), "potKey": GI_POTION_KEY,
                 "potEvery": GI_POT_EVERY_MS, "hitWindow": GI_HIT_WINDOW_MS, "pvpRadius": GI_PVP_RADIUS,
                 "view": GI_VIEW, "boxWait": GI_BOX_WAIT_SEC * 1000, "loopMs": GI_LOOP_MS,
                 "barrierTries": GI_BARRIER_TRIES,
@@ -666,8 +867,8 @@ class GoldenInvasion:
             self.go_wait_spot()
             return True
         if self.phase == "hunt":
-            if rel >= GI_HUNT_SEC:
-                self.end_hunt()
+            if rel >= GI_HUNT_SEC and not self.locked():
+                self.end_hunt("event time is over")
                 return True
             self.hunt(rel)
             return True
@@ -803,6 +1004,70 @@ class GoldenInvasion:
             self.a.idle_wiggle((m, x, y))      # small random steps while waiting (mu_auto_bot IDLE_WIGGLE)
 
     # ── HUNT ──
+    def dragon_call(self, s, status, dead, now):
+        """Share the dragon I see; walk to a dragon another hunter sees on my map (<= GI_CALL_DIST tiles)."""
+        if not GI_CALL:
+            return
+        hub = self.a.hub
+        sh = getattr(hub, "gi_shared", None)
+        if sh is None:
+            return
+        me, m, x, y = self.a.name, s.get("map"), s.get("x"), s.get("y")
+        dragon = status.get("dragon")
+        with hub.lock:
+            calls = sh.setdefault("dragons", {})
+            if dragon and not dead:
+                calls[me] = {"map": m, "x": dragon[0], "y": dragon[1], "at": now}
+            else:
+                calls.pop(me, None)
+            others = [(n, dict(v)) for n, v in calls.items() if n != me]
+        best = None
+        if not dead and not dragon and x is not None and status.get("mode") != "pvp":
+            for n, v in others:
+                if v["map"] != m or now - v["at"] > GI_CALL_FRESH:
+                    continue
+                d = math.hypot(v["x"] - x, v["y"] - y)
+                if d <= GI_CALL_DIST and (best is None or d < best[0]):
+                    best = (d, n, v)
+        if best:
+            d, n, v = best
+            if not self.call or self.call["from"] != n or math.hypot(self.call["x"] - v["x"], self.call["y"] - v["y"]) > 8:
+                self.log(f"{n} found a Golden Dragon at ({v['x']},{v['y']}), {d:.0f} tiles away -> going to help")
+            self.call = {"from": n, "x": v["x"], "y": v["y"]}
+            self.ev(GI_CALL_JS, {"x": v["x"], "y": v["y"], "ms": 3000})
+        elif self.call:
+            self.log(f"dragon call from {self.call['from']} over ("
+                     + ("I see the dragon myself" if dragon else "dead" if dead else "no longer reported") + ")")
+            self.call = None
+            self.ev(GI_CALL_JS, None)
+
+    def locked(self):
+        """True while we're fighting over a Golden Dragon / its +5 box: nothing may end or move the hunt."""
+        return bool(GI_DRAGON_LOCK and self.phase == "hunt" and getattr(self, "dlock", False))
+
+    def update_lock(self, status, dead, now):
+        if not GI_DRAGON_LOCK:
+            return
+        dragon = status.get("dragon")             # [x, y, distance] of the dragon in view, or None
+        big5 = status.get("big5")                 # distance to a free Box +5 on the ground, or None
+        mode = status.get("mode")
+        if not self.dlock:
+            if not dead and dragon and (mode == "dragon" or (mode in ("pvp", "box") and dragon[2] <= GI_DRAGON_LOCK_DIST)):
+                self.dlock, self.dlock_seen = True, now
+                self.log(f"DRAGON LOCK on: fighting over the Golden Dragon at ({dragon[0]},{dragon[1]}) "
+                         f"-> staying until the +5 is ours, it's gone, or we die")
+            return
+        if dead:
+            self.dlock = False
+            self.log("DRAGON LOCK off: we died")
+            return
+        if dragon or big5 is not None:
+            self.dlock_seen = now
+            return
+        if now - self.dlock_seen > GI_DRAGON_BOX_GRACE:
+            self.dlock = False
+            self.log(f"DRAGON LOCK off: no dragon and no free +5 box in view for {GI_DRAGON_BOX_GRACE} s")
+
     def start_hunt(self):
         c = self.c
         self.ev(GI_INSTALL_JS, self.cfg())
@@ -811,7 +1076,10 @@ class GoldenInvasion:
         if GI_RECORD:
             c.rec.start()
         self.hunt_started = time.time()
+        self.last_golden = time.time()        # idle clock (GI_IDLE_SEC)
         self.map_target = None
+        self.dlock, self.dlock_seen = False, 0.0
+        self.call = None
         self.log(f"=== HUNT START (map {c.s.get('map')} at ({c.s.get('x')},{c.s.get('y')}), "
                  f"hp {c.s.get('hp')}, lvl {c.s.get('level')}) ===")
 
@@ -828,7 +1096,8 @@ class GoldenInvasion:
         in accounts.json), the others hunt where they waited."""
         hub = self.a.hub
         sh = hub.gi_shared
-        snap = hub.snapshot()          # BEFORE taking hub.lock: snapshot() takes it too (non-reentrant -> deadlock)
+        snap = hub.snapshot()          # BEFORE taking hub.lock: snapshot() takes it too
+        hunters = self.hunters()       # same: hunters() calls snapshot() (inside the lock it froze every bot at HUNT START)
         with hub.lock:
             if "focus" not in sh:
                 maps = (counts or {}).get("maps") or {}
@@ -842,7 +1111,7 @@ class GoldenInvasion:
                     why = (f"banner {banner.get('name')} is not one of ours, " if banner else "no banner, ") \
                         + f"most golden mobs in {MAP_NAMES[focus]}"
                 pre = sh.get("pre", {})
-                order = [n for n in self.hunters() if n in pre]
+                order = [n for n in hunters if n in pre]
                 ok = [n for n in order if focus != MAP_DEVIAS or ((snap.get(n) or {}).get("level") or 0) >= DEVIAS_MIN_LEVEL]
                 members = [n for n in ok if pre.get(n) == focus][:GI_FOCUS_COUNT]
                 members += [n for n in ok if n not in members][:GI_FOCUS_COUNT - len(members)]
@@ -896,10 +1165,22 @@ class GoldenInvasion:
         status = st.get("status") or {}
         counts = st.get("counts")
         dead = status.get("dead") or (s.get("hp") or 0) <= 0
+        now = time.time()
+        # idle clock: reset while a golden is in view, while fighting / picking up, while dead or travelling
+        if (dead or status.get("goldens") or status.get("mode") in ("golden", "dragon", "pvp", "box")
+                or self.map_target is None or s.get("map") != self.map_target):
+            self.last_golden = now
+        self.update_lock(status, dead, now)
+        # InvasionMonsters only comes when a count changes; total 0 (incl. the 'fd 00' inactive packet) = over
+        if counts is not None and counts.get("total") == 0 and rel > GI_BANNER_WAIT + 10 and not self.dlock:
+            return self.end_hunt("every golden mob is dead")
+        if now - self.last_golden > GI_IDLE_SEC and not self.dlock:
+            return self.end_hunt(f"no golden mob found for {GI_IDLE_SEC} s")
         if dead and not self.was_dead:
             self.deaths += 1
             self.log(f"DIED (#{self.deaths}) at ({s.get('x')},{s.get('y')}) -> respawn and keep hunting")
         self.was_dead = dead
+        self.dragon_call(s, status, dead, now)
         if dead:
             return
         if self.map_target is None:
@@ -913,7 +1194,7 @@ class GoldenInvasion:
             else:
                 return
         # switch map when ours is empty and the other one still has plenty
-        if counts and s.get("map") == self.map_target and status.get("mode") == "search":
+        if counts and s.get("map") == self.map_target and status.get("mode") == "search" and not self.dlock and not self.call:
             maps = counts.get("maps") or {}
             here = int(maps.get(str(self.map_target), 0) or 0)
             lvl_ok = lambda m: m != MAP_DEVIAS or (s.get("level") or 0) >= DEVIAS_MIN_LEVEL
@@ -939,7 +1220,11 @@ class GoldenInvasion:
         if self.leave_town(s, status):
             return
         self.mark_seen(s, status)
-        if status.get("mode") == "search":
+        if self.call and status.get("mode") == "search":
+            self.goal = None
+            self.ev(B.WALK_JS, [self.call["x"], self.call["y"]])
+            self.last_golden = now                        # walking to a dragon is not idle time
+        elif status.get("mode") == "search":
             self.search_step(s)
         else:
             self.goal = None
@@ -948,7 +1233,8 @@ class GoldenInvasion:
             self.log(f"{status.get('mode')} | target {status.get('target')} | players {status.get('players')} "
                      f"(near {status.get('near')}) | goldens {status.get('goldens')} | hp {status.get('hp')}/"
                      f"{status.get('maxHp')} | pots {status.get('pots')} | casts {status.get('casts')}/"
-                     f"{status.get('myCasts')} seen | skill {status.get('attackSkill')} | left {counts and counts.get('total')}")
+                     f"{status.get('myCasts')} seen | skill {status.get('attackSkill')} | left {counts and counts.get('total')}"
+                     + (f" | dragon ~{status.get('eta')} s left, {status.get('hitters')} other(s) hitting it" if status.get('eta') is not None else ""))
 
     def leave_town(self, s, status):
         """Respawned (or wandered) into the Devias safe zone: warp to another Devias zone instead of walking out."""
@@ -975,6 +1261,10 @@ class GoldenInvasion:
     def cell(self, x, y):
         return (int(x) // GI_SEARCH_CELL, int(y) // GI_SEARCH_CELL)
 
+    def searched(self, key, now):
+        t = self.grid.get(key)
+        return t is not None and now - t < GI_SEARCH_AGE
+
     def mark_seen(self, s, status):
         x, y = s.get("x"), s.get("y")
         if x is None:
@@ -990,7 +1280,8 @@ class GoldenInvasion:
             for lx, ly in status.get("loot") or []:      # leftover loot: someone already went there
                 for cx in range(int((lx - GI_LOOT_RADIUS) // GI_SEARCH_CELL), int((lx + GI_LOOT_RADIUS) // GI_SEARCH_CELL) + 1):
                     for cy in range(int((ly - GI_LOOT_RADIUS) // GI_SEARCH_CELL), int((ly + GI_LOOT_RADIUS) // GI_SEARCH_CELL) + 1):
-                        self.grid.setdefault((cx, cy), now)
+                        if not self.searched((cx, cy), now):
+                            self.grid[(cx, cy)] = now
 
     def search_step(self, s):
         x, y = s.get("x"), s.get("y")
@@ -1000,7 +1291,7 @@ class GoldenInvasion:
         if self.goal:
             gx, gy = self.goal
             d = math.hypot(gx - x, gy - y)
-            if d <= 3 or self.cell(gx, gy) in self.grid:
+            if d <= 3 or self.searched(self.cell(gx, gy), now):
                 self.goal = None
             elif d < self.goal_best - 0.5:
                 self.goal_best, self.goal_progress_at = d, now
@@ -1012,7 +1303,7 @@ class GoldenInvasion:
             cand = []
             for cx in range(n):
                 for cy in range(n):
-                    if (cx, cy) in self.grid:
+                    if self.searched((cx, cy), now):
                         continue
                     mx, my = cx * GI_SEARCH_CELL + GI_SEARCH_CELL // 2, cy * GI_SEARCH_CELL + GI_SEARCH_CELL // 2
                     cand.append((math.hypot(mx - x, my - y), cx, cy, mx, my))
@@ -1030,7 +1321,7 @@ class GoldenInvasion:
         self.ev(B.WALK_JS, list(self.goal))
 
     # ── END ──
-    def end_hunt(self):
+    def end_hunt(self, why="done"):
         c = self.c
         self.ev(GI_SET_JS, False)
         st = self.ev(GI_STATUS_JS) or {}
@@ -1042,7 +1333,7 @@ class GoldenInvasion:
         bag = self.ev(BAG_BOXES_JS) or {}
         got = {box_name(l): bag.get(l, 0) - self.bag0.get(l, 0) for l in set(bag) | set(self.bag0)}
         got = {k: v for k, v in sorted(got.items()) if v}
-        self.log(f"=== HUNT OVER: boxes {got or 'none'} | players died after I targeted them: "
+        self.log(f"=== HUNT OVER ({why}, {int(time.time() - self.hunt_started)} s): boxes {got or 'none'} | players died after I targeted them: "
                  f"{self.stats.get('player_kills', 0)} | deaths {self.deaths} | potions {status.get('pots')} | "
                  f"casts {status.get('casts')} ({status.get('myCasts')} seen by the server) | "
                  f"hits taken from players {status.get('hitsOnMe')} | failed pickups {status.get('pickFails')} ===")
@@ -1130,7 +1421,8 @@ class GoldenInvasion:
         self.log(f"=== GOLDEN INVASION finished ({why}) -> back to normal ===")
         self.barrier(False)
         self.phase = "idle"
-        a.show_window = False
+        if getattr(self, "showed", True):
+            a.show_window = False
         a.step_key = None
         c.walk_target = None
         c.spot = None

@@ -12,6 +12,9 @@ Leveling (each character, independently):
   * Parties: two of ours on the same leg of the route, same map, within PARTY_MEET_RADIUS tiles
     party up (the higher level invites, only our own invites are accepted). A character with no party member near it
     (PARTY_APART_RADIUS) for PARTY_APART_SEC leaves the party.
+  * Strangers' party invites are accepted while leveling (LEVEL_ACCEPT_STRANGERS, not for pairs, only when
+    not in a party). Once in, say LEVEL_AFK_TEXT once (at most every LEVEL_AFK_EVERY s); the party is
+    left when we move on to another spot / leg, go to reset, Blood Castle, Golden Invasion or a box trade.
 
 Blood Castle (15 minutes before every castle, BC_PLAN_SEC):
   * One character per castle level (BC1..BC7, lower castles first).
@@ -89,6 +92,12 @@ PARTY_APART_RADIUS  = 20    # a party member further than this ...
 PARTY_APART_SEC     = 60    # ... for this long (nobody near me) -> I leave the party
 PARTY_EVERY         = 2     # seconds between party checks
 SEND_AUTOPARTY_OFF  = True  # the group bot turned /autoparty ON for the alts; turn it off once
+LEVEL_ACCEPT_STRANGERS = True   # leveling: accept party invites from other players (not while in a party,
+                                # not for leveling pairs); the party is left when we move to another spot/map
+LEVEL_AFK_TEXT      = "me quedo afk"   # said once after joining a stranger's party ("" = say nothing) ...
+LEVEL_AFK_EVERY     = 900       # ... and at most once per this many seconds per character (Juan 2026-10-12)
+LEVEL_AFK_PARTY_CHAT = True     # say it in party chat (~); False = normal chat
+LEVEL_AFK_DELAY     = (3, 8)    # seconds after joining before saying it (random, looks less instant)
 
 # spot rules for a character on its own (the group bot's rules for the rest, see mu_group_bot.py)
 SOLO_DEATHS_TO_SWITCH = 3   # my deaths at one spot within DEATH_WINDOW_SEC -> switch (not on the best spot)
@@ -124,7 +133,10 @@ BC_DEFAULT_RATE     = 15    # levels/min assumed when a character's recent rate 
 BC_RESET_OVERHEAD   = 1.5   # minutes for /reset + Zen Chests + walking out of town
 BC_LOW_RATE         = 25    # levels/min right after a reset (Lorencia)
 BC_WAIT_INVITE_SEC  = 8     # inside: after asking "party?", wait this long for an invite before inviting ourselves (was 30; Juan 2026-10-11)
-BC_ASK_PARTY_TEXT   = "party?"   # said once in normal chat when the first other player shows up
+BC_ASK_PARTY_TEXT   = "party?"   # said once in normal chat when the first other player shows up ...
+BC_ASK_PARTY        = False      # ... only if True (Juan 2026-10-12: don't say it any more; we still wait, then invite)
+BC_WEAPON_TEXT      = ""   # said once when the weapon was picked up by us or someone in our party
+                                            # (Juan 2026-10-12); "" = off
 BC_INVITE_EVERY     = 10    # seconds between invites to the same player
 BC_SHOW_WINDOW_AFTER = 2    # entry dialog not found this many times -> restore the window so you can click
 DEVIAS_MIN_LEVEL    = 20    # /move Devias (Spirit of Archangel) needs this level: BC1 entries wait for it
@@ -264,7 +276,7 @@ class Hub:
     """What the characters know about each other (each thread only touches its own browser)."""
 
     def __init__(self, names):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()   # re-entrant: a thread that already holds it can call snapshot() etc. without freezing everyone
         self.names = names
         self.info = {}
         self.stats = SharedStats(G.BASE_DIR / G.STATS_FILE)
@@ -311,6 +323,8 @@ class Agent:
         self.party_check = 0
         self.alone_since = None
         self.invited = {}
+        self.stranger_party = None   # leveling in a stranger's party: {"area", "joined", "say_at", "said"}
+        self.afk_said_at = 0         # last time LEVEL_AFK_TEXT was said
         self.bcs = None              # Blood Castle state while this character is assigned to one
         self.plan_seen = None
         self.paused = False
@@ -587,6 +601,8 @@ class Agent:
             self.publish()
             return
         if self.trade_tick():
+            if self.stranger_party and self.my_trade and self.name == self.my_trade["alt"]:
+                self.leave_party("walking over to trade boxes")
             self.publish()
             if now - self.last_status > 60:
                 self.last_status = now
@@ -604,6 +620,8 @@ class Agent:
                 c.shop_pending = False
             return
         if self.pair_wait_tick():
+            if self.stranger_party:
+                self.leave_party("leaving the spot")
             self.publish()
             if now - self.last_status > 60:
                 self.last_status = now
@@ -1125,6 +1143,24 @@ class Agent:
             self.log(f"leaving party {party} ({why})")
             self.ev("() => window.__social.partyLeave()")
             self.alone_since = None
+        self.stranger_party = None
+
+    def stranger_party_tick(self, party, now):
+        """In a stranger's party while leveling: say LEVEL_AFK_TEXT once (rate limited), and leave
+        as soon as we move to another spot / leg of the route."""
+        sp = self.stranger_party
+        area = (self.step_key, self.spot_idx)
+        if sp is None:                   # joined without us seeing the accept (e.g. after a restart)
+            sp = self.stranger_party = {"area": area, "joined": now, "said": True, "say_at": 0}
+            self.log(f"in a stranger's party {party} -> staying while we farm here")
+        if sp["area"] != area:
+            return self.leave_party("moving on to another area")
+        if not sp["said"] and now >= sp["say_at"]:
+            sp["said"] = True            # once per accepted invite, even if the rate limit skips it
+            if LEVEL_AFK_TEXT and now - self.afk_said_at >= LEVEL_AFK_EVERY:
+                self.afk_said_at = now
+                self.log(f"joined {party} -> saying '{LEVEL_AFK_TEXT}'")
+                self.c.chat(("~" if LEVEL_AFK_PARTY_CHAT else "") + LEVEL_AFK_TEXT)
 
     def party_tick(self):
         c, s = self.c, self.c.s
@@ -1137,18 +1173,26 @@ class Agent:
         if grp:
             return self.pair_party_tick(grp, snap)
 
-        # invites: accept only our own characters, and only when not in a party
+        # invites: accept our own characters, and strangers (LEVEL_ACCEPT_STRANGERS), only when not in a party
         if s.get("partyRequest"):
             text = s.get("partyRequestText", "")
-            if len(party) <= 1 and any(f'"{n}"' in text for n in ours if n != self.name):
-                self.log("accepting party invite")
+            from_ours = any(f'"{n}"' in text for n in ours if n != self.name)
+            if len(party) <= 1 and (from_ours or LEVEL_ACCEPT_STRANGERS):
+                self.log(f"accepting party invite{'' if from_ours else ' from a stranger'}: {text[:60]}")
                 self.ev("() => window.__social.partyRespond(true)")
+                if not from_ours:
+                    self.stranger_party = {"area": (self.step_key, self.spot_idx), "joined": now,
+                                           "said": False, "say_at": now + random.uniform(*LEVEL_AFK_DELAY)}
             else:
                 self.ev("() => window.__social.partyRespond(false)")
 
+        if len(party) <= 1 and self.stranger_party and now - self.stranger_party["joined"] > 15:
+            self.stranger_party = None   # the party broke up / we were kicked / the invite expired
         if len(party) > 1:
             if any(n not in ours for n in party):
-                return self.leave_party("a stranger is in it")
+                if not LEVEL_ACCEPT_STRANGERS:
+                    return self.leave_party("a stranger is in it")
+                return self.stranger_party_tick(party, now)
             near = False
             for n in party:
                 o = snap.get(n)
@@ -1859,32 +1903,60 @@ class Agent:
         Presses the key at most once per HELPER_ASYNC_GUARD so a slow confirm isn't toggled back."""
         c = self.c
         if bool(c.s.get("helper")) == on:
+            self.helper_tries = 0
             return
         now = time.time()
         if now - self.helper_press_at < B.HELPER_ASYNC_GUARD:
             return
         self.helper_press_at = now
-        self.log(f"helper -> {'ON' if on else 'OFF'} (no wait)")
+        # 2026-10-12: the key press alone never landed in the minimized windows (BC 00:00: all four
+        # characters pressed "ON" every 4.5 s for 3 min, helper stayed off, stuck at the gate).
+        # set_helpers() always had the client's own toggle as fallback; here we alternate: the
+        # client toggle first (works minimized), the key on the next try.
+        self.helper_tries = getattr(self, "helper_tries", 0) + 1
+        how = "toggle" if self.helper_tries % 2 else "key"
+        self.log(f"helper -> {'ON' if on else 'OFF'} (no wait, {how})")
         try:
-            c.page.evaluate("() => { const c=document.querySelector('canvas'); c && c.focus(); }")
-            c.page.keyboard.press(G.HELPER_KEY)
+            if how == "toggle":
+                c.page.evaluate("() => window.__store.toggleMuHelper()")
+            else:
+                c.page.evaluate("() => { const c=document.querySelector('canvas'); c && c.focus(); }")
+                c.page.keyboard.press(G.HELPER_KEY)
         except Exception as e:
-            self.log(f"helper key: {e!r}")
+            self.log(f"helper {how}: {e!r}")
 
-    def grab(self, b, on):
-        """Arm/disarm the in-page weapon grabber (mu_bc.BC_GRAB_JS); logs its events.
-        Returns its status, or None if the page didn't answer."""
+    def grab(self, b, on, goal=None, goal_r=2, mode="advance", weapon=True, statue=True):
+        """Arm/disarm the in-page loop (mu_bc.BC_GRAB_JS): weapon grab + statue attack, and without
+        the helper (B.BC_USE_HELPER False) also walking to `goal` and fighting what is in the way
+        (mode advance / rush / guard / hold). Logs its events. Returns its status, or None if the
+        page didn't answer."""
         if not on and not b.get("grab_on"):
             return None
+        fight = not B.BC_USE_HELPER
         cfg = {"version": B.GRAB_VERSION, "on": bool(on), "g": B.WEAPON[0], "n": B.WEAPON[1],
                "re": B.WEAPON_NAME_RE, "radius": B.GRAB_RADIUS, "loopMs": B.GRAB_LOOP_MS,
-               "pickMs": B.GRAB_PICK_MS}
+               "pickMs": B.GRAB_PICK_MS, "weapon": bool(weapon), "statue": bool(statue),
+               "statueTypes": B.STATUE_TYPES, "statueRadius": B.STATUE_ATTACK_RADIUS,
+               "castMs": B.STATUE_CAST_MS if not fight else B.FIGHT_CAST_MS,
+               "stand": list(B.STATUE), "standR": B.STATUE_RADIUS + 0.5,
+               "fight": fight, "goal": list(goal) if (fight and goal) else None, "goalR": goal_r,
+               "mode": mode, "gateTypes": B.GATE_TYPES, "npcTypes": B.NPC_TYPES,
+               "mageSkill": B.FIGHT_MAGE_SKILL, "combo": B.FIGHT_KNIGHT_COMBO,
+               "comboStep": B.FIGHT_COMBO_STEP_MS, "mageRange": B.FIGHT_MAGE_RANGE,
+               "knightRange": B.FIGHT_KNIGHT_RANGE, "otherRange": B.FIGHT_OTHER_RANGE,
+               "range": B.FIGHT_RANGES.get(self.name.lower(), 0), "coneHalf": B.FIGHT_CONE_HALF,
+               "rushRange": B.FIGHT_RUSH_RANGE, "stuckMs": B.FIGHT_STUCK_MS, "huntMs": B.FIGHT_HUNT_MS,
+               "leash": B.FIGHT_LEASH, "walkMs": B.FIGHT_WALK_MS, "potKey": B.FIGHT_POT_KEY,
+               "potHp": B.FIGHT_POT_HP, "potMs": B.FIGHT_POT_MS, "buffs": B.FIGHT_BUFFS,
+               "buffEvery": B.FIGHT_BUFF_EVERY_MS, "buffTries": B.FIGHT_BUFF_TRIES}
+        if on and not fight and b.get("statue_solo_over"):
+            cfg["statue"] = False                 # our own attack took too long: the helper finishes it
         r = self.ev(B.BC_GRAB_JS, cfg)
         if r is None:
             return None
         if on and not b.get("grab_on"):
-            self.log("BC: weapon grabber armed (in-page, every "
-                     f"{B.GRAB_LOOP_MS} ms, {B.GRAB_RADIUS} tiles)")
+            self.log(f"BC: in-page loop armed (every {B.GRAB_LOOP_MS} ms: weapon grab"
+                     + (", walking + fighting, NO helper)" if fight else ", statue)"))
         b["grab_on"] = bool(on)
         for e in r.get("events") or []:
             self.log(f"BC grab: {e}")
@@ -1892,6 +1964,34 @@ class Agent:
             b["grab_err"] = r["err"]
             self.log(f"BC grab error: {r['err']}")
         return r
+
+    def fight_to(self, b, x, y, radius, mode, at_goal=None, weapon=True, statue=False):
+        """No-helper movement inside the castle: the in-page loop walks to (x, y) and fights what is
+        in the way (mode); once within radius it switches to at_goal (e.g. guard / hold).
+        Returns (arrived, loop status)."""
+        s = self.c.s
+        if s.get("helper"):
+            self.helper_async(False)              # left on from leveling: it would fight on its own
+        arrived = dist(s, x, y) <= radius
+        r = self.grab(b, True, goal=(x, y), goal_r=radius,
+                      mode=(at_goal or mode) if arrived else mode, weapon=weapon, statue=statue)
+        self.fight_log(b, r)
+        return arrived, r
+
+    def fight_log(self, b, r):
+        """Status line every FIGHT_LOG_SEC: where we are, what we hit, casts sent vs seen, potions."""
+        now = time.time()
+        if not r or now - b.get("fight_log_at", 0) < B.FIGHT_LOG_SEC:
+            return
+        b["fight_log_at"] = now
+        f, s = r.get("fight") or {}, self.c.s
+        d = f.get("dGoal")
+        self.log(f"BC fight: ({s.get('x')},{s.get('y')}) {f.get('mode')} | "
+                 f"{'%.0f' % d if d is not None else '?'} tiles to go | "
+                 f"{f.get('target') or '-'} ({f.get('why')}) | {f.get('inRange')} in range "
+                 f"({f.get('kind')}, {f.get('range')}t, skill {f.get('skill')}) | casts {f.get('casts')} sent / "
+                 f"{f.get('seen')} seen | pots {f.get('pots')} | hp {f.get('hp')}/{f.get('maxHp')}"
+                 + (" | STUCK" if f.get("stuck") else ""))
 
     def walk_in_castle(self, b, x, y, radius=2):
         c, s = self.c, self.c.s
@@ -1982,6 +2082,40 @@ class Agent:
                     b["in_party"].add(n)
                     self.log(f"BC: {n} is already in a party -> not inviting him again")
 
+    # who holds the Archangel's weapon (the castle state's holder = a netId): me / a name / a party member
+    HOLDER_JS = """(h) => { const w = window.__world, me = w && w.playerEntity;
+      if (me && me.netId === h) return {me: true, name: (window.__store.playerData || {}).name || null};
+      const e = w ? w.netObjsQuery.entities.find(x => x.netId === h && x.playerAnimation) : null;
+      let name = e ? (e.objectNameInWorld || '').trim() : null;
+      if (!name) { const pm = ((window.__social || {}).partyMembers || []).find(m => m.index === h || m.netId === h);
+                   if (pm) name = (pm.name || '').trim(); }
+      return {me: false, name}; }"""
+
+    def bc_weapon_shout(self, b, holder):
+        """Once per castle: the weapon was just picked up by us or one of our party -> say BC_WEAPON_TEXT."""
+        if not BC_WEAPON_TEXT or holder in (None, 255) or b.get("weapon_shout"):
+            return
+        who = self.ev(self.HOLDER_JS, holder) or {}
+        name = (who.get("name") or "").strip()
+        first = b.setdefault("weapon_seen_at", time.time())
+        if not who.get("me") and not name and time.time() - first < 5:
+            return                                   # holder not identified yet (out of view?): retry a few s
+        b["weapon_shout"] = True                     # decided once per castle, whoever it was
+        party = [n.strip().lower() for n in (self.c.s.get("party") or [])]
+        ours = who.get("me") or (name and name.lower() in party)
+        if not ours:
+            self.log(f"BC: weapon picked up by {name or f'holder {holder}'} (not our party) -> no shout")
+            return
+        key = (b.get("tier"), b.get("open_at"))
+        with self.hub.lock:                          # two of ours in the same castle: say it only once
+            said = getattr(self.hub, "bc_weapon_shouts", set())
+            if key in said:
+                return
+            said.add(key)
+            self.hub.bc_weapon_shouts = said
+        self.log(f"BC: weapon picked up by {'me' if who.get('me') else name} (our party) -> '{BC_WEAPON_TEXT}'")
+        self.c.chat(BC_WEAPON_TEXT)
+
     def bc_party(self, b):
         """Once another player shows up: say "party?" and wait BC_WAIT_INVITE_SEC for an invite;
         then invite the players in view who aren't already in a party (and keep inviting new arrivals)
@@ -2010,9 +2144,12 @@ class Agent:
             b["first_stranger"] = now
             if len(party) <= 1 and not b["asked"]:
                 b["asked"] = True
-                self.log(f"BC: other players here ({', '.join(players[:4])}) -> asking '{BC_ASK_PARTY_TEXT}', "
-                         f"waiting {BC_WAIT_INVITE_SEC}s for an invite")
-                self.c.chat(BC_ASK_PARTY_TEXT)
+                if BC_ASK_PARTY:
+                    self.log(f"BC: other players here ({', '.join(players[:4])}) -> asking '{BC_ASK_PARTY_TEXT}', "
+                             f"waiting {BC_WAIT_INVITE_SEC}s for an invite")
+                    self.c.chat(BC_ASK_PARTY_TEXT)
+                else:
+                    self.log(f"BC: other players here ({', '.join(players[:4])}) -> waiting {BC_WAIT_INVITE_SEC}s for an invite")
             else:
                 self.log(f"BC: other players here ({', '.join(players[:4])})")
         if b["first_stranger"] is None or now - b["first_stranger"] < BC_WAIT_INVITE_SEC:
@@ -2084,6 +2221,7 @@ class Agent:
         self.bc_party(b)
         self.bc_diag(b, st)
         holder = st.get("own") if st else 255
+        self.bc_weapon_shout(b, holder)
         # after a pickup attempt: the bag code may not be 13/19, so also trust "item gone from
         # the ground + the game says someone holds the weapon" (solo / right after our pickup)
         pk = b.get("pick_try")
@@ -2111,9 +2249,15 @@ class Agent:
         in_bag = (self.ev(B.WEAPON_INV_JS, [list(x) for x in B.WEAPON_CODES]) or 0) > 0
         has_weapon = in_bag or b.get("we_have")
         if has_weapon:
-            self.grab(b, False)
-            if not self.walk_in_castle(b, *B.ARCHANGEL, radius=2):
-                return True
+            if B.BC_USE_HELPER:
+                self.grab(b, False)
+                if not self.walk_in_castle(b, *B.ARCHANGEL, radius=2):
+                    return True
+            else:
+                # run back hitting only what blocks the way; at the Archangel: stop fighting, talk
+                arrived, _ = self.fight_to(b, *B.ARCHANGEL, 2, "rush", at_goal="hold", weapon=False)
+                if not arrived:
+                    return True
             if in_bag:
                 b["deliver_at"] = None
             else:
@@ -2127,7 +2271,8 @@ class Agent:
                 if not in_bag and not b.get("deliver_at"):
                     b["deliver_at"] = time.time()
                 b["talk_at"] = time.time()
-                c.set_helper(False)
+                if s.get("helper"):
+                    c.set_helper(False)
                 self.log("BC: delivering the weapon to the Archangel")
                 self.ev(B.TALK_NPC_JS, B.ARCHANGEL_NPC)
             return True
@@ -2135,17 +2280,27 @@ class Agent:
             b["rush"] = True
             self.log("BC: another player has the weapon -> back to the Archangel")
         if b["rush"]:
-            self.grab(b, False)
-            self.walk_in_castle(b, *B.ARCHANGEL, radius=2)
+            if B.BC_USE_HELPER:
+                self.grab(b, False)
+                self.walk_in_castle(b, *B.ARCHANGEL, radius=2)
+            else:
+                self.fight_to(b, *B.ARCHANGEL, 2, "rush", at_goal="hold", weapon=False)
+            self.log_rush(b)
             return True
         if not st or st.get("st") not in (1, 4):
             self.grab(b, False)
             self.park(s.get("map"), "", *(self.ev(B.WAIT_SPOT_JS, [*B.BC_WAIT, *B.BC_START]) or B.BC_START),
                       radius=2)   # waiting for the castle to start (by the bridge), wiggling a little
             return True
-        # castle running: the in-page grabber watches the ground 20x/s and picks the weapon up
-        # the instant it drops (even while this Python tick is busy). Here: log + helper off.
-        gr = self.grab(b, True)
+        # castle running: the in-page loop watches the ground 20x/s and picks the weapon up the
+        # instant it drops (even while this Python tick is busy). Without the helper it also walks
+        # up the corridor to the stand spot by the statue, hitting what is in the way, and guards
+        # the spot (statue first, then anything in range) once there.
+        if not B.BC_USE_HELPER:
+            _, gr = self.fight_to(b, *B.STATUE, B.STATUE_RADIUS, "advance", at_goal="guard",
+                                  weapon=True, statue=True)
+        else:
+            gr = self.grab(b, True)
         if gr and gr.get("chasing"):
             self.helper_async(False)                  # the helper would keep attacking / walking away
             if not b.get("pick_try") or b["pick_try"][0] != gr["id"]:
@@ -2169,12 +2324,35 @@ class Agent:
                     b["pick_try"] = (w["id"], now, list(bag0) if bag0 is not None else None)
                 self.ev(B.PICKUP_JS, w["id"])
                 return True
+        if not B.BC_USE_HELPER:
+            return True                           # walking / fighting / statue: all in the page
+        if gr and gr.get("statue"):
+            # the grabber is hitting the Statue of Saint itself (we want the LAST hit: the weapon
+            # then belongs to us/our party first) -> keep the helper out of it, for a while
+            if gr.get("statueMs", 0) < B.STATUE_SOLO_SEC * 1000:
+                self.helper_async(False)
+                return True
+            if not b.get("statue_solo_over"):
+                b["statue_solo_over"] = True
+                self.log(f"BC: statue still up after {B.STATUE_SOLO_SEC}s of our own attacks -> MU Helper")
+                self.grab(b, True)
         tx, ty = B.STATUE
         if dist(s, tx, ty) <= B.STATUE_RADIUS:
             self.helper_async(True)
             return True
         self.walk_in_castle(b, tx, ty, radius=B.STATUE_RADIUS)
         return True
+
+    def log_rush(self, b):
+        """While running back to the Archangel: where are we, every 5 s (to see why we arrive late)."""
+        s, now = self.c.s, time.time()
+        if now - b.get("rush_log_at", 0) < 5:
+            return
+        b["rush_log_at"] = now
+        b.setdefault("rush_t0", now)
+        self.log(f"BC: running to the Archangel: at ({s.get('x')},{s.get('y')}), "
+                 f"{dist(s, *B.ARCHANGEL):.0f} tiles left, {now - b['rush_t0']:.0f}s so far, "
+                 f"helper {'on' if s.get('helper') else 'off'}")
 
     def check_msgwin(self):
         """Close the game's message window (OK dialog) whenever one is open, and log its text."""
@@ -2227,8 +2405,17 @@ class Agent:
                 b["ui_closed"].add(t)
                 self.close_dialogs(b, f"{t}s after the end")
         if in_bc(s.get("map")) and not b["box"] and since_end < B.END_WAIT_SEC:
-            if not self.go(s.get("map"), "", *B.ARCHANGEL, radius=4) and since_end < 20:
-                return True
+            if not self.go(s.get("map"), "", *B.ARCHANGEL, radius=4):
+                # still on the way back (far up the corridor when someone else delivered):
+                # keep walking - boxes are only in range near the Archangel
+                self.log_rush(b)
+                boxes = [it for it in (self.ev(B.SCAN_JS, [self.hub.names, 30] + list(B.BOX)) or {}).get("items", [])
+                         if it["id"] not in b["tried"]]
+                if not boxes:
+                    return True
+            elif not b.get("arrived_at"):
+                b["arrived_at"] = time.time()
+                self.log(f"BC: at the Archangel {since_end:.0f}s after the end")
             now = time.time()
             if b["box_try"]:
                 bid, t0, n0 = b["box_try"]
@@ -2246,7 +2433,7 @@ class Agent:
                 b["box_try"] = (boxes[0]["id"], now, self.inv(B.BOX))
                 self.ev(B.PICKUP_JS, boxes[0]["id"])
                 return True
-            if since_end < 25:
+            if time.time() - b.get("arrived_at", time.time()) < 25:
                 return True        # boxes may still be dropping
         if in_bc(s.get("map")):
             if time.time() - c.last_warp > 15:

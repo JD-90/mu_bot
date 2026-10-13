@@ -58,8 +58,12 @@ ARCHANGEL_NPC = 232
 WEAPON        = (5, 10)             # Archangel's weapon: "Weapon of Archangel" [5/10 lvl 0] (seen 2026-10-10, BC3)
 WEAPON_CODES  = [(5, 10), (13, 19), (0, 19), (4, 18)]   # 5/10 = how it shows on the ground; 13/19 = in the bag (confirmed 2026-10-10 15:07, bruto BC7); 0/19, 4/18 = classic codes, unconfirmed
 BOX           = (14, 11, 12)        # Box of Kundun +5
-STATUE        = (13, 93)            # walk towards the statue (weapon drops at ≈13,95)
-STATUE_RADIUS = 3                   # this close -> helper on to destroy the statue
+# The weapon ALWAYS drops on the Statue of Saint's tile (14,95): 27 of 27 sightings in the logs,
+# 2026-10-10/11, castles 2-7. We stand on the tile next to it (corridor side) so the pickup is
+# one tile away, and hit the statue / its guards from there.
+WEAPON_DROP   = (14, 95)
+STATUE        = (14, 94)            # our stand spot, next to the statue / weapon drop
+STATUE_RADIUS = 1                   # this close = on the spot (helper mode: helper on; no-helper mode: guard the spot)
 STUCK_SEC     = 2.0                 # no walking progress this long -> stuck
 HELPER_BURST  = 3.0                 # helper on this long when stuck, then keep walking
 CLEAR_RADIUS  = 7                   # scan radius for the weapon on the ground
@@ -371,67 +375,362 @@ BAG_JS = """
 # ── fast weapon grab (2026-10-11) ──
 # Logs showed the weapon on the ground for 5-6 s before we even sent the first pickup: the Python
 # tick is 1/s and every MU Helper toggle blocks it ~5 s waiting for the server. Same fix as the
-# Golden Invasion fight loop: a loop INSIDE the page (every GRAB_LOOP_MS) watches the ground while the
-# castle runs, and the moment the weapon shows up it drops any attack and re-sends the pickup every
-# GRAB_PICK_MS until it leaves the ground. Python only arms/disarms it, logs it, and turns the
-# helper off (without waiting).
-GRAB_VERSION   = 1
-GRAB_LOOP_MS   = 50                  # in-page check period (20x/s)
-GRAB_PICK_MS   = 200                 # re-send the pickup this often while the weapon is on the ground
+# Golden Invasion fight loop: a loop INSIDE the page watches the ground while the castle runs.
+#
+# v3 (2026-10-11 19:06, NicoBM took it from bruto): v1 saw the weapon 2 tiles away and reacted in
+# 0 ms, but it was gone 251 ms later with 0 pickups refused -> our pickup never reached the server.
+# `pickupTarget` is a mouse click: the client WALKS next to the item first and only then sends the
+# pickup. v3:
+#  1. sends the pickup packet DIRECTLY (`__store.pickupItemRequest(netId)`, no walking) the instant
+#     the weapon appears, re-sent every GRAB_PICK_MS; `pickupTarget` is still set too, so if the
+#     server refuses from too far (refused count in the log) the client walks in and retries itself.
+#  2. reacts to the game's `ItemsDropped` event (no waiting for the next 50 ms poll).
+#  3. Statue of Saint (npcType 132, appears at (14,95) once the phase-4 guards die) in view ->
+#     attack it ourselves, no MU Helper: the helper wanders off to other targets, and the last
+#     hit decides who may pick the weapon up first ("This item doesn't belong to you") when the
+#     killer is not in our party. Python falls back to the helper after STATUE_SOLO_SEC.
+# Python only arms/disarms it, logs it, and turns the helper off (without waiting).
+# v5 (2026-10-12, Juan): NO MU HELPER IN BLOOD CASTLE. The helper made the characters slow to react
+# (every toggle ~5 s, and on 2026-10-12 it never turned on in the minimized windows: 3 min stuck at
+# the gate), picked its own targets and walked them away from the statue. The in-page loop now also
+# WALKS and FIGHTS, 20x/s:
+#   1. weapon on the ground -> direct pickup (as v3)
+#   2. Statue of Saint in view and we're on the stand spot -> attack it ourselves (last hit = ours)
+#   3. buffs: Soul Barrier (mages) / Greater Fortitude (knights) when the fight starts, then every
+#      FIGHT_BUFF_EVERY_MS
+#   4. a monster IN SKILL RANGE that is in the way -> cast at it from where we stand (never chase):
+#        advance : monsters in a corridor ahead of us, towards the goal (FIGHT_CONE_HALF tiles wide
+#                  each side); stuck (no progress FIGHT_STUCK_MS) -> anything in range, any direction;
+#                  still nothing for FIGHT_HUNT_MS (e.g. alone in the kill phase at the gate) -> the
+#                  nearest monster within FIGHT_LEASH tiles (the client walks into range for that cast)
+#        rush    : running to the Archangel: only monsters right in front (FIGHT_RUSH_RANGE), anything
+#                  in range only when stuck
+#        guard   : on the stand spot by the statue: anything in range, but we don't leave the spot
+#        hold    : no fighting (standing at the Archangel to talk to him)
+#      monsters first, the Castle Gate only when no monster is in range
+#   5. nothing to hit -> walk to the goal (re-sent every FIGHT_WALK_MS)
+#   + a potion (hotkey Q) every FIGHT_POT_MS while HP < FIGHT_POT_HP of max
+# Skills: Ice Storm (39) for whoever owns it (mages, range FIGHT_MAGE_RANGE); Dark Knights the same
+# combo as the Golden Invasion (weapon skill -> Death Stab -> Twisting Slash, range FIGHT_KNIGHT_RANGE);
+# anyone else: the selected skill, FIGHT_OTHER_RANGE. castRequest only (no attackTarget: that makes
+# the client chase the monster).
+# Python sets the goal + mode every tick, logs the events and a status line every FIGHT_LOG_SEC.
+GRAB_VERSION   = 6
+BC_USE_HELPER  = False               # True = the old behaviour (helper bursts when stuck, helper at the statue)
+GRAB_LOOP_MS   = 50                  # in-page check period (20x/s), on top of the ItemsDropped event
+GRAB_PICK_MS   = 100                 # re-send the pickup this often while the weapon is on the ground
 GRAB_RADIUS    = 20                  # tiles: chase the weapon this far
+STATUE_TYPES   = [132, 133, 134]     # Statue of Saint (132 seen 2026-10-11 00:06, BC map 12); 133/134 = classic variants
+GATE_TYPES     = [131]               # Castle gate (131, at (14,75), seen 2026-10-11)
+NPC_TYPES      = [232, 233]          # Archangel / Spirit of Archangel: never targets
+STATUE_ATTACK_RADIUS = 15            # tiles: attack the statue in-page from this close
+STATUE_CAST_MS = 100                 # re-send the attack this often
+STATUE_SOLO_SEC = 10                 # (helper mode only) statue still standing this long -> MU Helper fallback
 BC_FAST_TICK   = 0.25                # Python tick inside the castle (normal: 1 s)
 HELPER_ASYNC_GUARD = 4.5             # s: don't press the helper key again before the last press could land
+FIGHT_MAGE_SKILL   = 39              # Ice Storm
+FIGHT_KNIGHT_COMBO = [[22, 20, 19, 21, 23], 43, 41]   # same as mu_gi.GI_KNIGHT_COMBO
+FIGHT_COMBO_STEP_MS = 700
+FIGHT_MAGE_RANGE   = 6.0             # tiles: cast at monsters this close (Ice Storm)
+FIGHT_KNIGHT_RANGE = 2.5             # knights' skills are melee-ish
+FIGHT_OTHER_RANGE  = 3.0
+FIGHT_RANGES       = {}              # per character (lower case) -> tiles, overrides the above
+FIGHT_CONE_HALF    = 3.0             # "in the way" = within this many tiles of the line towards the goal
+FIGHT_RUSH_RANGE   = 3.0             # rushing back: only hit monsters this close in front
+FIGHT_STUCK_MS     = 1500            # no progress towards the goal this long -> hit anything in range
+FIGHT_HUNT_MS      = 3000            # stuck this long with nothing in range -> go for the nearest monster ...
+FIGHT_LEASH        = 10              # ... within this many tiles
+FIGHT_CAST_MS      = 100             # re-send the cast this often
+FIGHT_WALK_MS      = 400             # re-send the walk this often
+FIGHT_POT_KEY      = 0               # item hotkey 0 = Q
+FIGHT_POT_HP       = 0.5             # potion while HP below this fraction
+FIGHT_POT_MS       = 300
+FIGHT_BUFFS        = [16, 48]        # Soul Barrier, Greater Fortitude (each only if owned)
+FIGHT_BUFF_EVERY_MS = 55000
+FIGHT_BUFF_TRIES   = 3
+FIGHT_LOG_SEC      = 5               # Python status line this often
 
-# cfg = {version, on, g, n, re, radius, loopMs, pickMs}; installs once per page, returns status + events
-BC_GRAB_JS = """
+# cfg = {version, on, g, n, re, radius, loopMs, pickMs, weapon, statue, statueTypes, statueRadius, castMs,
+#        stand, standR, fight, goal, goalR, mode, gateTypes, npcTypes, mageSkill, combo, comboStep,
+#        mageRange, knightRange, otherRange, range, coneHalf, rushRange, stuckMs, huntMs, leash,
+#        walkMs, potKey, potHp, potMs, buffs, buffEvery, buffTries}
+# installs once per page; returns status + events
+BC_GRAB_JS = r"""
 (cfg) => {
   const W = window;
   let G = W.__bcGrab;
   if (!G || G.version !== cfg.version) {
     if (G && G.timer) clearInterval(G.timer);
+    if (G) G.dead = true;                       // an older version's bus listeners go quiet
     G = W.__bcGrab = {version: cfg.version, on: false, cfg, id: null, seenAt: 0, firstPickAt: 0,
-                      lastPick: 0, picks: 0, fails: 0, events: [], err: null};
+                      lastPick: 0, picks: 0, direct: 0, fails: 0, statueId: null, statueAt: 0,
+                      lastCast: 0, casts: 0, events: [], err: null, directErr: null, dead: false,
+                      myId: null, myCasts: 0, lastMySkill: null, lastMySkillAt: 0, comboIdx: 0, comboAt: 0,
+                      kind: null, range: null, skill: null, tgt: null, tgtName: null, why: '', lastWhy: '',
+                      fightCasts: 0, lastWalk: 0, goalKey: null, best: 1e9, bestAt: 0, pots: 0, lastPot: 0,
+                      bQueue: [], bTries: 0, bAt: 0, buffAt: {}, buffs: 0, mode: null, walks: 0};
+    const me = G;
     const ev = s => { if (G.events.length < 50) G.events.push(s); };
-    if (W.__eventBus) W.__eventBus.on('ItemPickUpRequestFailed', () => { if (G.id !== null) G.fails++; });
-    G.tick = () => {
+    G.ev = ev;
+    const bus = W.__eventBus;
+    const u8 = d => new Uint8Array(d.buffer || d, d.byteOffset || 0, d.byteLength);
+    if (bus) {
+      bus.on('ItemPickUpRequestFailed', () => { if (!me.dead && me.id !== null) me.fails++; });
+      // a drop packet arrived: look right away (the entity may be created in this same handler,
+      // so check now and once more on the next turn of the event loop)
+      bus.on('ItemsDropped', () => {
+        if (me.dead || !me.on) return;
+        setTimeout(() => { try { me.tick('drop'); } catch (e) {} }, 0);
+        setTimeout(() => { try { me.tick('drop'); } catch (e) {} }, 15);
+      });
+      // c3 09 19 00 <skill u16> <caster u16> <target u16>: my own casts as the server shows them
+      const mine = (d) => { try {
+        if (me.dead || me.myId === null) return;
+        const u = u8(d), skill = (u[3] << 8) | u[4], caster = (u[5] << 8) | u[6];
+        if (caster !== me.myId) return;
+        me.myCasts++; me.lastMySkill = skill; me.lastMySkillAt = Date.now();
+        if (me.bQueue.length && skill === me.bQueue[0]) {
+          me.buffAt[skill] = Date.now(); me.bQueue.shift(); me.buffs++; me.bTries = 0; me.bAt = 0;
+          ev('buff ' + skill + ' cast');
+        }
+      } catch (e) {} };
+      bus.on('SkillAnimation', mine);
+      bus.on('AreaSkillAnimation', mine);
+    }
+    const P = e => ({x: e.transform.pos.x, y: e.transform.pos.z});
+    const owns = (s, n) => !!(n && s.skills && s.skills.some(k => k.number === n));
+    const stopStatue = (w, now, why) => {
+      if (G.statueId === null) return;
+      ev(`statue ${why} ${now - G.statueAt} ms after we started attacking it (${G.casts} attacks sent)`);
+      G.statueId = null;
+      if (w) { w.attackTarget = null; w.castRequest = null; }
+    };
+    G.stopStatue = stopStatue;
+    const pick = (w, e, now) => {
+      G.lastPick = now; G.picks++;
+      if (!G.firstPickAt) G.firstPickAt = now;
+      const s = W.__store;
+      if (s && typeof s.pickupItemRequest === 'function') {
+        try { s.pickupItemRequest(e.netId); G.direct++; }
+        catch (x) { if (!G.directErr) { G.directErr = String(x).slice(0, 120); ev('direct pickup error: ' + G.directErr); } }
+      } else if (!G.directErr) { G.directErr = 'no __store.pickupItemRequest'; ev(G.directErr); }
+      w.pickupTarget = e;                        // walk-in fallback (server range check)
+    };
+    // class from the skills: Ice Storm -> mage; knight combo -> knight; else the selected skill
+    const classify = (s, c) => {
+      let kind = 'other', range = c.otherRange;
+      if (owns(s, c.mageSkill)) { kind = 'mage'; range = c.mageRange; }
+      else if ((c.combo || []).some(st => (Array.isArray(st) ? st : [st]).some(n => owns(s, n)))) { kind = 'knight'; range = c.knightRange; }
+      if (c.range) range = c.range;
+      if (kind !== G.kind || range !== G.range) { G.kind = kind; G.range = range; ev(`fighting as ${kind}, range ${range} tiles`); }
+    };
+    const pickSkill = (now, s, c) => {
+      if (G.kind === 'mage') return c.mageSkill;
+      if (G.kind === 'knight') {
+        const combo = [];
+        for (const st of c.combo || []) { const n = (Array.isArray(st) ? st : [st]).find(o => owns(s, o)); if (n) combo.push(n); }
+        if (!combo.length) return null;
+        if (G.comboIdx >= combo.length) G.comboIdx = 0;
+        const cur = combo[G.comboIdx];
+        if ((G.lastMySkill === cur && G.lastMySkillAt > G.comboAt) || now - G.comboAt > c.comboStep) {
+          if (G.comboAt) G.comboIdx = (G.comboIdx + 1) % combo.length;
+          G.comboAt = now;
+        }
+        return combo[G.comboIdx];
+      }
+      return null;                               // other: whatever is selected in the client
+    };
+    const cast = (w, s, e, now, sk) => {
+      try { if (sk && s.currentSkill !== sk) s.selectSkill(sk); } catch (x) {}
+      if (!w.castRequest && now - G.lastCast >= G.cfg.castMs) {
+        const p = P(e);
+        w.castRequest = {target: e, point: {x: p.x, y: p.y}, forced: false, pvp: false};
+        G.lastCast = now; return true;
+      }
+      return false;
+    };
+    const walkTo = (w, h, x, y) => {
+      if (!w.isWalkable || !w.isWalkable(x, y)) return false;
+      const m = h.playerMoveTo, pf = h.pathfinding;
+      m.point.x = x; m.point.y = y; m.handled = false; m.sendToServer = true;
+      pf.from.x = h.transform.pos.x; pf.from.y = h.transform.pos.z;
+      pf.to.x = x; pf.to.y = y; pf.calculated = false;
+      return true;
+    };
+    const OFFS = [[0, 0], [1, 0], [-1, 0], [0, -1], [0, 1], [1, -1], [-1, -1], [1, 1], [-1, 1], [2, 0], [-2, 0], [0, 2], [0, -2]];
+    // buffs (owned ones only): queued when the fight starts and every buffEvery; one cast at a time,
+    // confirmed by the server's skill animation. True = casting a buff now (skip the fight this tick).
+    const buffTick = (now, w, s, h) => {
+      const c = G.cfg;
+      for (const n of c.buffs || [])
+        if (owns(s, n) && !G.bQueue.includes(n) && now - (G.buffAt[n] || 0) > c.buffEvery) { G.bQueue.push(n); G.buffAt[n] = now; }
+      if (!G.bQueue.length) return false;
+      const n = G.bQueue[0];
+      if (now - G.bAt < 1200) return true;
+      if (G.bTries >= c.buffTries) { ev('buff ' + n + ': no cast seen after ' + G.bTries + ' tries -> skipped'); G.bQueue.shift(); G.bTries = 0; return false; }
+      G.bTries++; G.bAt = now;
+      try {
+        if (s.currentSkill !== n) s.selectSkill(n);
+        const me = P(h);
+        w.castRequest = {target: h, point: {x: me.x, y: me.y}, forced: false, pvp: false};
+      } catch (x) { ev('buff ' + n + ' error: ' + String(x).slice(0, 100)); }
+      return true;
+    };
+    G.tick = (why) => {
       if (!G.on) return;
       const w = W.__world, h = w && w.playerEntity; if (!h) return;
+      const s = W.__store, pd = (s && s.playerData) || {};
       const c = G.cfg, rx = new RegExp(c.re, 'i'), p = h.transform.pos, now = Date.now();
-      let best = null;
-      for (const e of w.netObjsQuery.entities) {
-        if (!e.droppedItem || e.droppedItem.isMoney) continue;
-        const it = e.droppedItem;
-        if (!((it.group === c.g && it.num === c.n) || rx.test((e.objectNameInWorld || '').trim()))) continue;
-        const d = Math.hypot(e.transform.pos.x - p.x, e.transform.pos.z - p.z);
-        if (d <= c.radius && (!best || d < best.d)) best = {e, d};
+      G.myId = h.netId;
+      const hp = pd.currentHP || 0, maxHp = pd.maxHP || 0;
+      if (h.dying || hp <= 0) { G.tgt = null; return; }
+      // potions
+      if (c.fight && maxHp && hp < c.potHp * maxHp && now - G.lastPot >= c.potMs) {
+        G.lastPot = now;
+        try { s.useItemHotkey(c.potKey); G.pots++; } catch (x) {}
       }
-      if (!best) {
-        if (G.id !== null) {
-          ev(`weapon left the ground ${now - G.seenAt} ms after we saw it ` +
-             `(first pickup after ${G.firstPickAt ? G.firstPickAt - G.seenAt : '-'} ms, ` +
-             `${G.picks} pickup requests, ${G.fails} refused)`);
-          G.id = null;
+      let best = null, statue = null, gate = null;
+      const mobs = [];
+      for (const e of w.netObjsQuery.entities) {
+        if (!e.transform || e.localPlayer) continue;
+        const d = Math.hypot(e.transform.pos.x - p.x, e.transform.pos.z - p.z);
+        if (e.droppedItem) {
+          if (!c.weapon || e.droppedItem.isMoney) continue;
+          const it = e.droppedItem;
+          if (!((it.group === c.g && it.num === c.n) || rx.test((e.objectNameInWorld || '').trim()))) continue;
+          if (d <= c.radius && (!best || d < best.d)) best = {e, d};
+          continue;
+        }
+        if (e.npcType === undefined || e.dying) continue;
+        if (c.statueTypes.includes(e.npcType)) {
+          if (c.statue && (!c.stand || Math.hypot(p.x - c.stand[0], p.z - c.stand[1]) <= c.standR)
+              && d <= c.statueRadius && (!statue || d < statue.d)) statue = {e, d};
+          continue;
+        }
+        if ((c.npcTypes || []).includes(e.npcType) || !e.monsterAnimation) continue;
+        if ((c.gateTypes || []).includes(e.npcType)) { if (!gate || d < gate.d) gate = {e, d}; continue; }
+        mobs.push({e, d, x: e.transform.pos.x, y: e.transform.pos.z});
+      }
+      if (best) {
+        stopStatue(null, now, 'down (weapon on the ground)');
+        if (G.id !== best.e.netId) {
+          G.id = best.e.netId; G.seenAt = now; G.picks = 0; G.direct = 0; G.fails = 0; G.firstPickAt = 0;
+          ev(`weapon seen ${best.d.toFixed(1)} tiles away (via ${why || 'poll'}; me @(${Math.round(p.x)},${Math.round(p.z)}), ` +
+             `weapon @(${Math.round(best.e.transform.pos.x)},${Math.round(best.e.transform.pos.z)})) -> grabbing`);
+        }
+        w.attackTarget = null; w.castRequest = null; G.tgt = null;
+        if (now - G.lastPick >= c.pickMs) pick(w, best.e, now);
+        return;
+      }
+      if (G.id !== null) {
+        ev(`weapon left the ground ${now - G.seenAt} ms after we saw it ` +
+           `(first pickup after ${G.firstPickAt ? G.firstPickAt - G.seenAt : '-'} ms, ` +
+           `${G.picks} pickups / ${G.direct} direct, ${G.fails} refused)`);
+        G.id = null;
+      }
+      if (statue) {
+        if (G.statueId !== statue.e.netId) {
+          G.statueId = statue.e.netId; G.statueAt = now; G.casts = 0;
+          ev(`Statue of Saint seen ${Math.round(statue.d)} tiles away -> attacking it (no helper)`);
+        }
+        w.pickupTarget = null;
+        if (c.fight) { classify(s, c); try { const sk = pickSkill(now, s, c); if (sk && s.currentSkill !== sk) s.selectSkill(sk); } catch (x) {} }
+        w.attackTarget = statue.e;
+        if (!w.castRequest && now - G.lastCast >= c.castMs) {
+          w.castRequest = {target: statue.e, point: {x: statue.e.transform.pos.x, y: statue.e.transform.pos.z},
+                           forced: false, pvp: false};
+          G.lastCast = now; G.casts++;
         }
         return;
       }
-      if (G.id !== best.e.netId) {
-        G.id = best.e.netId; G.seenAt = now; G.picks = 0; G.fails = 0; G.firstPickAt = 0;
-        ev(`weapon seen ${Math.round(best.d)} tiles away -> grabbing`);
+      stopStatue(w, now, 'gone');
+      if (!c.fight) return;
+      classify(s, c);
+      // standing on a safe-zone tile (castle start area): the client refuses every cast there, so
+      // fighting from it never works (2026-10-12, invalido stood 2.5 min at (13,14) casting 830x, 0 seen)
+      // -> no buffs / no fighting until we're out, just walk
+      const meSafe = !!(w.getTerrainFlag && (w.getTerrainFlag(Math.round(p.x), Math.round(p.z)) & 1) === 1);
+      // casts going out but none seen by the server for a while -> walk a bit instead (any other reason)
+      if (G.myCasts !== G.ncSeen || G.tgt === null || !G.ncAt) { G.ncSeen = G.myCasts; G.ncAt = now; }
+      const noCast = now - G.ncAt > 3000;
+      if (noCast && !G.walkUntil) { G.walkUntil = now + 2000; ev('casts not going through for 3 s -> walking for 2 s'); }
+      if (G.walkUntil && now > G.walkUntil) { G.walkUntil = 0; G.ncAt = now; }
+      const noFight = meSafe || (G.walkUntil && now <= G.walkUntil);
+      if (meSafe !== !!G.wasSafe) { G.wasSafe = meSafe; if (meSafe) ev('in a safe zone: no fighting, walking out'); }
+      if (!noFight && c.mode !== 'hold' && buffTick(now, w, s, h)) return;
+      // ── fight / walk ──
+      const goal = c.goal, mode = c.mode;
+      const dGoal = goal ? Math.hypot(p.x - goal[0], p.z - goal[1]) : 0;
+      const atGoal = !goal || dGoal <= c.goalR;
+      const key = goal ? goal.join(',') + mode : null;
+      if (key !== G.goalKey) { G.goalKey = key; G.best = dGoal; G.bestAt = now; }
+      if (atGoal || dGoal < G.best - 0.5) { G.best = dGoal; G.bestAt = now; }
+      const stuckMs = now - G.bestAt, stuck = !atGoal && stuckMs > c.stuckMs;
+      let ux = 0, uy = 0;
+      if (goal && dGoal > 0.01) { ux = (goal[0] - p.x) / dGoal; uy = (goal[1] - p.z) / dGoal; }
+      const ahead = m => {
+        if (!goal || atGoal) return true;
+        const vx = m.x - p.x, vy = m.y - p.z, along = vx * ux + vy * uy, lat = Math.abs(vx * uy - vy * ux);
+        return along >= -0.5 && lat <= c.coneHalf;
+      };
+      const R = G.range;
+      mobs.sort((a, b) => a.d - b.d);
+      let tgt = null, reason = '';
+      if (mode !== 'hold' && !noFight) {
+        const inR = mobs.filter(m => m.d <= R);
+        if (mode === 'guard' || atGoal) { tgt = inR[0]; reason = 'in range at the spot'; }
+        else if (mode === 'rush') {
+          tgt = inR.find(m => m.d <= c.rushRange && ahead(m)); reason = 'in the way (rushing)';
+          if (!tgt && stuck) { tgt = inR[0]; reason = 'stuck: in range'; }
+        } else {
+          tgt = inR.find(ahead); reason = 'in the way';
+          if (!tgt && stuck) { tgt = inR[0]; reason = 'stuck: in range'; }
+        }
+        if (!tgt && gate && gate.d <= Math.max(R, 3) && (ahead({x: gate.e.transform.pos.x, y: gate.e.transform.pos.z}) || stuck)) {
+          tgt = gate; reason = 'castle gate';
+        }
+        if (!tgt && stuck && mode !== 'rush' && stuckMs > c.huntMs) {
+          tgt = mobs.find(m => m.d <= c.leash); reason = 'stuck: going for the nearest';
+        }
       }
-      w.attackTarget = null; w.castRequest = null;
-      if (now - G.lastPick >= c.pickMs) {
-        G.lastPick = now; G.picks++; w.pickupTarget = best.e;
-        if (!G.firstPickAt) G.firstPickAt = now;
+      if (reason !== G.lastWhy && tgt) { G.lastWhy = reason; ev(`target: ${(tgt.e.objectNameInWorld || '').trim() || tgt.e.npcType} (${reason}, ${tgt.d.toFixed(1)} tiles)`); }
+      if (!tgt && G.lastWhy) G.lastWhy = '';
+      G.why = tgt ? reason : (meSafe ? 'safe zone: walking out' : noFight ? 'casts not going through: walking'
+              : atGoal ? 'at the goal' : (stuck ? 'stuck, nothing in range' : 'walking'));
+      G.tgtName = tgt ? ((tgt.e.objectNameInWorld || '').trim() || String(tgt.e.npcType)) : null;
+      G.stuck = stuck; G.dGoal = dGoal; G.inRange = mobs.filter(m => m.d <= R).length; G.mode = mode;
+      G.hp = hp; G.maxHp = maxHp;
+      if (tgt) {
+        G.tgt = tgt.e.netId;
+        w.pickupTarget = null;
+        const sk = pickSkill(now, s, c); G.skill = sk || (s && s.currentSkill);
+        if (cast(w, s, tgt.e, now, sk)) G.fightCasts++;
+        return;
       }
+      if (G.tgt !== null) { G.tgt = null; w.castRequest = null; w.attackTarget = null; G.lastWalk = 0; }
+      if (atGoal || now - G.lastWalk < c.walkMs) return;
+      G.lastWalk = now;
+      // stuck with nothing to hit: sidestep (try the tiles around the goal in turn)
+      const offs = stuck ? OFFS.slice(1 + (G.walks % (OFFS.length - 1))).concat(OFFS) : OFFS;
+      for (const [ox, oy] of offs) if (walkTo(w, h, Math.round(goal[0]) + ox, Math.round(goal[1]) + oy)) { G.walks++; break; }
     };
     G.timer = setInterval(() => { try { G.tick(); } catch (e) { G.err = String(e).slice(0, 200); } }, cfg.loopMs);
   }
   G.cfg = cfg;
+  if (G.statueId !== null && (!cfg.on || !cfg.statue)) G.stopStatue(W.__world, Date.now(), 'left (statue off)');
   if (G.on !== cfg.on) {
     G.on = cfg.on;
-    if (!cfg.on) { if (G.id !== null && W.__world) W.__world.pickupTarget = null; G.id = null; }
+    if (!cfg.on) {
+      const w = W.__world;
+      if (w) { if (G.id !== null) w.pickupTarget = null; if (G.tgt !== null) { w.castRequest = null; w.attackTarget = null; } }
+      G.id = null; G.tgt = null; G.goalKey = null; G.bQueue = [];
+    }
   }
   return {on: G.on, chasing: G.id !== null, id: G.id, picks: G.picks, fails: G.fails,
+          statue: G.statueId !== null, statueMs: G.statueId !== null ? Date.now() - G.statueAt : 0,
+          fight: {mode: G.mode, kind: G.kind, range: G.range, skill: G.skill, target: G.tgtName, why: G.why,
+                  stuck: !!G.stuck, dGoal: G.dGoal, inRange: G.inRange, casts: G.fightCasts, seen: G.myCasts,
+                  pots: G.pots, buffs: G.buffs, hp: G.hp, maxHp: G.maxHp},
           events: G.events.splice(0), err: G.err};
 }
 """
