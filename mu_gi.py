@@ -24,7 +24,8 @@ Timeline (start = the event start read from the event panel, normally :50:00):
                       * nothing in view -> walk to the nearest part of the map not searched yet
                         (areas with leftover loot count as already searched)
                       * never runs back to town; after a death it respawns and carries on
-  end        AFTER  /pkclear if outlaw (sells ONE Zen Chest at the Lorencia bar first if zen is short),
+                      * /pkclear right after every kill (GI_PKCLEAR_ON_KILL: as soon as we turn outlaw)
+  end        AFTER  /pkclear if still outlaw (sells ONE Zen Chest at the Lorencia bar first if zen is short),
                     then back to normal (leveling / Blood Castle if still in a castle's range)
 
 The fight logic runs INSIDE the game page every GI_LOOP_MS (50 ms = 20x/s); Python only handles the
@@ -113,6 +114,10 @@ GI_LOOT_RADIUS   = 10               # leftover loot marks this area as searched
 GI_WALK_STUCK    = 4                # seconds without getting closer to a search point -> pick another
 GI_RECORD        = True             # record the hunt with mu_recorder
 GI_SELL_CHEST_FOR_PK = True         # /pkclear short of zen -> sell ONE Zen Chest at the Lorencia bar
+GI_PKCLEAR_ON_KILL = True           # /pkclear right after every kill during the hunt, not just at the end
+                                    # (Juan 2026-10-13: new server rule, outlaws can drop gear)
+GI_PKCLEAR_RETRY_SEC = 4            # outlaw again / still outlaw: next /pkclear no sooner than this
+GI_PKCLEAR_MAX_TRIES = 3            # failed tries per kill before leaving it to the end of the hunt
 MAP_LORENCIA, MAP_DEVIAS, MAP_NORIA = 0, 2, 3
 DEVIAS_WARPS     = ["Devias3", "Devias"]   # /move aliases to try (Devias 3 landed at (225,229) for 2500 zen)
 DEVIAS_OUT_WARPS = ["Devias4", "Devias2", "Devias3"]  # stuck in the Devias safe zone (respawn): warp out, next one if it fails
@@ -677,6 +682,9 @@ class GoldenInvasion:
         self.deaths = 0
         self.was_dead = False
         self.pk_tries = 0
+        self.pk_sent_at = 0          # GI_PKCLEAR_ON_KILL: last /pkclear sent during the hunt
+        self.pk_live_tries = 0       # ... tries since we last turned outlaw
+        self.pk_live_state = None    # ... hero state when we sent it
         self.after_step = None
         self.last_status_log = 0
 
@@ -810,6 +818,9 @@ class GoldenInvasion:
         self.deaths = 0
         self.was_dead = False
         self.pk_tries = 0
+        self.pk_sent_at = 0
+        self.pk_live_tries = 0
+        self.pk_live_state = None
         self.after_step = None
         self.warp_tries = 0
         self.bag0 = self.ev(BAG_BOXES_JS) or {}
@@ -1183,6 +1194,7 @@ class GoldenInvasion:
         self.dragon_call(s, status, dead, now)
         if dead:
             return
+        self.pkclear_on_kill(status, s)
         if self.map_target is None:
             banner = st.get("banner")
             if banner and banner.get("at", 0) / 1000 < self.cur_start - 30:
@@ -1235,6 +1247,35 @@ class GoldenInvasion:
                      f"{status.get('maxHp')} | pots {status.get('pots')} | casts {status.get('casts')}/"
                      f"{status.get('myCasts')} seen | skill {status.get('attackSkill')} | left {counts and counts.get('total')}"
                      + (f" | dragon ~{status.get('eta')} s left, {status.get('hitters')} other(s) hitting it" if status.get('eta') is not None else ""))
+
+    def pkclear_on_kill(self, status, s):
+        """GI_PKCLEAR_ON_KILL: we turned outlaw (a kill) -> /pkclear right away, so we don't fight on as an
+        outlaw (new server rule: outlaws can drop gear). Hero state > 3 = outlaw, same test as after()."""
+        if not GI_PKCLEAR_ON_KILL:
+            return
+        hs = status.get("heroState")
+        if hs is None:
+            return
+        now = time.time()
+        if hs <= 3:
+            if self.pk_live_tries:
+                self.log(f"/pkclear done mid-hunt (state {self.pk_live_state} -> {hs}, "
+                         f"zen {s.get('money') or 0:,})")
+            self.pk_live_tries, self.pk_live_state = 0, None
+            return
+        if self.pk_live_state is not None and hs > self.pk_live_state:
+            self.pk_live_tries = 0                     # another kill since the last try: start over
+        if self.pk_live_tries >= GI_PKCLEAR_MAX_TRIES or now - self.pk_sent_at < GI_PKCLEAR_RETRY_SEC:
+            return
+        self.pk_live_tries += 1
+        self.pk_live_state = hs
+        self.pk_sent_at = now
+        if self.pk_live_tries == GI_PKCLEAR_MAX_TRIES:
+            self.log(f"/pkclear try {self.pk_live_tries} (state {hs}, zen {s.get('money') or 0:,}); "
+                     "if this fails too, I retry after the hunt (selling a Zen Chest if zen is short)")
+        else:
+            self.log(f"outlaw (state {hs}) after a kill -> /pkclear (try {self.pk_live_tries})")
+        self.c.chat("/pkclear")
 
     def leave_town(self, s, status):
         """Respawned (or wandered) into the Devias safe zone: warp to another Devias zone instead of walking out."""
