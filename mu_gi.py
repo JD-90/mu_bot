@@ -79,7 +79,7 @@ GI_CLEAR_KILL_SEC = 8               # a player not dead after this long -> back 
 GI_CLEAR_LEASH   = 8                # only players within this many tiles of the dragon (no chasing)
 GI_POT_HP        = 0.8              # (Juan 2026-10-12) also drink whenever HP < 80 % of max, players near or not
 GI_CALL          = True             # (Juan 2026-10-12) a hunter that sees a Golden Dragon calls the others: any of our
-GI_CALL_DIST     = 70               # hunters on the same map within this many tiles of it (and no dragon of its own)
+GI_CALL_DIST     = 50               # hunters on the same map within this many tiles of it (and no dragon of its own)
 GI_CALL_FRESH    = 5                # walks over to help (more chances at the last hit + backup vs players);
                                     # a sighting older than this (s) no longer counts
 GI_POT_EVERY_MS  = 200              # potion every 0.2 s ...

@@ -31,7 +31,19 @@ _ACC      = json.loads(_ACC_FILE.read_text(encoding="utf-8"))[0]   # first accou
 USERNAME  = _ACC["user"]
 PASSWORD  = _ACC["password"]
 CHARACTER = _ACC["character"]
-SERVER    = "Server 1-1"          # text of the server button on the server list
+SERVER    = "Servidor Fast"       # channel on the server list (was "Server 1-1"); picked by PICK_SERVER_JS
+PICK_SERVER_JS = r"""() => {
+  // Server list: the channel buttons no longer carry their name as DOM text (drawn as an image), so take the
+  // clickable entries of .server-sel-win that aren't the server-group button ("Mu Garden").
+  const w = document.querySelector('.server-sel-win');
+  if (!w) return null;
+  const btns = [...w.querySelectorAll('div')].filter(e => e.onclick && !/Mu Garden/i.test(e.textContent || ''));
+  const want = btns.find(e => /Servidor Fast|Servidor Final|Server 1-1/i.test(e.textContent || '')) || btns[0];
+  if (!want) return null;
+  document.querySelectorAll('[data-bot-server]').forEach(e => e.removeAttribute('data-bot-server'));
+  want.setAttribute('data-bot-server', '1');
+  return (want.textContent || '').trim() || 'channel #' + (btns.indexOf(want) + 1);
+}"""
 
 # (from_level, to_level, /move alias, map index, x, y)
 # Map indexes from the client: Lorencia=0, Arena2=83, Arena3=84, Arena4=85
@@ -165,10 +177,13 @@ class Bot:
             self.page.evaluate("(n) => window.__store.selectCharacterRequest(n)", CHARACTER)
             time.sleep(6)
             return
-        srv = self.page.get_by_text(SERVER, exact=True)
-        if srv.count():
-            log(f"choosing {SERVER}")
-            srv.first.click()
+        srv = self.page.evaluate(PICK_SERVER_JS)
+        if srv:
+            log(f"choosing server ({srv})")
+            try:
+                self.page.click("[data-bot-server]", timeout=5000)
+            except PWError as e:
+                log(f"server click failed: {e!r}"[:200])
             time.sleep(3)
 
     def reload(self):

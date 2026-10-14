@@ -150,7 +150,7 @@ BC_ENTER_MAX_RELOADS  = 2   # ... at most this many times per castle
 # frozen on one tile like a bot (Juan 2026-10-11)
 IDLE_WIGGLE         = True
 IDLE_WIGGLE_EVERY   = (15, 40)  # seconds between steps (random in this range)
-IDLE_WIGGLE_STEP    = (1)    # tiles per step (random in this range)
+IDLE_WIGGLE_STEP    = (1, 1) # tiles per step (random in this range; (1, 1) = always 1)
 IDLE_WIGGLE_LEASH   = 2         # never further than this many tiles from the waiting spot
 IDLE_WIGGLE_DOOR_SEC = 15       # Devias: stop wiggling and stand on the spot this long before the door opens
 
@@ -1736,7 +1736,8 @@ class Agent:
         if x is None or y is None or (s.get("hp") or 0) <= 0 or s.get("helper"):
             return
         _, hx, hy = home
-        step = random.randint(*IDLE_WIGGLE_STEP)
+        rng = IDLE_WIGGLE_STEP if isinstance(IDLE_WIGGLE_STEP, (tuple, list)) else (IDLE_WIGGLE_STEP, IDLE_WIGGLE_STEP)
+        step = random.randint(*rng)
         cands = [(x + dx, y + dy) for dx in range(-step, step + 1) for dy in range(-step, step + 1)
                  if max(abs(dx), abs(dy)) == step
                  and math.hypot(x + dx - hx, y + dy - hy) <= IDLE_WIGGLE_LEASH]

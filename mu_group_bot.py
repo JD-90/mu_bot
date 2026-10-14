@@ -28,7 +28,19 @@ from mu_recorder import Recorder
 
 # ───────────────────────────── CONFIG ─────────────────────────────
 URL    = "https://mu.mormon.garden/"
-SERVER = "Server 1-1"
+SERVER    = "Servidor Fast"       # channel on the server list (was "Server 1-1"); picked by PICK_SERVER_JS
+PICK_SERVER_JS = r"""() => {
+  // Server list: the channel buttons no longer carry their name as DOM text (drawn as an image), so take the
+  // clickable entries of .server-sel-win that aren't the server-group button ("Mu Garden").
+  const w = document.querySelector('.server-sel-win');
+  if (!w) return null;
+  const btns = [...w.querySelectorAll('div')].filter(e => e.onclick && !/Mu Garden/i.test(e.textContent || ''));
+  const want = btns.find(e => /Servidor Fast|Servidor Final|Server 1-1/i.test(e.textContent || '')) || btns[0];
+  if (!want) return null;
+  document.querySelectorAll('[data-bot-server]').forEach(e => e.removeAttribute('data-bot-server'));
+  want.setAttribute('data-bot-server', '1');
+  return (want.textContent || '').trim() || 'channel #' + (btns.indexOf(want) + 1);
+}"""
 
 
 # Accounts live in accounts.json next to this script (not committed to git).
@@ -685,10 +697,13 @@ class Char:
                 self.login_fails = 0
             self.last_ingame = time.time()  # don't reload while logging in
             return
-        srv = self.page.get_by_text(SERVER, exact=True)
-        if srv.count():
-            self.log(f"choosing {SERVER}")
-            srv.first.click()
+        srv = self.page.evaluate(PICK_SERVER_JS)
+        if srv:
+            self.log(f"choosing server ({srv})")
+            try:
+                self.page.click("[data-bot-server]", timeout=5000)
+            except PWError as e:
+                self.log(f"server click failed: {e!r}"[:200])
             time.sleep(2)
 
     # ── party ──
