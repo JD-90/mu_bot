@@ -8,3 +8,5 @@ __pycache__/
 RESTART
 STOP_ALL
 STOP_BOT
+
+.DS_Store
