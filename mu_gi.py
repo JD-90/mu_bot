@@ -48,8 +48,8 @@ GI_STATS_EVERY   = 300              # seconds between stat checks
 GI_SKILLS        = {}               # fixed skill per character (lower-case name -> skill number); empty = by class:
                                     # Ice Storm if owned (Soul Masters), else the Dark Knight combo, else the selected skill
 GI_START_MINUTE  = 50               # fallback when the event panel can't be read (PC clock)
-GI_PREP_SEC      = 90               # start preparing this long before the start (:48:30: potions in Noria, then the waiting map)
-GI_WAIT_SEC      = 30               # be at the waiting spot this long before the start (:49:30)
+GI_PREP_SEC      = 45               # start preparing this long before the start (:48:30: potions in Noria, then the waiting map)
+GI_WAIT_SEC      = 15               # be at the waiting spot this long before the start (:49:30)
 GI_HUNT_SEC      = 900              # the event lasts 15 min (:50 -> :05): hunt until the end ... (Juan 2026-10-11:
                                     # dragons are much tougher now, 3 min was too short)
 GI_IDLE_SEC      = 90               # ... or until no golden mob was in view this long (dead / warping don't count)
@@ -79,7 +79,7 @@ GI_CLEAR_KILL_SEC = 8               # a player not dead after this long -> back 
 GI_CLEAR_LEASH   = 8                # only players within this many tiles of the dragon (no chasing)
 GI_POT_HP        = 0.8              # (Juan 2026-10-12) also drink whenever HP < 80 % of max, players near or not
 GI_CALL          = True             # (Juan 2026-10-12) a hunter that sees a Golden Dragon calls the others: any of our
-GI_CALL_DIST     = 50               # hunters on the same map within this many tiles of it (and no dragon of its own)
+GI_CALL_DIST     = 70               # hunters on the same map within this many tiles of it (and no dragon of its own)
 GI_CALL_FRESH    = 5                # walks over to help (more chances at the last hit + backup vs players);
                                     # a sighting older than this (s) no longer counts
 GI_POT_EVERY_MS  = 200              # potion every 0.2 s ...
@@ -90,13 +90,13 @@ GI_PVP_MODE      = "defense"        # how we treat other players (Juan, 2026-10-
                                     #   "attack"  = old behaviour: kill players at a dragon / guarding a locked box first
 GI_PVP_RADIUS    = 12               # players this close to us or to the dragon -> fight them first (attack mode)
 GI_VIEW          = 30               # tiles: ignore anything further away
-GI_BOX_WAIT_SEC  = 20               # a locked Box of Kundun: keep trying this long
+GI_BOX_WAIT_SEC  = 8               # a locked Box of Kundun: keep trying this long
 GI_DRAGON_LOCK   = True             # (Juan, 2026-10-12) fighting over a Golden Dragon (+5): never leave it - no event end,
                                    # idle end, map switch or Blood Castle - until we have the +5 box, it's gone, or we die
-GI_DRAGON_LOCK_DIST = 14            # "fighting over it" = targeting the dragon, or a player while the dragon is this close
+GI_DRAGON_LOCK_DIST = 16            # "fighting over it" = targeting the dragon, or a player while the dragon is this close
 GI_DRAGON_BOX_GRACE = 8             # dragon gone from view: wait this long for its box to show up before letting go
 GI_DRAGON_LOCK_MAX = 900            # safety cap: the lock never keeps a hunt alive longer than this past the normal end
-GI_BIG_BOX_RADIUS = 8               # a free Box +5 this close is picked up BEFORE fighting players (Juan, 2026-10-12)
+GI_BIG_BOX_RADIUS = 10               # a free Box +5 this close is picked up BEFORE fighting players (Juan, 2026-10-12)
 GI_IGNORE_AFTER  = 20               # a target that got this many casts with <= 1 seen by the server ...
 GI_IGNORE_SEC    = 20               # ... is skipped this long (2026-10-11 23:50: 218 casts at the Noria gate, 1 seen)
 GI_CAST_GAP_MS   = 0                # min. ms between two cast requests (was 100); 0 = refill as soon as the client takes one
@@ -108,7 +108,7 @@ GI_SHOW_WINDOW   = True             # True = restore the game windows during the
                                    # (Juan, 2026-10-12): with them minimized (00:50-08:50 runs) the characters
                                    # landed ~1 hit per 3 s instead of ~0.4 s (see claude/gi-loot-drop-2026-10-12.md).
                                    # False = they stay minimized, and a window a relog restores is minimized again
-GI_SEARCH_CELL   = 16               # search grid cell size (tiles)
+GI_SEARCH_CELL   = 24               # search grid cell size (tiles)
 GI_SIGHT         = 18               # tiles around us that count as "searched"
 GI_LOOT_RADIUS   = 10               # leftover loot marks this area as searched
 GI_WALK_STUCK    = 4                # seconds without getting closer to a search point -> pick another
@@ -116,7 +116,7 @@ GI_RECORD        = True             # record the hunt with mu_recorder
 GI_SELL_CHEST_FOR_PK = True         # /pkclear short of zen -> sell ONE Zen Chest at the Lorencia bar
 GI_PKCLEAR_ON_KILL = True           # /pkclear right after every kill during the hunt, not just at the end
                                     # (Juan 2026-10-13: new server rule, outlaws can drop gear)
-GI_PKCLEAR_RETRY_SEC = 4            # outlaw again / still outlaw: next /pkclear no sooner than this
+GI_PKCLEAR_RETRY_SEC = 2            # outlaw again / still outlaw: next /pkclear no sooner than this
 GI_PKCLEAR_MAX_TRIES = 3            # failed tries per kill before leaving it to the end of the hunt
 MAP_LORENCIA, MAP_DEVIAS, MAP_NORIA = 0, 2, 3
 DEVIAS_WARPS     = ["Devias3", "Devias"]   # /move aliases to try (Devias 3 landed at (225,229) for 2500 zen)
@@ -166,6 +166,7 @@ GI_INSTALL_JS = r"""
     potUntil: 0, lastPot: 0, pots: 0, casts: 0, myCasts: 0, lastCast: 0, lastHp: null,
     hostile: new Map(), target: null, targetIsPlayer: false, lastTargetName: null,
     box: null, boxFirstFail: new Map(), boxGaveUp: new Set(), lastPick: 0, pickFails: 0,
+    lootSpamUntil: 0, lootSpamPos: null, lastSeenDragon: null,
     hitsOnMe: 0, events: [], status: {}, recentTargets: new Map(), chatSeen: new WeakSet(),
     barrier: false, wasSafe: null, bQueue: [], bTries: 0, bAt: 0, bDone: 0, bEvents: [], buffAt: {},
     comboIdx: 0, comboAt: 0, attackSkill: null, ignored: new Map(), tStats: new Map(), tPrev: null, safeSkipped: 0,
@@ -413,6 +414,18 @@ GI_INSTALL_JS = r"""
     const byD = (a, b) => a.d - b.d;
     players.sort(byD); goldens.sort(byD); boxes.sort((a, b) => (b.lvl - a.lvl) || (a.d - b.d));
     const dragon = goldens.find(g => g.dragon) || null;
+    
+    // Box +5 Rush Logic
+    if (dragon) {
+      G.lastSeenDragon = { p: dragon.p };
+    } else if (G.lastSeenDragon) {
+      G.lootSpamUntil = now + 3000;
+      G.lootSpamPos = [Math.round(G.lastSeenDragon.p.x), Math.round(G.lastSeenDragon.p.y)];
+      G.lastSeenDragon = null;
+      ev('dragon dead -> rushing coordinates to spam Box +5 loot');
+    }
+    const isSpammingLoot = now < G.lootSpamUntil;
+
     // another of our hunters called us to its dragon (GI_CALL_JS): walk there (Python), skip the small stuff
     const helping = !!(G.call && now < G.call.until && !dragon);
     // ── clearing a dying dragon (Juan 2026-10-12) ──
@@ -451,9 +464,11 @@ GI_INSTALL_JS = r"""
     const defense = cfg.pvpMode !== 'attack';
     let target = null, why = '', pick = null;
     // 0. a free Box +5 close by: grab it before any fight (2026-10-11: two +5s lost while fighting players)
-    const bigBox = boxes.find(b => b.lvl >= 12 && b.d <= cfg.bigBoxRadius && !G.boxFirstFail.has(b.e.netId)
-                                   && !G.boxGaveUp.has(b.e.netId));
-    if (bigBox) { pick = bigBox; }
+    const bigBox = boxes.find(b => b.lvl >= 12 && (isSpammingLoot || (b.d <= cfg.bigBoxRadius && !G.boxFirstFail.has(b.e.netId) && !G.boxGaveUp.has(b.e.netId))));
+    
+    if (isSpammingLoot && !bigBox) { 
+      target = null; pick = null; why = 'rushing to dragon death location'; 
+    } else if (bigBox) { pick = bigBox; }
     else if (defense && hostiles.length && !(dragon && cfg.dragonLock)) {
       // defense mode: only players who hit me are ever targets, and they come first
       target = hostiles[0]; why = 'hit me';
@@ -538,14 +553,15 @@ GI_INSTALL_JS = r"""
       }
     } else if (pick) {
       if (G.box !== pick.e.netId) { G.box = pick.e.netId; ev(`picking up Box +${pick.lvl - 7} (${Math.round(pick.d)} tiles)`); }
-      if (now - G.lastPick > 250) { G.lastPick = now; w.pickupTarget = pick.e; }
+      const pickDelay = (isSpammingLoot && pick.lvl >= 12) ? 50 : 250;
+      if (now - G.lastPick > pickDelay) { G.lastPick = now; w.pickupTarget = pick.e; }
     } else {
       G.box = null;
     }
     if (!target && G.target !== null) { w.attackTarget = null; w.castRequest = null; }
     G.target = target ? target.e.netId : null;
-    G.status = {safePlayers: safeN, ignored: G.ignored.size, mode: target ? (isPlayer ? 'pvp' : (target.e.npcType === 79 ? 'dragon' : 'golden')) : (pick ? 'box' : 'search'),
-      target: tName, why, players: players.length, near: players.filter(x => x.d <= cfg.pvpRadius).length,
+    G.status = {safePlayers: safeN, ignored: G.ignored.size, mode: (isSpammingLoot && !pick) ? 'spam_loot' : (target ? (isPlayer ? 'pvp' : (target.e.npcType === 79 ? 'dragon' : 'golden')) : (pick ? 'box' : 'search')),
+      spamPos: G.lootSpamPos, target: tName, why, players: players.length, near: players.filter(x => x.d <= cfg.pvpRadius).length,
       goldens: goldens.length, dragon: dragon ? [Math.round(dragon.p.x), Math.round(dragon.p.y), Math.round(dragon.d)] : null,
       helping, eta: eta === null ? null : Math.round(eta), hitters: G.dHitters.size, boxes: boxes.length, loot: loot.slice(0, 20), hp, maxHp: pd.maxHP, heroState: h.heroState,
       big5: (() => { const b = boxes.find(x => x.lvl >= 12 && !G.boxGaveUp.has(x.e.netId)); return b ? Math.round(b.d) : null; })(),
@@ -1215,7 +1231,7 @@ class GoldenInvasion:
             there = int(maps.get(str(other), 0) or 0)
             if here == 0 and there >= 5:
                 self.log(f"map: nothing left here, {there} left in {MAP_NAMES[other]} -> switching")
-                self.map_target, self.goal = other, None
+                self.map_target, self.goal = None
                 self.assign_map(other)
         if s.get("map") != self.map_target:
             if self.map_target == MAP_DEVIAS:
@@ -1236,6 +1252,11 @@ class GoldenInvasion:
             self.goal = None
             self.ev(B.WALK_JS, [self.call["x"], self.call["y"]])
             self.last_golden = now                        # walking to a dragon is not idle time
+        elif status.get("mode") == "spam_loot":
+            self.goal = None
+            if status.get("spamPos"):
+                self.ev(B.WALK_JS, status.get("spamPos"))
+            self.last_golden = now
         elif status.get("mode") == "search":
             self.search_step(s)
         else:

@@ -135,7 +135,7 @@ BC_LOW_RATE         = 25    # levels/min right after a reset (Lorencia)
 BC_WAIT_INVITE_SEC  = 8     # inside: after asking "party?", wait this long for an invite before inviting ourselves (was 30; Juan 2026-10-11)
 BC_ASK_PARTY_TEXT   = "party?"   # said once in normal chat when the first other player shows up ...
 BC_ASK_PARTY        = False      # ... only if True (Juan 2026-10-12: don't say it any more; we still wait, then invite)
-BC_WEAPON_TEXT      = ""   # said once when the weapon was picked up by us or someone in our party
+BC_WEAPON_TEXT      = "gogo"   # said once when the weapon was picked up by us or someone in our party
                                             # (Juan 2026-10-12); "" = off
 BC_INVITE_EVERY     = 10    # seconds between invites to the same player
 BC_SHOW_WINDOW_AFTER = 2    # entry dialog not found this many times -> restore the window so you can click
@@ -149,8 +149,8 @@ BC_ENTER_MAX_RELOADS  = 2   # ... at most this many times per castle
 # Golden Invasion waiting spot) it takes a small random step now and then, so it doesn't stand
 # frozen on one tile like a bot (Juan 2026-10-11)
 IDLE_WIGGLE         = True
-IDLE_WIGGLE_EVERY   = (10, 25)  # seconds between steps (random in this range)
-IDLE_WIGGLE_STEP    = (1, 2)    # tiles per step (random in this range)
+IDLE_WIGGLE_EVERY   = (15, 40)  # seconds between steps (random in this range)
+IDLE_WIGGLE_STEP    = (1)    # tiles per step (random in this range)
 IDLE_WIGGLE_LEASH   = 2         # never further than this many tiles from the waiting spot
 IDLE_WIGGLE_DOOR_SEC = 15       # Devias: stop wiggling and stand on the spot this long before the door opens
 
