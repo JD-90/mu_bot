@@ -1274,14 +1274,11 @@ def disable_console_quickedit():
 def pause_requested(group):
     """Console key P toggles pause; a PAUSE file next to the script also pauses while it exists."""
     pressed = False
-    if sys.platform == "win32":
-        try:
-            import msvcrt
-            while msvcrt.kbhit():
-                if msvcrt.getwch().lower() == PAUSE_KEY:
-                    pressed = not pressed
-        except Exception:
-            pass
+    try:
+        from console_keys import read_keys as get_console_keys
+        pressed = sum(k == PAUSE_KEY for k in get_console_keys()) % 2 == 1
+    except Exception:
+        pass
     flag = BASE_DIR / PAUSE_FILE
     if pressed:
         if group.paused:          # resume: also clear the file so it can't re-pause

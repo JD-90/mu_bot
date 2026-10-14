@@ -111,7 +111,7 @@ SOLO_DEATHS_TO_SWITCH = 3   # my deaths at one spot within DEATH_WINDOW_SEC -> s
 #     it never climbs or resets for one) and the levelee waits at the Lorencia bar meanwhile
 #   * at ASSIST_UNTIL_RESETS resets the pair breaks up by itself; a later grand reset starts it again
 PAIRS               = {
-    "bruto": "invalido",
+    "mogulin": "invalido",
 }
 ASSIST_UNTIL_RESETS = 5
 PAIR_LEVELER_GRACE  = 30    # leveler offline (reload / map change) this long -> the levelee waits at the bar
@@ -2547,44 +2547,42 @@ def coordinator(hub, agents):
 
 def read_keys(hub, agents):
     """P = pause/resume everyone, 1..5 = one character. A PAUSE file pauses everyone."""
-    if sys.platform == "win32":
-        try:
-            import msvcrt
-            while msvcrt.kbhit():
-                k = msvcrt.getwch().lower()
-                if k == RESTART_KEY:
-                    if SUPERVISED:
-                        try:
-                            RESTART_FILE.write_text("now", encoding="utf-8")
-                            log("=== R pressed: restarting the bot now (the supervisor closes and starts it) ===")
-                        except OSError as e:
-                            log(f"R pressed but could not write the RESTART file: {e!r}")
-                    else:
-                        log("R pressed, but this bot was not started by the supervisor (run_auto.bat) -> "
-                            "close it and start run_auto.bat to get restarts")
-                elif k == BC_TOGGLE_KEY:
-                    hub.bc_on = not hub.bc_on
-                    log("=== BLOOD CASTLE " + ("ON" if hub.bc_on else
-                        "OFF (anyone already inside finishes that castle; nobody else goes)") + " ===")
-                elif k == G.PAUSE_KEY:
-                    if all(a.name in hub.paused for a in agents):
-                        hub.paused.clear()
-                        hub.pause_all = False
-                        log("=== RESUMING EVERYONE ===")
-                    else:
-                        hub.pause_all = True
-                        hub.paused.update(a.name for a in agents)
-                        log("=== PAUSING EVERYONE (P again to resume; windows stay minimized, "
-                            "use 1-5 to open one) ===")
-                elif k.isdigit() and 1 <= int(k) <= len(agents):
-                    a = agents[int(k) - 1]
-                    if a.name in hub.paused:
-                        hub.paused.discard(a.name)
-                    else:
-                        hub.pause_all = False
-                        hub.paused.add(a.name)
-        except Exception:
-            pass
+    try:
+        from console_keys import read_keys as get_console_keys
+        for k in get_console_keys():
+            if k == RESTART_KEY:
+                if SUPERVISED:
+                    try:
+                        RESTART_FILE.write_text("now", encoding="utf-8")
+                        log("=== R pressed: restarting the bot now (the supervisor closes and starts it) ===")
+                    except OSError as e:
+                        log(f"R pressed but could not write the RESTART file: {e!r}")
+                else:
+                    log("R pressed, but this bot was not started by the supervisor -> "
+                        "close it and start run_auto.sh to get restarts")
+            elif k == BC_TOGGLE_KEY:
+                hub.bc_on = not hub.bc_on
+                log("=== BLOOD CASTLE " + ("ON" if hub.bc_on else
+                    "OFF (anyone already inside finishes that castle; nobody else goes)") + " ===")
+            elif k == G.PAUSE_KEY:
+                if all(a.name in hub.paused for a in agents):
+                    hub.paused.clear()
+                    hub.pause_all = False
+                    log("=== RESUMING EVERYONE ===")
+                else:
+                    hub.pause_all = True
+                    hub.paused.update(a.name for a in agents)
+                    log("=== PAUSING EVERYONE (P again to resume; windows stay minimized, "
+                        "use 1-5 to open one) ===")
+            elif k.isdigit() and 1 <= int(k) <= len(agents):
+                a = agents[int(k) - 1]
+                if a.name in hub.paused:
+                    hub.paused.discard(a.name)
+                else:
+                    hub.pause_all = False
+                    hub.paused.add(a.name)
+    except Exception:
+        pass
     flag = G.BASE_DIR / G.PAUSE_FILE
     if flag.exists():
         if not getattr(read_keys, "file_paused", False):

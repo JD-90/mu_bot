@@ -2,7 +2,7 @@
 Keeps the MU bot running and lets it be restarted WITHOUT touching its console
 (so Claude, or you from another program, can restart it by creating a file).
 
-run_auto.bat starts this script; it starts mu_auto_bot.py (or the script given as argument)
+run_auto.bat / run_auto.sh starts this script; it starts mu_auto_bot.py (or the script given as argument)
 in the same console window, so the bot's keys (P, B, 1-5) keep working as before.
 
 Control files (create them in the bot folder; their content is optional):
@@ -10,15 +10,15 @@ Control files (create them in the bot folder; their content is optional):
                     (Blood Castle, Golden Invasion, post-reset Zen Chest buys)
   RESTART  "now"    restart right away (file content = the word now)
   STOP_ALL          stop the bot AND this supervisor (window closes)
-  restart_bot.bat   does "RESTART now" for you (double-click); starts the bot if it isn't running
+  restart_bot.bat / restart_bot.sh does "RESTART now" for you; starts the bot if it isn't running
 
 On its own it also:
   * restarts the bot after a crash (after CRASH_MAX crashes in CRASH_WINDOW it waits for a RESTART file)
   * restarts a frozen bot (its log silent for HANG_MIN minutes)
   * compiles every .py first: broken code -> the running bot is left alone / it waits for a fix,
     and the error goes to supervisor.log
-Stopping a bot: STOP_BOT file -> the bot closes its browsers and exits; after GRACE_SEC it is
-killed together with its browsers (taskkill /T).
+Stopping a bot: STOP_BOT file -> the bot closes its browsers and exits; after GRACE_SEC its
+process tree is killed.
 Everything is logged to supervisor.log.
 """
 import os
@@ -89,7 +89,8 @@ def start_bot():
     except OSError:
         pass
     env = dict(os.environ, MU_SUPERVISED="1")
-    p = subprocess.Popen([sys.executable, BOT], cwd=str(BASE), env=env)
+    p = subprocess.Popen([sys.executable, BOT], cwd=str(BASE), env=env,
+                         start_new_session=(sys.platform != "win32"))
     log(f"started {BOT} (pid {p.pid})")
     return p
 
@@ -99,7 +100,11 @@ def kill_tree(p):
     if sys.platform == "win32":
         subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True)
     else:
-        p.kill()
+        import signal
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     try:
         p.wait(timeout=15)
     except subprocess.TimeoutExpired:
