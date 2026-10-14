@@ -147,7 +147,42 @@ SCOUT_GIVE_UP_SEC   = 300   # whole scouting run longer than this -> use the bes
 
 RENDER_SCALE     = 50       # Option > Quality > Render scale (%) set at login; None = leave as is
 RESET_LEVEL      = None     # None = auto-detect with /resetinfo, otherwise e.g. 400
-HELPER_KEY       = "Equal"  # "=" toggles MU Helper
+HELPER_KEY       = "Equal"  # "=" toggles MU Helper (also written into the game's key bindings)
+
+# Game options every account gets (Juan 2026-10-14). Keys/values are the client's own
+# (localStorage "mu_options"). Sliders and choices store an INDEX, not the number shown:
+#   uiScale        0..8 -> 70 80 90 100 115 130 150 175 200 %
+#   renderScale    0..5 -> 100 90 80 75 60 50 %
+#   renderDistance 0..9 -> 40 80 120 160 200 240 280 320 400 480
+#   fpsLimit       0..4 -> uncapped 30 60 90 120
+#   lootZen        0..9 -> off 100 500 1k 5k 10k 50k 100k 500k 1M
+#   volume 0..9 (0 = off), musicVolume 0..10, cameraFov 20..60 (degrees, stored as is)
+# Written into the browser before the game loads (every page load) and set again live after
+# the Low preset, so they also come back after the main character's pause settings.
+GAME_OPTIONS = {
+    "wsadMovement": True,       # Controls > Camera and movement: Move with W A S D
+    "cameraFov": 60,            # Controls > Camera and movement: Field of view 60
+    "volume": 0,                # Sound: master volume off = all sound off
+    "lootFilter": True,         # Game > Loot: Filter drop names ON ...
+    "lootJewels": True,
+    "lootExcellent": True,
+    "lootAncient": True,
+    "lootHighLevel": True,
+    "lootOther": False,         # ... except All other items
+    "lootZen": 0,               # zen piles: off
+    "hideEnteredGame": True,    # Game > Chat and alerts: hide "entered the game"
+    "uiScale": 4,               # Interface > Screen: Interface size 115%
+}
+# Option > Video > Quality > Preset "Low" (the client's own preset values)
+LOW_PRESET = {
+    "renderingStyle": 0, "renderScale": 3, "upscale": 0, "msaa": 0, "anisotropy": 0, "sunShafts": 0,
+    "postProcessing": False, "shadows": False, "dynamicLights": False, "clouds": False,
+    "weatherEffects": False, "ambientParticles": False, "animatedWater": False, "advancedEffects": False,
+    "grassDensity": 0, "renderDistance": 0, "monsterEffects": False, "otherPlayerSkillEffects": False,
+    "otherPlayerItemEffects": False, "otherPlayerPets": False, "visiblePlayers": 3,
+    "distantAnimations": True, "itemEffects": 1, "effectLevel": 4, "fpsLimit": 2,
+}
+RENDER_SCALE_STEPS = [100, 90, 80, 75, 60, 50]   # renderScale index -> %
 ARRIVE_RADIUS    = 3        # tiles: close enough to start the helper / invite to party
 FOLLOW_EVERY     = 10       # seconds: alts check where the main character is this often
 FOLLOW_RADIUS    = 8        # tiles: alt further than this from the main ...
@@ -177,6 +212,71 @@ def log(msg, who="group"):
     print(line, flush=True)
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def render_scale_index(percent):
+    """Render scale % -> the client's slider index (nearest step)."""
+    return min(range(len(RENDER_SCALE_STEPS)), key=lambda i: abs(RENDER_SCALE_STEPS[i] - percent))
+
+
+# Runs in every game page before the client's own code: writes GAME_OPTIONS into the saved
+# options and binds MU Helper to HELPER_KEY, so the client starts with them.
+OPTIONS_INIT_JS = """
+(() => { try {
+  if (!/mormon/.test(location.hostname)) return;
+  const want = __OPTIONS__, helperKey = __HELPER_KEY__;
+  let o = {};
+  try { o = JSON.parse(localStorage.getItem('mu_options') || '{}') || {}; } catch (e) {}
+  Object.assign(o, want);
+  // without this the client "migrates" old saves on load (it would turn W A S D back off)
+  o.defaultsRevision = Math.max(+o.defaultsRevision || 0, 3);
+  localStorage.setItem('mu_options', JSON.stringify(o));
+  if (helperKey) {
+    const names = Object.keys(localStorage).filter(k => k === 'mu_keys' || k.startsWith('mu_keys:'));
+    if (!names.includes('mu_keys')) names.push('mu_keys');
+    for (const k of names) {
+      let b = {};
+      try { b = JSON.parse(localStorage.getItem(k) || '{}') || {}; } catch (e) {}
+      for (const a of Object.keys(b)) if (b[a] === helperKey && a !== 'muHelper') b[a] = '';
+      b.muHelper = helperKey;
+      localStorage.setItem(k, JSON.stringify(b));
+    }
+  }
+} catch (e) {} })();
+"""
+
+
+def prepare_context(ctx):
+    """Call right after launching a game browser, before the first page.goto()."""
+    js = (OPTIONS_INIT_JS.replace("__OPTIONS__", json.dumps(GAME_OPTIONS))
+                         .replace("__HELPER_KEY__", json.dumps(HELPER_KEY or "")))
+    ctx.add_init_script(script=js)
+
+
+# With the Option window open: finds the window's own "set" function (React props of an option
+# row) and sets every given option through it - same as moving the slider / clicking the toggle,
+# so it applies live. Returns the options that did not end up with the wanted value.
+SET_OPTIONS_JS = """
+(vals) => {
+  let actions = null;
+  for (const el of document.querySelectorAll('[data-row-id], [data-row-id] *')) {
+    const fk = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+    for (let f = fk && el[fk], d = 0; f && d < 40; f = f.return, d++) {
+      const p = f.memoizedProps;
+      if (p && p.actions && typeof p.actions.set === 'function') { actions = p.actions; break; }
+    }
+    if (actions) break;
+  }
+  if (!actions) return {ok: false, why: 'option rows not found'};
+  for (const [k, v] of Object.entries(vals)) {
+    try { actions.set(k, v); } catch (e) {}
+  }
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem('mu_options') || '{}'); } catch (e) {}
+  const off = Object.keys(vals).filter(k => k in saved && saved[k] !== vals[k]);
+  return {ok: true, off};
+}
+"""
 
 
 STATE_JS = """
@@ -482,9 +582,42 @@ class Char:
         self.walk_target = None
         self.following = False
 
+    def set_options(self, values, what="options"):
+        """Opens the Option window, sets `values` live (see SET_OPTIONS_JS), closes it.
+        True when it worked."""
+        page = self.page
+        r = None
+        try:
+            page.evaluate("() => { window.__store.optionsEnabled = true; }")
+            for _ in range(4):
+                time.sleep(0.6)
+                r = page.evaluate(SET_OPTIONS_JS, values)
+                if r and r.get("ok"):
+                    break
+        except Exception as e:
+            r = {"ok": False, "why": repr(e)}
+        finally:
+            try:
+                page.evaluate("() => { window.__store.optionsEnabled = false; }")
+            except Exception:
+                pass
+        if r and r.get("ok"):
+            off = r.get("off") or []
+            self.log(f"{what} set" + (f" (did not stick: {', '.join(off)})" if off else ""))
+            return True
+        self.log(f"{what}: could not set them ({(r or {}).get('why')})")
+        return False
+
     def set_low_graphics(self):
-        """Option -> VIDEO / Quality -> Preset -> Low. Done once per session."""
+        """Low preset + bot render scale + GAME_OPTIONS, live. Done once per session (and again
+        after the main character's pause settings). Falls back to clicking the preset."""
         self.gfx_done = True
+        vals = dict(LOW_PRESET)
+        if RENDER_SCALE:
+            vals["renderScale"] = render_scale_index(RENDER_SCALE)
+        vals.update(GAME_OPTIONS)
+        if self.set_options(vals, f"graphics Low (render scale {RENDER_SCALE}%) + game options"):
+            return
         page = self.page
         try:
             page.evaluate("() => { window.__store.optionsEnabled = true; }")
@@ -1317,6 +1450,7 @@ def main():
                     f"--window-position={40 + i * 50},{40 + i * 50}",
                 ],
             )
+            prepare_context(ctx)
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.goto(URL, wait_until="domcontentloaded", timeout=180_000)
             members.append(Char(acc, page, is_leader=(i == 0)))

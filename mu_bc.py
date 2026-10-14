@@ -69,7 +69,7 @@ HELPER_BURST  = 3.0                 # helper on this long when stuck, then keep 
 CLEAR_RADIUS  = 7                   # scan radius for the weapon on the ground
 FOLLOW_DIST   = 4
 BOX_TRY_SEC   = 3.5
-END_WAIT_SEC  = 90                  # after the castle ends: time to pick boxes before leaving
+END_WAIT_SEC  = 5                  # after the castle ends: time to pick boxes before leaving
 TRADE_BOXES   = True                # afterwards, alts trade every Box of Kundun (+1..+5) to wizzardo
 KUNDUN_MIN_LVL = 8                  # Box of Kundun +1 = item level 8 ... +5 = 12 (Zen Chest = 4, not traded)
 TRADE_SPOT    = (0, 122, 133)       # Lorencia bar
@@ -116,6 +116,31 @@ BC_HOOK_JS = """
 """
 
 BC_STATE_JS = "() => window.__bcState"
+
+# party members vs the spawn area (delivery wait). A member is "here" when we can see him within r tiles
+# of (ax, ay); "gone" when the party data puts him on another map. keys = the party entry's fields
+# (logged once, to learn what the client keeps there).
+PARTY_SPAWN_JS = """([ax, ay, r, me]) => {
+  const soc = window.__social, w = window.__world, pd = (window.__store && window.__store.playerData) || {};
+  const pm = (soc && soc.partyMembers) || [];
+  const ents = {};
+  for (const e of (w ? w.netObjsQuery.entities : [])) {
+    if (!e.transform || e.droppedItem || e.npcType !== undefined) continue;
+    const n = (e.objectNameInWorld || '').trim().toLowerCase(); if (n) ents[n] = e;
+  }
+  const myMap = pd.map ?? pd.mapNumber ?? pd.mapId ?? null;
+  const out = [];
+  for (const m of pm) {
+    const name = (m.name || '').trim(); if (!name || name.toLowerCase() === (me || '').toLowerCase()) continue;
+    const e = ents[name.toLowerCase()];
+    const mp = m.map ?? m.mapNumber ?? m.mapId ?? m.mapIndex ?? null;
+    const x = e ? e.transform.pos.x : null, y = e ? e.transform.pos.z : null;
+    out.push({name, visible: !!e, x: x === null ? null : Math.round(x), y: y === null ? null : Math.round(y),
+              map: mp, here: !!e && Math.hypot(x - ax, y - ay) <= r,
+              dead: !!(e && e.dying), keys: Object.keys(m).slice(0, 25).join(',')});
+  }
+  return {members: out, myMap};
+}"""
 
 # last entry answer + last server message (both since time t, epoch ms)
 BC_ENTER_RESULT_JS = """
@@ -415,7 +440,21 @@ BAG_JS = """
 # anyone else: the selected skill, FIGHT_OTHER_RANGE. castRequest only (no attackTarget: that makes
 # the client chase the monster).
 # Python sets the goal + mode every tick, logs the events and a status line every FIGHT_LOG_SEC.
-GRAB_VERSION   = 6
+GRAB_VERSION   = 7                   # v7 (2026-10-14): kill-phase zone at the bridge, no gate before the bridge drops,
+                                    # self-start at castle state 0, no buffs while just walking
+# Kill phase (Juan 2026-10-14): the bridge to the gate only drops once enough monsters are dead (castle
+# state 1 -> 4). Until then: no attacking the gate; clear monsters, never further than BRIDGE_ZONE_R tiles
+# from the bridge edge (where everybody stalls, (13-15, 68-69) in every castle).
+BRIDGE_EDGE    = (14, 68)
+BRIDGE_ZONE_R  = 8
+# Delivery (Juan 2026-10-14): holding the weapon at the Archangel, wait until every party member is in the
+# spawn area (within DELIVER_SPAWN_R of the Archangel); members who left the castle (other map / gone /
+# not in the party any more) don't count. Never longer than DELIVER_WAIT_MAX, nor with less than
+# DELIVER_MIN_REM seconds left on the castle clock.
+DELIVER_WAIT_PARTY = True
+DELIVER_SPAWN_R    = 10
+DELIVER_WAIT_MAX   = 90
+DELIVER_MIN_REM    = 60
 BC_USE_HELPER  = False               # True = the old behaviour (helper bursts when stuck, helper at the statue)
 GRAB_LOOP_MS   = 50                  # in-page check period (20x/s), on top of the ItemsDropped event
 GRAB_PICK_MS   = 100                 # re-send the pickup this often while the weapon is on the ground
@@ -657,11 +696,36 @@ BC_GRAB_JS = r"""
       if (G.walkUntil && now > G.walkUntil) { G.walkUntil = 0; G.ncAt = now; }
       const noFight = meSafe || (G.walkUntil && now <= G.walkUntil);
       if (meSafe !== !!G.wasSafe) { G.wasSafe = meSafe; if (meSafe) ev('in a safe zone: no fighting, walking out'); }
-      if (!noFight && c.mode !== 'hold' && buffTick(now, w, s, h)) return;
+      // castle state straight from the packet hook (fresher than Python's tick)
+      const S = W.__bcState, fresh = !!(S && S.t >= (c.stateSince || 0));
+      const killPhase = fresh ? (S.st === 0 || S.st === 1) : !!c.killPhase;
+      // ── v7: waiting by the bridge: start the moment the castle state says it started (phase 0 =
+      //    the barrier opens; we used to wait for phase 1, ~2 s later, + a Python tick) ──
+      let goal = c.goal, mode = c.mode, goalR = c.goalR;
+      if (mode === 'wait') {
+        if (fresh && [0, 1, 4].includes(S.st) && c.startGoal) {
+          if (!G.selfStart) { G.selfStart = true; ev(`castle started (state ${S.st}) -> going in right away`); }
+          mode = c.startMode || 'advance'; goal = c.startGoal; goalR = c.startR || 2;
+        } else {
+          G.selfStart = false; G.why = 'waiting for the start'; G.mode = 'wait';
+          if (G.tgt !== null) { G.tgt = null; w.castRequest = null; w.attackTarget = null; }
+          return;
+        }
+      }
+      // buffs: never while just walking up the corridor (they cost 1-4 s at the start); only with a
+      // monster close, or when guarding / clearing
+      const nearMob = mobs.some(m => m.d <= (G.range || 3) + 2);
+      if (!noFight && mode !== 'hold' && (mode !== 'advance' || nearMob) && buffTick(now, w, s, h)) return;
       // ── fight / walk ──
-      const goal = c.goal, mode = c.mode;
       const dGoal = goal ? Math.hypot(p.x - goal[0], p.z - goal[1]) : 0;
-      const atGoal = !goal || dGoal <= c.goalR;
+      const atGoal = !goal || dGoal <= goalR;
+      // v7 kill phase at the bridge: the gate can't be hit until enough monsters are dead (the bridge
+      // drops at the second phase) -> clear monsters, never further than zoneR from the bridge edge
+      const zone = c.zone, zoneR = c.zoneR || 8;
+      const dZone = zone ? Math.hypot(p.x - zone[0], p.z - zone[1]) : 1e9;
+      const inZone = killPhase && zone && mode === 'advance' && dZone <= zoneR + 1;
+      if (inZone !== !!G.wasZone) { G.wasZone = inZone; ev(inZone ? `kill phase at the bridge: clearing monsters within ${zoneR} tiles of (${zone})`
+                                                           : 'left the bridge kill zone'); }
       const key = goal ? goal.join(',') + mode : null;
       if (key !== G.goalKey) { G.goalKey = key; G.best = dGoal; G.bestAt = now; }
       if (atGoal || dGoal < G.best - 0.5) { G.best = dGoal; G.bestAt = now; }
@@ -676,7 +740,12 @@ BC_GRAB_JS = r"""
       const R = G.range;
       mobs.sort((a, b) => a.d - b.d);
       let tgt = null, reason = '';
-      if (mode !== 'hold' && !noFight) {
+      let chase = null;
+      if (inZone && !noFight) {
+        const inR = mobs.filter(m => m.d <= R && Math.hypot(m.x - zone[0], m.y - zone[1]) <= zoneR + R);
+        tgt = inR[0]; reason = 'kill phase: in range';
+        if (!tgt) chase = mobs.find(m => Math.hypot(m.x - zone[0], m.y - zone[1]) <= zoneR + R) || null;
+      } else if (mode !== 'hold' && !noFight) {
         const inR = mobs.filter(m => m.d <= R);
         if (mode === 'guard' || atGoal) { tgt = inR[0]; reason = 'in range at the spot'; }
         else if (mode === 'rush') {
@@ -686,7 +755,7 @@ BC_GRAB_JS = r"""
           tgt = inR.find(ahead); reason = 'in the way';
           if (!tgt && stuck) { tgt = inR[0]; reason = 'stuck: in range'; }
         }
-        if (!tgt && gate && gate.d <= Math.max(R, 3) && (ahead({x: gate.e.transform.pos.x, y: gate.e.transform.pos.z}) || stuck)) {
+        if (!tgt && gate && !killPhase && gate.d <= Math.max(R, 3) && (ahead({x: gate.e.transform.pos.x, y: gate.e.transform.pos.z}) || stuck)) {
           tgt = gate; reason = 'castle gate';
         }
         if (!tgt && stuck && mode !== 'rush' && stuckMs > c.huntMs) {
@@ -708,6 +777,26 @@ BC_GRAB_JS = r"""
         return;
       }
       if (G.tgt !== null) { G.tgt = null; w.castRequest = null; w.attackTarget = null; G.lastWalk = 0; }
+      if (inZone) {
+        // nothing in range: step towards the nearest monster near the bridge (stopping R-1 tiles short),
+        // clamped to zoneR tiles from the bridge edge; no monsters -> back to the edge
+        if (now - G.lastWalk < c.walkMs) return;
+        let tx = zone[0], ty = zone[1];
+        if (chase) {
+          const k = Math.max(chase.d, 0.01), stop = Math.max(R - 1, 1);
+          tx = chase.x - (chase.x - p.x) / k * Math.min(stop, chase.d);
+          ty = chase.y - (chase.y - p.z) / k * Math.min(stop, chase.d);
+          const vx = tx - zone[0], vy = ty - zone[1], L = Math.hypot(vx, vy);
+          if (L > zoneR) { tx = zone[0] + vx / L * zoneR; ty = zone[1] + vy / L * zoneR; }
+          G.why = `kill phase: closing in on ${(chase.e.objectNameInWorld || '').trim() || chase.e.npcType}`;
+        } else {
+          G.why = 'kill phase: nothing near the bridge, waiting at the edge';
+        }
+        if (Math.hypot(tx - p.x, ty - p.z) < 1.5) return;
+        G.lastWalk = now;
+        for (const [ox, oy] of OFFS) if (walkTo(w, h, Math.round(tx) + ox, Math.round(ty) + oy)) { G.walks++; break; }
+        return;
+      }
       if (atGoal || now - G.lastWalk < c.walkMs) return;
       G.lastWalk = now;
       // stuck with nothing to hit: sidestep (try the tiles around the goal in turn)

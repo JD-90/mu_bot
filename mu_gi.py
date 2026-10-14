@@ -54,6 +54,11 @@ GI_HUNT_SEC      = 900              # the event lasts 15 min (:50 -> :05): hunt 
                                     # dragons are much tougher now, 3 min was too short)
 GI_IDLE_SEC      = 90               # ... or until no golden mob was in view this long (dead / warping don't count)
 GI_SEARCH_AGE    = 180              # a searched area counts as unsearched again after this long (long hunts)
+GI_MIN_LEFT      = 10               # (Juan 2026-10-14) fewer golden mobs than this left in total -> stop searching and
+                                    # end the hunt (a fight / dragon lock in progress is finished first; 0 = off)
+GI_SPACING       = 8                # (Juan 2026-10-14) while searching, our hunters keep at least this many tiles
+                                    # apart: too close -> step away, and search goals near a teammate are skipped.
+                                    # Not applied in fights / dragon calls / loot (they need to be on the target). 0 = off
 GI_EXPLORED_SWITCH = True           # (Juan 2026-10-14) whole map searched -> warp to the other GI map with the most
                                     # golden mobs left right now (none left elsewhere -> keep patrolling this one)
 GI_SWITCH_MIN_STAY = 60             # ... but not sooner than this many seconds after landing on this map (no ping-pong)
@@ -1206,6 +1211,10 @@ class GoldenInvasion:
         # InvasionMonsters only comes when a count changes; total 0 (incl. the 'fd 00' inactive packet) = over
         if counts is not None and counts.get("total") == 0 and rel > GI_BANNER_WAIT + 10 and not self.dlock:
             return self.end_hunt("every golden mob is dead")
+        left = counts.get("total") if counts is not None else None
+        if (GI_MIN_LEFT and left is not None and 0 < left < GI_MIN_LEFT and rel > GI_BANNER_WAIT + 10
+                and not self.dlock and status.get("mode") == "search"):
+            return self.end_hunt(f"only {left} golden mob(s) left (< {GI_MIN_LEFT})")
         if now - self.last_golden > GI_IDLE_SEC and not self.dlock:
             return self.end_hunt(f"no golden mob found for {GI_IDLE_SEC} s")
         if dead and not self.was_dead:
@@ -1269,8 +1278,11 @@ class GoldenInvasion:
                 self.ev(B.WALK_JS, status.get("spamPos"))
             self.last_golden = now
         elif status.get("mode") == "search":
-            self.search_step(s)
+            self.share_pos(s)
+            if not self.keep_apart(s, now):
+                self.search_step(s)
         else:
+            self.share_pos(s)
             self.goal = None
         if time.time() - self.last_status_log > 20:
             self.last_status_log = time.time()
@@ -1331,6 +1343,69 @@ class GoldenInvasion:
         sh = getattr(self.a.hub, "gi_shared", None) or {"grids": {}}
         return sh["grids"].setdefault(self.map_target if self.map_target is not None else self.c.s.get("map"), {})
 
+    # ── spacing between our hunters (GI_SPACING) ──
+    def share_pos(self, s):
+        sh = getattr(self.a.hub, "gi_shared", None)
+        if sh is None or s.get("x") is None:
+            return
+        with self.a.hub.lock:
+            sh.setdefault("pos", {})[self.a.name] = {"map": s.get("map"), "x": s.get("x"), "y": s.get("y"),
+                                                     "goal": self.goal, "at": time.time()}
+
+    def mates(self, s):
+        """[(name, x, y, goal)] of our other hunters on my map, positions fresher than 5 s."""
+        sh = getattr(self.a.hub, "gi_shared", None)
+        if sh is None:
+            return []
+        now = time.time()
+        with self.a.hub.lock:
+            pos = {n: dict(v) for n, v in (sh.get("pos") or {}).items() if n != self.a.name}
+        return [(n, v["x"], v["y"], v.get("goal")) for n, v in pos.items()
+                if v["map"] == s.get("map") and now - v["at"] < 5]
+
+    def keep_apart(self, s, now):
+        """A teammate closer than GI_SPACING: walk away from him. True = moving away (skip the search step)."""
+        if not GI_SPACING:
+            return False
+        x, y = s.get("x"), s.get("y")
+        if x is None:
+            return False
+        close = [(math.hypot(mx - x, my - y), n, mx, my) for n, mx, my, _ in self.mates(s)]
+        close = [c for c in close if c[0] < GI_SPACING]
+        if not close:
+            return False
+        if now - getattr(self, "apart_at", 0) < 1.5:
+            return True                                    # already walking away
+        # only one of each pair moves: the later one in accounts.json (the earlier one keeps searching)
+        order = list(self.a.hub.names)
+        idx = order.index(self.a.name) if self.a.name in order else 0
+        movers = [c for c in close if (order.index(c[1]) if c[1] in order else -1) < idx]
+        if not movers:
+            return False
+        # away from the teammates that are too close (their average), GI_SPACING + 2 tiles from the nearest
+        ax = sum(x - mx for _, _, mx, my in movers)
+        ay = sum(y - my for _, _, mx, my in movers)
+        if abs(ax) + abs(ay) < 0.5:
+            ax, ay = 1.0, 0.0
+        base = math.atan2(ay, ax)
+        dist = GI_SPACING + 2
+        pts = []
+        for da in (0, 0.5, -0.5, 1.0, -1.0, 1.6, -1.6, 2.4, -2.4, math.pi):
+            a = base + da
+            pts.append([int(round(x + math.cos(a) * dist)), int(round(y + math.sin(a) * dist))])
+        ok = self.ev(WALKABLE_JS, pts) or []
+        for w in ok:
+            if w and all(math.hypot(w[0] - mx, w[1] - my) >= GI_SPACING for _, _, mx, my in close):
+                self.apart_at = now
+                self.goal = None
+                if now - getattr(self, "apart_logged", 0) > 20:
+                    self.apart_logged = now
+                    self.log(f"spacing: {', '.join(n for _, n, _, _ in movers)} within {GI_SPACING} tiles "
+                             f"-> stepping to ({w[0]},{w[1]})")
+                self.ev(B.WALK_JS, [int(w[0]), int(w[1])])
+                return True
+        return False
+
     def blocked_cells(self):
         """Search cells with no walkable tile (walls / water / outside the map), per map, shared by our hunters."""
         sh = getattr(self.a.hub, "gi_shared", None)
@@ -1389,6 +1464,16 @@ class GoldenInvasion:
                     mx, my = cx * GI_SEARCH_CELL + GI_SEARCH_CELL // 2, cy * GI_SEARCH_CELL + GI_SEARCH_CELL // 2
                     cand.append((math.hypot(mx - x, my - y), cx, cy, mx, my))
             cand.sort()
+            if GI_SPACING:
+                taken = []
+                for _, mx2, my2, g in self.mates(s):
+                    taken.append((mx2, my2))
+                    if g:
+                        taken.append(tuple(g))
+                spaced = [c for c in cand if all(math.hypot(c[3] - tx, c[4] - ty) >= GI_SEARCH_CELL / 2 + GI_SPACING
+                                                 for tx, ty in taken)]
+                if spaced:
+                    cand = spaced                     # leave the areas next to a teammate to him
             blocked = self.blocked_cells()
             if not cand:
                 self.explored_map = self.map_target       # hunt() warps to the map with the most goldens left

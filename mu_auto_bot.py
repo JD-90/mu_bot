@@ -63,7 +63,10 @@ Pause: P pauses / resumes EVERY character. Keys 1-5 pause / resume ONE character
        accounts.json). A paused character's window is restored so you can play it; the others
        keep going. While paused, everything you do in that window is written to mu_record.log
        (mu_recorder.py) so new events can be learned from it. Characters in BIG_ON_PAUSE get a
-       maximized window at full render scale while paused (back to 800x500 / low on resume).
+       fullscreen 1440p window with BIG_OPTIONS (100% render scale, effects, 120 fps, sound on)
+       while paused (back to 800x500 / Low / sound off on resume).
+Options: every account gets GAME_OPTIONS (mu_group_bot.py: W A S D, loot filter, FOV 60, 115%
+       interface, sound off, hide "entered the game") and MU Helper on HELPER_KEY.
 """
 import math
 import os
@@ -120,7 +123,7 @@ LEVELEE_VIT_MAX     = 1500  # every levelee in PAIRS puts its free points into V
 LEVELEE_VIT_EVERY   = 60    # seconds between checks for free points
 
 # Blood Castle
-BC_AUTO             = False   # Blood Castle on/off AT STARTUP. Press B in the console to switch it live
+BC_AUTO             = True    # (Juan 2026-10-14: on by default) Blood Castle on/off AT STARTUP. Press B in the console to switch it live
                               # (off until the bots seem human enough; Juan 2026-10-11)
 BC_TOGGLE_KEY       = "b"
 BC_TIERS            = B.BC_TIERS        # (castle, min lvl, max lvl): BC1 15-80 ... BC7 331-400
@@ -159,6 +162,18 @@ WINDOW_CHECK_EVERY  = 30    # seconds between window checks
 BIG_ON_PAUSE        = {"wizzardo"}  # these characters get a maximized, sharp window when you pause
                                     # them with 1-5 (back to 800x500 / low graphics on resume)
 BIG_RENDER_SCALE    = 100   # Render scale (%) while big; None = leave it as the bot set it
+BIG_FULLSCREEN      = True  # True = fullscreen window while big (no browser bars); False = maximized
+BIG_RESOLUTION      = (2560, 1440)  # game size while big (1440p); capped to what the screen fits
+# Game options while big (Juan 2026-10-14); index meanings are listed above GAME_OPTIONS in
+# mu_group_bot.py. On resume the Low preset + GAME_OPTIONS come back (sound off again).
+BIG_OPTIONS = {
+    "otherPlayerItemEffects": True,   # World and effects: other players' gear effects ON
+    "otherPlayerSkillEffects": True,  # World and effects: other players' skill effects ON
+    "renderDistance": 1,              # World and effects: render distance 80
+    "fpsLimit": 4,                    # FPS limit 120
+    "volume": 5,                      # Sound: master volume 5
+    "musicVolume": 1,                 # Sound: music 1
+}
 REMINIMIZE_RESTORED = False # True = re-minimize any window that got restored (the old behaviour).
                             # False = a window you restore by hand stays open until you minimize it again
 
@@ -378,6 +393,7 @@ class Agent:
                     args=["--disable-background-timer-throttling", "--disable-renderer-backgrounding",
                           "--disable-backgrounding-occluded-windows",
                           f"--window-position={40 + self.idx * 50},{40 + self.idx * 50}"])
+                G.prepare_context(ctx)     # GAME_OPTIONS + MU Helper key, before the game loads
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 page.goto(G.URL, wait_until="domcontentloaded", timeout=180_000)
                 self.c = G.Char(self.acc, page, is_leader=False)
@@ -411,7 +427,8 @@ class Agent:
             return None
 
     def go_big(self):
-        """Maximize the window and make the game fill it, with a sharper render scale."""
+        """Fullscreen (or maximized) window with the game at BIG_RESOLUTION and the BIG_OPTIONS
+        quality / sound settings, for playing it yourself."""
         c, page = self.c, self.c.page
         self.big = True
         try:
@@ -422,21 +439,31 @@ class Agent:
             b = cdp.send("Browser.getWindowBounds", {"windowId": win})["bounds"]
             vp = page.viewport_size or {"width": G.WINDOW_SIZE[0], "height": G.WINDOW_SIZE[1]}
             extra_w, extra_h = b["width"] - vp["width"], b["height"] - vp["height"]   # borders + toolbar
-            cdp.send("Browser.setWindowBounds", {"windowId": win, "bounds": {"windowState": "maximized"}})
+            state = "fullscreen" if BIG_FULLSCREEN else "maximized"
+            cdp.send("Browser.setWindowBounds", {"windowId": win, "bounds": {"windowState": state}})
             time.sleep(0.8)
             b = cdp.send("Browser.getWindowBounds", {"windowId": win})["bounds"]
             cdp.detach()
             c.minimized = False
-            w, h = max(800, b["width"] - extra_w), max(500, b["height"] - extra_h)
+            if state == "fullscreen":
+                w, h = b["width"], b["height"]          # no browser bars in fullscreen
+            else:
+                w, h = b["width"] - extra_w, b["height"] - extra_h
+            if BIG_RESOLUTION:
+                w, h = min(w, BIG_RESOLUTION[0]), min(h, BIG_RESOLUTION[1])
+            w, h = max(800, w), max(500, h)
             page.set_viewport_size({"width": w, "height": h})
-            self.log(f"window maximized for manual play ({w}x{h})")
+            self.log(f"window {state} for manual play ({w}x{h})")
         except Exception as e:
-            self.log(f"could not maximize the window: {e!r}")
+            self.log(f"could not enlarge the window: {e!r}")
+        vals = dict(BIG_OPTIONS)
         if BIG_RENDER_SCALE:
+            vals["renderScale"] = G.render_scale_index(BIG_RENDER_SCALE)
+        if not c.set_options(vals, "manual-play options") and BIG_RENDER_SCALE:
             self.options_render_scale(BIG_RENDER_SCALE)
 
     def go_small(self):
-        """Back to the bot's 800x500 window and low graphics (then it gets minimized as usual)."""
+        """Back to the bot's 800x500 window, low graphics and sound off (then it gets minimized as usual)."""
         c, page = self.c, self.c.page
         self.big = False
         try:
@@ -445,7 +472,7 @@ class Agent:
             self.user_opened = False
         except Exception as e:
             self.log(f"could not shrink the window: {e!r}")
-        c.gfx_done = False              # main tick re-applies the Low preset + bot render scale
+        c.gfx_done = False              # main tick re-applies the Low preset + bot render scale + GAME_OPTIONS
 
     def options_render_scale(self, value):
         page = self.c.page
@@ -1949,7 +1976,11 @@ class Agent:
                "rushRange": B.FIGHT_RUSH_RANGE, "stuckMs": B.FIGHT_STUCK_MS, "huntMs": B.FIGHT_HUNT_MS,
                "leash": B.FIGHT_LEASH, "walkMs": B.FIGHT_WALK_MS, "potKey": B.FIGHT_POT_KEY,
                "potHp": B.FIGHT_POT_HP, "potMs": B.FIGHT_POT_MS, "buffs": B.FIGHT_BUFFS,
-               "buffEvery": B.FIGHT_BUFF_EVERY_MS, "buffTries": B.FIGHT_BUFF_TRIES}
+               "buffEvery": B.FIGHT_BUFF_EVERY_MS, "buffTries": B.FIGHT_BUFF_TRIES,
+               # v7: kill-phase zone at the bridge + self-start from the waiting spot
+               "zone": list(B.BRIDGE_EDGE), "zoneR": B.BRIDGE_ZONE_R, "killPhase": bool(b.get("kill_phase")),
+               "stateSince": int((b.get("open_at") or 0) * 1000 - 60_000),
+               "startGoal": list(B.STATUE), "startMode": "advance", "startR": B.STATUE_RADIUS}
         if on and not fight and b.get("statue_solo_over"):
             cfg["statue"] = False                 # our own attack took too long: the helper finishes it
         r = self.ev(B.BC_GRAB_JS, cfg)
@@ -2175,6 +2206,55 @@ class Agent:
 
     BC_PHASES = {0: "start", 1: "kill monsters", 4: "gate/statue", 2: "finished"}
 
+    def bc_wait_party(self, b, st):
+        """B.DELIVER_WAIT_PARTY: at the Archangel with the weapon -> True while a party member that is
+        still in the castle is not in the spawn area yet (we hold the weapon and wait)."""
+        now = time.time()
+        t0 = b.setdefault("dwait_at", now)
+        rem = (st or {}).get("rem")
+        if b.get("dwait_done"):
+            return False
+        def done(msg):
+            b["dwait_done"] = True
+            if b.get("dwait_logged") or msg.startswith("waited"):
+                self.log(f"BC: {msg} -> delivering")
+            return False
+        if now - t0 > B.DELIVER_WAIT_MAX:
+            return done(f"waited {B.DELIVER_WAIT_MAX}s for the party")
+        if rem is not None and rem < B.DELIVER_MIN_REM:
+            return done(f"only {rem}s left on the castle clock")
+        r = self.ev(B.PARTY_SPAWN_JS, [*B.ARCHANGEL, B.DELIVER_SPAWN_R, self.name]) or {}
+        members = r.get("members") or []
+        if members and not b.get("dwait_keys"):
+            b["dwait_keys"] = True
+            self.log(f"BC: party entry fields: {members[0].get('keys')}")
+        my_map = self.c.s.get("map")
+        snap = self.hub.snapshot()
+        waiting = []
+        for m in members:
+            ours = snap.get(m["name"])
+            if ours and ours.get("map") is not None:          # one of our characters: we know its map
+                if ours["map"] != my_map:
+                    continue                                  # left the castle -> doesn't count
+                if ours.get("x") is not None and dist(ours, *B.ARCHANGEL) <= B.DELIVER_SPAWN_R:
+                    continue
+            elif m.get("here"):
+                continue
+            elif m.get("map") is not None and m["map"] != my_map:
+                continue                                      # the party data says he's on another map
+            if m.get("dead"):
+                continue
+            waiting.append(m)
+        if not waiting:
+            return done("whole party in the spawn area")
+        if now - b.get("dwait_log_at", 0) > 5:
+            b["dwait_log_at"], b["dwait_logged"] = now, True
+            who = ", ".join(f"{m['name']} " + (f"({m['x']},{m['y']})" if m.get("visible") else "(not in view)")
+                            for m in waiting)
+            self.log(f"BC: holding the weapon at the Archangel, waiting for {who} "
+                     f"({int(now - t0)}s, {rem}s left on the clock)")
+        return True
+
     def bc_diag(self, b, st):
         """Diagnostics: log every castle state change, and what's on the ground near the statue."""
         s, now = self.c.s, time.time()
@@ -2268,6 +2348,8 @@ class Agent:
                              "Archangel weapon in the bag -> it was not the weapon, carrying on")
                     b["we_have"], b["deliver_at"] = False, None
                     return True
+            if in_bag and B.DELIVER_WAIT_PARTY and self.bc_wait_party(b, st):
+                return True                               # holding the weapon until the party is here
             if time.time() - b["talk_at"] > 3:
                 if not in_bag and not b.get("deliver_at"):
                     b["deliver_at"] = time.time()
@@ -2288,8 +2370,15 @@ class Agent:
                 self.fight_to(b, *B.ARCHANGEL, 2, "rush", at_goal="hold", weapon=False)
             self.log_rush(b)
             return True
-        if not st or st.get("st") not in (1, 4):
-            self.grab(b, False)
+        if st:
+            b["kill_phase"] = st.get("st") in (0, 1)
+        if not st or st.get("st") not in (0, 1, 4):      # (v7) state 0 = the barrier opens: go right away
+            # the in-page loop waits armed ("wait" mode) and starts walking by itself the instant the
+            # castle state packet arrives, without waiting for this Python tick
+            if not B.BC_USE_HELPER:
+                self.grab(b, True, mode="wait", weapon=False, statue=False)
+            else:
+                self.grab(b, False)
             self.park(s.get("map"), "", *(self.ev(B.WAIT_SPOT_JS, [*B.BC_WAIT, *B.BC_START]) or B.BC_START),
                       radius=2)   # waiting for the castle to start (by the bridge), wiggling a little
             return True
