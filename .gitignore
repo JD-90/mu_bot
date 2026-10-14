@@ -2,6 +2,8 @@ accounts.json
 browser_profile*/
 *.log
 .deps_ok
+.deps_ok.*
+.venv/
 __pycache__/
 RESTART
 STOP_ALL
