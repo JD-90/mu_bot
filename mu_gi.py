@@ -54,6 +54,9 @@ GI_HUNT_SEC      = 900              # the event lasts 15 min (:50 -> :05): hunt 
                                     # dragons are much tougher now, 3 min was too short)
 GI_IDLE_SEC      = 90               # ... or until no golden mob was in view this long (dead / warping don't count)
 GI_SEARCH_AGE    = 180              # a searched area counts as unsearched again after this long (long hunts)
+GI_EXPLORED_SWITCH = True           # (Juan 2026-10-14) whole map searched -> warp to the other GI map with the most
+                                    # golden mobs left right now (none left elsewhere -> keep patrolling this one)
+GI_SWITCH_MIN_STAY = 60             # ... but not sooner than this many seconds after landing on this map (no ping-pong)
 GI_WAIT_DIST     = 20               # waiting spot: this many tiles outside the Noria safe zone
 GI_SKILL         = 39               # default for GI_SKILLS (Ice Storm)
 GI_BARRIER       = True             # mages: Soul Barrier on yourself every time you leave a safe zone (Juan 2026-10-11)
@@ -828,6 +831,8 @@ class GoldenInvasion:
             if not sh or sh.get("key") != key:
                 hub.gi_shared = {"key": key, "grids": {}, "assign": {}}   # shared by all our hunters
         self.goal = None
+        self.explored_map = None             # map whose whole search grid was searched recently (search_step)
+        self.map_since = time.time()         # when we got our current map_target (GI_SWITCH_MIN_STAY)
         self.pre_map = self.pick_pre_map()
         with hub.lock:
             hub.gi_shared.setdefault("pre", {})[self.a.name] = self.pre_map
@@ -1218,6 +1223,7 @@ class GoldenInvasion:
             if banner or (counts and counts.get("total") and rel > GI_BANNER_WAIT) or rel > GI_BANNER_WAIT + 4:
                 self.map_target, why = self.focus_map(banner, counts)
                 self.assign_map(self.map_target)
+                self.map_since = now
                 self.log(f"map: {MAP_NAMES.get(self.map_target)} ({why})")
             else:
                 return
@@ -1229,9 +1235,14 @@ class GoldenInvasion:
             rest = [m for m in GI_PRE_MAPS if m != self.map_target and lvl_ok(m)]
             other = max(rest, key=lambda m: int(maps.get(str(m), 0) or 0)) if rest else self.map_target
             there = int(maps.get(str(other), 0) or 0)
-            if here == 0 and there >= 5:
-                self.log(f"map: nothing left here, {there} left in {MAP_NAMES[other]} -> switching")
-                self.map_target, self.goal = None
+            explored = (GI_EXPLORED_SWITCH and getattr(self, "explored_map", None) == self.map_target
+                        and there > 0 and other != self.map_target
+                        and now - getattr(self, "map_since", 0) >= GI_SWITCH_MIN_STAY)
+            if (here == 0 and there >= 5) or explored:
+                why = "whole map searched" if explored and not (here == 0 and there >= 5) else "nothing left here"
+                self.log(f"map: {why} ({here} counted here), {there} left in {MAP_NAMES[other]} -> switching")
+                self.map_target, self.goal = other, None
+                self.explored_map, self.map_since = None, now
                 self.assign_map(other)
         if s.get("map") != self.map_target:
             if self.map_target == MAP_DEVIAS:
@@ -1320,6 +1331,14 @@ class GoldenInvasion:
         sh = getattr(self.a.hub, "gi_shared", None) or {"grids": {}}
         return sh["grids"].setdefault(self.map_target if self.map_target is not None else self.c.s.get("map"), {})
 
+    def blocked_cells(self):
+        """Search cells with no walkable tile (walls / water / outside the map), per map, shared by our hunters."""
+        sh = getattr(self.a.hub, "gi_shared", None)
+        if sh is None:
+            sh = self.__dict__.setdefault("_own_shared", {})
+        m = self.map_target if self.map_target is not None else self.c.s.get("map")
+        return sh.setdefault("blocked", {}).setdefault(m, set())
+
     def cell(self, x, y):
         return (int(x) // GI_SEARCH_CELL, int(y) // GI_SEARCH_CELL)
 
@@ -1370,13 +1389,34 @@ class GoldenInvasion:
                     mx, my = cx * GI_SEARCH_CELL + GI_SEARCH_CELL // 2, cy * GI_SEARCH_CELL + GI_SEARCH_CELL // 2
                     cand.append((math.hypot(mx - x, my - y), cx, cy, mx, my))
             cand.sort()
+            blocked = self.blocked_cells()
+            if not cand:
+                self.explored_map = self.map_target       # hunt() warps to the map with the most goldens left
+                # (2026-10-14) the whole map was searched in the last GI_SEARCH_AGE s: the hunters used to stand
+                # still here until the idle end (12:55, all three at the Noria map edge). Keep patrolling instead:
+                # the cells searched longest ago first, far ones before near ones.
+                me = self.cell(x, y)
+                for cx in range(n):
+                    for cy in range(n):
+                        if (cx, cy) == me or (cx, cy) in blocked:
+                            continue
+                        mx, my = cx * GI_SEARCH_CELL + GI_SEARCH_CELL // 2, cy * GI_SEARCH_CELL + GI_SEARCH_CELL // 2
+                        dd = math.hypot(mx - x, my - y)
+                        if dd <= GI_SIGHT:
+                            continue
+                        cand.append((self.grid.get((cx, cy), 0) - dd / 10, cx, cy, mx, my))
+                cand.sort()
+                if cand and now - getattr(self, "patrol_logged", 0) > 30:
+                    self.patrol_logged = now
+                    self.log("search: whole map searched recently -> patrolling the oldest-searched areas")
             pts = [[mx, my] for _, _, _, mx, my in cand[:12]]
-            ok = self.ev(WALKABLE_JS, pts) or []
+            ok = (self.ev(WALKABLE_JS, pts) or []) if pts else []
             for (dd, cx, cy, mx, my), w in zip(cand[:12], ok):
                 if w:
                     self.goal = tuple(w)
                     break
                 self.grid[(cx, cy)] = now                     # not walkable (wall / water)
+                blocked.add((cx, cy))
             if not self.goal:
                 return
             self.goal_best, self.goal_progress_at = 1e9, now
