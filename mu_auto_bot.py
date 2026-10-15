@@ -85,6 +85,7 @@ from playwright.sync_api import sync_playwright, Error as PWError
 import mu_group_bot as G
 import mu_bc as B
 import mu_gi as GI
+import mu_bb as BB
 import mu_chat as CH
 import mu_hub as HUB
 import roster as R
@@ -400,6 +401,8 @@ class Agent:
         self.wig_next = 0
         # Golden Invasion hunter (mu_gi.py): GI.GI_CHARS + every character with max stats (checked live)
         self.gi = GI.GoldenInvasion(self) if GI.GI_ENABLED else None
+        # Big Boss (mu_bb.py): every available character goes, one party of ours, back to normal after
+        self.bb = BB.BigBoss(self) if BB.BB_ENABLED else None
         # Chat replies to other players (mu_chat.py; dry run = log only, see CH.CHAT_SEND)
         self.chat = CH.ChatAgent(self, hub.chat) if getattr(hub, "chat", None) else None
 
@@ -430,7 +433,8 @@ class Agent:
                             break
                         self.log(f"error: {e!r}")
                         time.sleep(5)
-                    time.sleep((self.gi.sleep() if self.gi else None) or self.bc_sleep() or G.TICK)   # 4x/s during the invasion / inside BC
+                    time.sleep((self.bb.sleep() if self.bb else None) or (self.gi.sleep() if self.gi else None)
+                               or self.bc_sleep() or G.TICK)   # 4x/s during the invasion / inside BC
                 try:
                     ctx.close()
                 except Exception:
@@ -661,6 +665,9 @@ class Agent:
                 with hub.lock:
                     hub.pair_round.discard(self.name)    # my part of the pair's reset round is done
         self.read_bc_timer()                    # always: so switching BC on mid-hour works at once
+        if self.bb and self.bb.tick():          # Big Boss: drops everything else (not inside a Blood Castle)
+            self.publish()
+            return
         if self.gi and self.gi.tick():          # Golden Invasion (:49 -> :53) comes first
             self.publish()
             return
@@ -790,6 +797,8 @@ class Agent:
         c.rec.start()               # write down what you do while you play it (mu_recorder.py)
         if self.gi:
             self.gi.on_pause()          # the in-page fight loop must not fight while you play
+        if self.bb:
+            self.bb.on_pause()          # same for the Big Boss loop (it switches back on when you resume)
 
     def resume(self):
         self.paused = False
@@ -1193,6 +1202,8 @@ class Agent:
             why = "is busy with Blood Castle"
         elif L.get("mode") == "gi":
             why = "is hunting the Golden Invasion"
+        elif L.get("mode") == "bb":
+            why = "is at the Big Boss"
         elif not L.get("online"):
             self.leveler_off_since = self.leveler_off_since or now
             if now - self.leveler_off_since > PAIR_LEVELER_GRACE:
