@@ -6,11 +6,13 @@ Blood Castle ON ITS OWN. Uses the same accounts.json, ROUTE and spot data as mu_
 Leveling (each character, independently):
   * picks its leg of the ROUTE from its OWN level; /reset as soon as it reaches the reset level,
     then buys Zen Chests (same as the group bot).
-  * Entering a leg: if another of ours is already farming that leg, it goes to that character's
-    spot (the first one there is the "anchor" and decides spot switches). Otherwise it scouts the
-    spots alone and picks one.
-  * Parties: two of ours on the same leg of the route, same map, within PARTY_MEET_RADIUS tiles
-    party up (the higher level invites, only our own invites are accepted). A character with no party member near it
+  * Entering a leg (SOLO_OWN_SPOT): it scouts / takes a spot no other character of ours is on.
+    Only when every spot of the leg is taken does it go to the first one's spot (the "anchor", who
+    decides spot switches) and party with him; when a spot frees up it moves there. Two of ours
+    ending up on the same spot -> the one who came to the leg later moves on.
+    (SOLO_OWN_SPOT = False: the old way, everyone joins the first one on the leg.)
+  * Parties: two of ours on the same leg of the route (and the same spot with SOLO_OWN_SPOT), same map,
+    within PARTY_MEET_RADIUS tiles party up (the higher level invites, only our own invites are accepted). A character with no party member near it
     (PARTY_APART_RADIUS) for PARTY_APART_SEC leaves the party.
   * Strangers' party invites are accepted while leveling (LEVEL_ACCEPT_STRANGERS, not for pairs, only when
     not in a party). Once in, say LEVEL_AFK_TEXT once (at most every LEVEL_AFK_EVERY s); the party is
@@ -114,6 +116,10 @@ PARTY_THANKS_PARTY_CHAT = False # False = normal chat; True = party chat (~)
 PARTY_THANKS_MIN_GAP = 60       # at most once per this many seconds per character (kicked + re-invited...)
 
 # spot rules for a character on its own (the group bot's rules for the rest, see mu_group_bot.py)
+SOLO_OWN_SPOT       = True  # plain leveling (not pairs): each character takes a spot of its own on its leg of
+                            # the route; it joins (and parties with) another of ours only when every spot of the
+                            # leg is taken. A spot freeing up later -> the one sharing moves there (Juan 2026-10-15)
+SOLO_SPOT_CHECK     = 5     # seconds between "is someone of ours on my spot / did a spot free up" checks
 SOLO_DEATHS_TO_SWITCH = 3   # my deaths at one spot within DEATH_WINDOW_SEC -> switch (not on the best spot)
 
 # leveling pairs (after a grand reset a character can't kill anything: another one carries it)
@@ -374,6 +380,8 @@ class Agent:
         self.last_status = 0
         self.mode = "start"
         self.anchor_name = None
+        self.share_with = None       # SOLO_OWN_SPOT: every spot taken -> farming on this character's spot
+        self.solo_check = 0
         self.win_check = 0
         self.user_opened = False     # you restored this window by hand: keep_minimized leaves it open
         self.big = False             # window maximized for manual play (BIG_ON_PAUSE)
@@ -568,6 +576,7 @@ class Agent:
             "resets": s.get("resets"), "hp": s.get("hp"), "party": list(s.get("party") or []),
             "step": self.step_key, "spot": None if self.scouting else self.spot_idx,
             "scouting": self.scouting, "step_since": self.step_since, "arrived": self.arrived,
+            "share_with": self.share_with,
             "target": target, "rate": self.recent_rate(),
             "bc": self.bcs is not None,
             "bc_away": self.bcs is not None and self.bcs.get("phase") not in ("climb", "farm"), "boxes": self.boxes, "bag_free": self.bag_free,
@@ -840,6 +849,75 @@ class Agent:
                    if (p.get("step_since", 0), p["name"]) < (self.step_since, self.name)]
         return min(earlier, key=lambda p: (p.get("step_since", 0), p["name"])) if earlier else None
 
+    def taken_spots(self, snap=None):
+        """SOLO_OWN_SPOT: spots of my leg other characters of ours are on (pairs included, scouting
+        ones not): {spot index: [their info]}."""
+        snap = snap if snap is not None else self.hub.snapshot()
+        out = {}
+        for n, i in snap.items():
+            if n == self.name or not i.get("online") or i.get("paused") or i.get("mode") != "level":
+                continue
+            if i.get("step") != self.step_key or i.get("spot") is None:
+                continue
+            out.setdefault(i["spot"], []).append(i)
+        return out
+
+    def free_spots(self, spots, snap=None, with_bad=False):
+        """Spots of my leg nobody of ours is on, best known solo rate first (skipping the ones I
+        left recently unless with_bad)."""
+        now = time.time()
+        taken = self.taken_spots(snap)
+        order = [i for i in self.hub.stats.ranked(stats_alias(G.ROUTE[self.step_key][2], False), spots)
+                 if i not in taken]
+        if not with_bad:
+            order = [i for i in order if self.bad_until.get((self.step_key, i), 0) <= now]
+        return order
+
+    def share_anchor(self):
+        """SOLO_OWN_SPOT: the character whose spot I'm sharing (every spot was taken), if still there."""
+        if not self.share_with:
+            return None
+        p = next((p for p in self.peers_on_step() if p["name"] == self.share_with), None)
+        if p is None:
+            self.log(f"{self.share_with} left this leg -> picking a spot of my own")
+            self.share_with = None
+        return p
+
+    def own_spot_tick(self, alias, spots, snap):
+        """SOLO_OWN_SPOT, every SOLO_SPOT_CHECK s: sharing -> move to a spot that freed up; on my own
+        -> if another of ours is on my spot and came to the leg first, I move on (or share his spot
+        when there's nowhere else to go)."""
+        now = time.time()
+        if now - self.solo_check < SOLO_SPOT_CHECK or self.scouting:
+            return
+        self.solo_check = now
+        if self.share_with:
+            free = self.free_spots(spots, snap)
+            if free:
+                self.log(f"{alias}: spot {free[0] + 1} {spots[free[0]]} is free -> leaving "
+                         f"{self.share_with}'s spot for my own")
+                self.share_with = None
+                self.spot_idx = free[0]
+                self.new_spot()
+            return
+        here = self.taken_spots(snap).get(self.spot_idx) or []
+        first = [p for p in here if (p.get("step_since", 0), p["name"]) < (self.step_since, self.name)]
+        if not first:
+            return
+        who = min(first, key=lambda p: (p.get("step_since", 0), p["name"]))
+        free = self.free_spots(spots, snap) or self.free_spots(spots, snap, with_bad=True)
+        if free:
+            self.log(f"{alias}: {who['name']} is on spot {self.spot_idx + 1} too -> moving to spot "
+                     f"{free[0] + 1} {spots[free[0]]}")
+            self.spot_idx = free[0]
+            self.new_spot()
+            self.c.walk_target = None
+        elif not (who.get("assisted") or who.get("pair_lead")):
+            if who.get("share_with") and (snap.get(who["share_with"]) or {}).get("spot") == self.spot_idx:
+                who = snap[who["share_with"]]          # join the one who holds the spot, not another guest
+            self.share_with = who["name"]
+            self.log(f"{alias}: every spot is taken -> sharing {who['name']}'s spot (party)")
+
     def level_tick(self):
         c, s = self.c, self.c.s
         lvl = s.get("level") or 1
@@ -857,7 +935,7 @@ class Agent:
 
         def anchor_now():
             if not grp:
-                return self.find_anchor()
+                return self.share_anchor() if SOLO_OWN_SPOT else self.find_anchor()
             if not levelee:
                 return None                  # the leveler decides the pair's spot
             L = snap.get(grp[0]) or {}
@@ -872,11 +950,26 @@ class Agent:
             self.scouting = False
             self.spot_idx = self.hub.stats.ranked(stats_alias(alias, False), spots)[0]
             self.new_spot()
+            self.share_with = None
+            order = None
+            if SOLO_OWN_SPOT and not grp:
+                order = self.free_spots(spots, snap) or self.free_spots(spots, snap, with_bad=True)
+                if order:
+                    self.spot_idx = order[0]
+                    if len(order) < len(spots):
+                        self.log(f"{alias}: {len(spots) - len(order)} of {len(spots)} spots taken by ours "
+                                 f"-> looking for my own among the other {len(order)}")
+                else:
+                    first = self.find_anchor()
+                    if first:
+                        self.share_with = first["name"]
+                        self.log(f"{alias}: every spot is taken by ours -> sharing {first['name']}'s spot (party)")
+                    order = None
             anchor = anchor_now()
             if anchor:
                 self.log(f"{alias}: {anchor['name']} is already here -> going to the same spot")
-            elif G.SCOUT_ON_NEW_ZONE and len(spots) > 1 and not levelee:
-                self.start_scouting(alias, spots)
+            elif G.SCOUT_ON_NEW_ZONE and (len(order) if order else len(spots)) > 1 and not levelee:
+                self.start_scouting(alias, spots, order)
         anchor = anchor_now()
         self.anchor_name = anchor["name"] if anchor else None
         if anchor:
@@ -892,6 +985,15 @@ class Agent:
             if anchor.get("spot") is not None and anchor["spot"] != self.spot_idx:
                 self.spot_idx = anchor["spot"]
                 self.new_spot()
+        if SOLO_OWN_SPOT and not grp:
+            self.own_spot_tick(alias, spots, snap)
+            if not self.share_with:
+                anchor, self.anchor_name = None, None
+            elif anchor is None:
+                anchor = self.share_anchor()
+                self.anchor_name = anchor["name"] if anchor else None
+                if anchor and anchor.get("spot") is not None:
+                    self.spot_idx = anchor["spot"]
         step = G.spot_step(G.ROUTE[key], self.spot_idx)     # alias / map of THIS spot (Arena4 spots in the Arena3 leg)
 
         dead = (s.get("hp") or 0) <= 0
@@ -960,13 +1062,13 @@ class Agent:
         self.samples, self.stat_point, self.deaths = [], None, []
         self.arrived = False
 
-    def start_scouting(self, alias, spots):
+    def start_scouting(self, alias, spots, order=None):
         now = time.time()
-        order = self.hub.stats.ranked(stats_alias(alias, False), spots)
+        order = order or self.hub.stats.ranked(stats_alias(alias, False), spots)
         self.scouting = True
         self.scout = {"order": order, "i": 0, "seen": {}, "started": now, "arrived_at": None,
                       "best": 999.0, "progress_at": now}
-        self.log(f"SCOUTING {alias}: checking {len(spots)} spots for other players")
+        self.log(f"SCOUTING {alias}: checking {len(order)} spots for other players")
 
     def finish_scouting(self, alias, spots, reason):
         sc = self.scout
@@ -1036,6 +1138,12 @@ class Agent:
         now = time.time()
         self.bad_until[(self.step_key, self.spot_idx)] = now + G.BAD_SPOT_COOLDOWN
         order = [i for i in self.hub.stats.ranked(sa, spots) if i != self.spot_idx]
+        if SOLO_OWN_SPOT:
+            taken = self.taken_spots()
+            taken = {i for i, ps in taken.items()          # my levelees / characters sharing my spot follow me
+                     if any(p.get("share_with") != self.name and p.get("leveler") != self.name for p in ps)}
+            if any(i not in taken for i in order):
+                order = [i for i in order if i not in taken]
         free = [i for i in order if self.bad_until.get((self.step_key, i), 0) <= now]
         nxt = free[0] if free else min(order, key=lambda i: self.bad_until.get((self.step_key, i), 0))
         self.log(f"SPOT SWITCH ({reason}): {spots[self.spot_idx]} -> {spots[nxt]}")
@@ -1091,7 +1199,8 @@ class Agent:
             return self.switch_spot(f"{rate:.1f} lvl/min vs {best_other:.1f} known elsewhere", alias, spots, sa)
         best = ranked[0]
         if (best != self.spot_idx and now - self.spot_since >= G.RECHECK_MAIN_SEC
-                and self.bad_until.get((self.step_key, best), 0) <= now):
+                and self.bad_until.get((self.step_key, best), 0) <= now
+                and not (SOLO_OWN_SPOT and best in self.taken_spots())):
             self.log(f"SPOT SWITCH (re-checking best spot): {spots[self.spot_idx]} -> {spots[best]}")
             self.spot_idx = best
             self.new_spot()
@@ -1368,6 +1477,8 @@ class Agent:
                 o = snap.get(n)
                 if n == self.name or not o or not o.get("online"):
                     continue
+                if SOLO_OWN_SPOT and not (o.get("step") == self.step_key and o.get("spot") == self.spot_idx):
+                    continue           # on a spot of his own: we don't party
                 if (o.get("hp") or 0) <= 0:
                     near = True        # dead / respawning: give him time to walk back
                 elif o.get("map") == s.get("map") and o.get("x") is not None and \
@@ -1395,6 +1506,8 @@ class Agent:
                 continue           # pairs keep their own party
             if o.get("step") != self.step_key:
                 continue           # different leg of the route: we won't farm together
+            if SOLO_OWN_SPOT and (o.get("spot") is None or o.get("spot") != self.spot_idx):
+                continue           # each on a spot of his own: no party
             if o.get("map") != s.get("map") or o.get("x") is None or \
                     math.hypot(o["x"] - s["x"], o["y"] - s["y"]) > PARTY_MEET_RADIUS:
                 continue
