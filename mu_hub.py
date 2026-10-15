@@ -17,6 +17,11 @@ Command line:
     python mu_hub.py serve   run only the server (no bot), for testing
     python mu_hub.py test    read hub.json, contact the hub, print what it knows
 Status page in a browser: http://<hub>:47300/?key=<key>
+
+Event switches (Juan 2026-10-15): Blood Castle / Golden Invasion / Treasure Hunt / Big Boss on-off live
+at the hub, so switching one on any machine (console key, or the buttons on the status page) switches
+it on every machine. The server keeps them in hub_flags.json (git-ignored), so a restart keeps them.
+A machine that can't reach the hub keeps its own switches and sends what it changed once it's back.
 """
 import html
 import json
@@ -25,6 +30,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -44,6 +50,12 @@ SHARE_FIELDS = ("online", "paused", "mode", "map", "x", "y", "level", "resets", 
 TRADE_IDLE_SEC = 30     # a trade session nobody synced for this long is dropped
 TRADE_ENDED_KEEP = 20   # an ended one stays visible this long (the other side must see "ended")
 SAMPLES_KEEP = 2000     # spot_stats samples the server remembers (other machines fetch the ones they miss)
+FLAGS_FILE = Path(__file__).with_name("hub_flags.json")
+FLAGS = {"bc": "Blood Castle", "gi": "Golden Invasion", "th": "Treasure Hunt", "bb": "Big Boss"}
+MODE_NAMES = {"level": "leveling", "bc": "Blood Castle", "gi": "Golden Invasion", "th": "Treasure Hunt",
+              "bb": "Big Boss", "trade": "box trade", "vault": "vault trip", "crystal": "Alquimista",
+              "reset": "reset", "shop": "Zen Chests", "paused": "paused", "offline": "offline",
+              "start": "starting", "wait": "waiting (bar)"}
 
 
 def load_config():
@@ -74,11 +86,49 @@ class HubState:
         self.samples = []       # [(seq, machine, key, levels, minutes)] spot_stats samples from every machine
         self.seq = 0
         self.trades = {}        # lead -> box trade session between machines (see trade())
+        self.flags, self.flags_meta, self.flags_ver = {}, {}, 0    # event switches (see set_flags)
+        try:
+            d = json.loads(FLAGS_FILE.read_text(encoding="utf-8"))
+            self.flags = {k: bool(v) for k, v in (d.get("flags") or {}).items() if k in FLAGS}
+            self.flags_meta = {k: {"by": m.get("by"), "at": 0} for k, m in (d.get("meta") or {}).items() if k in self.flags}
+            self.flags_ver = 1 if self.flags else 0
+        except (OSError, ValueError, AttributeError):
+            pass
 
-    def beat(self, machine, chars, addr, samples=None, since=None, epoch=None):
+    def set_flags(self, changes, by, adopt=False):
+        """Event switches. adopt=True: only the ones nobody has set yet (a machine's startup values).
+        Call with self.lock held."""
+        now, changed = time.time(), False
+        for k, v in (changes or {}).items():
+            if k not in FLAGS or v is None or (adopt and k in self.flags):
+                continue
+            v = bool(v)
+            if self.flags.get(k) != v or k not in self.flags:
+                self.flags[k] = v
+                self.flags_meta[k] = {"by": by, "at": now}
+                changed = True
+        if changed:
+            self.flags_ver += 1
+            try:
+                FLAGS_FILE.write_text(json.dumps({"flags": self.flags, "meta": {
+                    k: {"by": m.get("by")} for k, m in self.flags_meta.items()}}, indent=1), encoding="utf-8")
+            except OSError:
+                pass
+        return changed
+
+    def toggle(self, k, by):
+        with self.lock:
+            if k in FLAGS:
+                self.set_flags({k: not self.flags.get(k, False)}, by)
+
+    def beat(self, machine, chars, addr, samples=None, since=None, epoch=None, flags=None, set_flags=None):
         now = time.time()
         with self.lock:
-            self.machines[machine] = {"at": now, "chars": chars or {}, "addr": addr}
+            self.machines[machine] = {"at": now, "chars": chars or {}, "addr": addr, "flags": flags or {}}
+            if set_flags:                       # switched on that machine (console key)
+                self.set_flags(set_flags, machine)
+            if flags:                           # nobody set these yet: that machine's startup values
+                self.set_flags(flags, f"{machine} (startup)", adopt=True)
             for smp in samples or []:
                 try:
                     key, levels, minutes = str(smp[0]), float(smp[1]), float(smp[2])
@@ -98,8 +148,12 @@ class HubState:
         now = now or time.time()
         self._expire(now)
         return {
-            "machines": {m: {"age": round(now - d["at"], 1), "addr": d["addr"], "chars": d["chars"]}
+            "machines": {m: {"age": round(now - d["at"], 1), "addr": d["addr"], "chars": d["chars"],
+                             "flags": d.get("flags") or {}}
                          for m, d in self.machines.items()},
+            "flags": dict(self.flags), "flags_ver": self.flags_ver,
+            "flags_meta": {k: {"by": m.get("by"), "ago": round(now - m["at"]) if m.get("at") else None}
+                           for k, m in self.flags_meta.items()},
             "claims": {k: {"owner": c["owner"], "machine": c["machine"], "left": round(c["until"] - now)}
                        for k, c in self.claims.items()},
             "trades": {l: {"alt": t["alt"], "machine": t["machine"], "age": round(now - t["at"], 1),
@@ -167,23 +221,81 @@ class HubState:
             return {"ok": False, "owner": c["owner"] if c else None}
 
 
-def _status_html(v):
+def _ago(sec):
+    if sec is None:
+        return "before the last restart"
+    sec = int(sec)
+    return f"{sec} s ago" if sec < 90 else f"{sec // 60} min ago" if sec < 5400 else f"{sec // 3600} h ago"
+
+
+def _status_html(v, key=""):
+    e = lambda x: html.escape("" if x is None else str(x))
+    q = f"?key={urllib.parse.quote(key)}" if key else ""
+    machines = sorted(v["machines"].items())
+    # event switches
+    sw = []
+    for k, label in FLAGS.items():
+        on = v["flags"].get(k)
+        meta = (v.get("flags_meta") or {}).get(k) or {}
+        state = "<b class=on>ON</b>" if on else "<b class=off>OFF</b>" if on is not None else "<i>not set</i>"
+        local = []
+        for m, d in machines:
+            lv = (d.get("flags") or {}).get(k)
+            ok = lv is None or lv == on
+            local.append(f"<td class={'ok' if ok else 'bad'}>{'on' if lv else 'off' if lv is not None else '?'}"
+                         f"{'' if ok else ' (not synced yet)'}</td>")
+        who = f"{e(meta.get('by'))}, {_ago(meta.get('ago'))}" if meta.get("by") else ""
+        btn = (f"<form method=post action='/toggle{q}{'&' if q else '?'}f={k}'>"
+               f"<button>{'switch OFF' if on else 'switch ON'}</button></form>")
+        sw.append(f"<tr><td>{e(label)}</td><td>{state}</td><td>{who}</td>{''.join(local)}<td>{btn}</td></tr>")
+    sw_head = "".join(f"<th>{e(m)} sees" for m, _ in machines)
+    # what everyone is doing
+    counts = {}
     rows = []
-    for m, d in sorted(v["machines"].items()):
+    for m, d in machines:
         for n, c in sorted(d["chars"].items()):
-            rows.append("<tr>" + "".join(f"<td>{html.escape(str(x))}</td>" for x in (
-                m, n, c.get("level"), c.get("resets"), c.get("mode"), c.get("map"),
-                f"{c.get('x')},{c.get('y')}", c.get("hp"), c.get("bc_tier") or "", f"{d['age']} s")) + "</tr>")
-    claims = "".join(f"<tr><td>{html.escape(k)}</td><td>{html.escape(str(c['owner']))}</td>"
-                     f"<td>{html.escape(str(c['machine']))}</td><td>{c['left']} s</td></tr>"
+            mode = c.get("mode") or "?"
+            if c.get("paused"):
+                mode = "paused"
+            counts[mode] = counts.get(mode, 0) + 1
+            extra = []
+            if c.get("bc_tier"):
+                extra.append(f"BC{c['bc_tier']} {c.get('bc_role') or ''}".strip())
+            if c.get("gi_hunter"):
+                extra.append("GI hunter")
+            if c.get("assisted"):
+                extra.append(f"carried by {c.get('leveler')}")
+            if c.get("share_with"):
+                extra.append(f"sharing {c['share_with']}'s spot")
+            boxes = f"{c.get('boxes') or 0}" + (f" ({c.get('boxes5')} +5)" if c.get("boxes5") else "")
+            rows.append("<tr>" + "".join(f"<td>{x}</td>" for x in (
+                e(m), f"<b>{e(n)}</b>", f"<span class=m-{e(mode)}>{e(MODE_NAMES.get(mode, mode))}</span>",
+                e(", ".join(extra)), e(c.get("level")), e(c.get("resets")), e(c.get("map")),
+                f"{e(c.get('x'))},{e(c.get('y'))}", e(c.get("hp")), e(boxes),
+                e(c.get("bag_free") if c.get("bag_free") is not None else ""), f"{d['age']} s")) + "</tr>")
+    summary = " · ".join(f"{e(MODE_NAMES.get(k, k))}: {n}" for k, n in sorted(counts.items(), key=lambda x: -x[1]))
+    claims = "".join(f"<tr><td>{e(k)}</td><td>{e(c['owner'])}</td>"
+                     f"<td>{e(c['machine'])}</td><td>{c['left']} s</td></tr>"
                      for k, c in sorted(v["claims"].items()))
+    trades = "".join(f"<tr><td>{e(t['alt'])} → {e(l)}</td><td>{e(t['machine'])}</td>"
+                     f"<td>{'ended: ' + e((t.get('ended') or {}).get('why')) if t.get('ended') else 'live'}</td>"
+                     f"<td>{t['age']} s</td></tr>" for l, t in sorted((v.get("trades") or {}).items()))
+    mach = " · ".join(f"{e(m)} ({e(d['addr'])}, heard {d['age']} s ago)" for m, d in machines) or "none"
     return f"""<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=5>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>MU hub</title>
 <style>body{{font:14px system-ui;margin:16px;background:#111;color:#ddd}}table{{border-collapse:collapse;margin-bottom:18px}}
-td,th{{border:1px solid #444;padding:4px 8px;text-align:left}}th{{background:#222}}</style>
-<h3>Characters</h3><table><tr><th>machine<th>name<th>lvl<th>resets<th>mode<th>map<th>pos<th>hp<th>BC<th>heard</tr>{''.join(rows)}</table>
+td,th{{border:1px solid #444;padding:4px 8px;text-align:left}}th{{background:#222}}
+.on{{color:#4c4}}.off{{color:#e55}}.bad{{color:#fa3}}.ok{{color:#999}}form{{margin:0}}
+button{{font:inherit;padding:3px 10px;cursor:pointer}}
+.m-bc,.m-gi,.m-th,.m-bb{{color:#fc5;font-weight:bold}}.m-paused,.m-offline{{color:#888}}.m-level{{color:#8cf}}
+.wrap{{overflow-x:auto}}</style>
+<h3>Events (shared by every machine)</h3>
+<div class=wrap><table><tr><th>event<th>state<th>last switched by{sw_head}<th></tr>{''.join(sw)}</table></div>
+<h3>Characters</h3><p>{summary or 'no characters'}</p>
+<div class=wrap><table><tr><th>machine<th>name<th>doing<th>details<th>lvl<th>resets<th>map<th>pos<th>hp<th>boxes<th>bag free<th>heard</tr>{''.join(rows)}</table></div>
+<h3>Box trades between machines</h3><table><tr><th>who<th>machine<th>state<th>age</tr>{trades}</table>
 <h3>Claims</h3><table><tr><th>key<th>owner<th>machine<th>left</tr>{claims}</table>
-<p>uptime {v['uptime']} s</p>"""
+<p>machines: {mach} · hub up {_ago(v['uptime']).replace(' ago', '')}</p>"""
 
 
 def make_handler(state, key):
@@ -213,7 +325,7 @@ def make_handler(state, key):
             if path == "/status":
                 return self._send(200, state.view())
             if path == "/":
-                return self._send(200, _status_html(state.view()).encode(), "text/html; charset=utf-8")
+                return self._send(200, _status_html(state.view(), key or "").encode(), "text/html; charset=utf-8")
             self._send(404, {"error": "not found"})
 
         def do_POST(self):
@@ -221,14 +333,24 @@ def make_handler(state, key):
                 return self._send(403, {"error": "bad key"})
             try:
                 n = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(n) or b"{}")
+                raw = self.rfile.read(n) or b"{}"
+                body = {} if self.path.startswith("/toggle") else json.loads(raw)
             except (ValueError, OSError):
                 return self._send(400, {"error": "bad json"})
             path = self.path.split("?", 1)[0]
+            if path == "/toggle":                # button on the status page
+                qs = urllib.parse.parse_qs((self.path.split("?", 1) + [""])[1])
+                state.toggle((qs.get("f") or [""])[0], f"status page ({self.client_address[0]})")
+                self.send_response(303)
+                self.send_header("Location", "/" + (f"?key={urllib.parse.quote(key)}" if key else ""))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if path == "/beat":
                 return self._send(200, state.beat(str(body.get("machine")), body.get("chars"),
                                                   self.client_address[0], body.get("samples"),
-                                                  body.get("since"), body.get("epoch")))
+                                                  body.get("since"), body.get("epoch"),
+                                                  body.get("flags"), body.get("set_flags")))
             if path == "/claim":
                 return self._send(200, state.claim(str(body.get("key")), body.get("owner"),
                                                    body.get("machine"), body.get("ttl")))
@@ -289,6 +411,10 @@ class HubLink:
         self.since, self.epoch = None, None   # last sample number / server epoch received
         self.on_samples = None     # callback(key, levels, minutes) for samples from other machines
         self.samples_in = 0
+        self.flags_fn = None       # () -> this machine's switches {"bc": bool, ...}
+        self.on_flags = None       # callback(changes {k: bool}, by) when the hub's switches differ from ours
+        self.flags_out = {}        # switched here, not yet confirmed by the hub
+        self.flags_ver = None
         self.stop = False
         self.server = start_server(cfg, log) if cfg.get("serve") else None
 
@@ -328,8 +454,15 @@ class HubLink:
     def beat(self):
         with self.lock:
             out, self.outbox = self.outbox, []
+            fout = dict(self.flags_out)
+        local = {}
+        if self.flags_fn:
+            try:
+                local = self.flags_fn() or {}
+            except Exception:
+                local = {}
         r = self._call("/beat", {"machine": self.machine, "chars": self.local_chars(), "samples": out,
-                                 "since": self.since, "epoch": self.epoch})
+                                 "since": self.since, "epoch": self.epoch, "flags": local, "set_flags": fout})
         if "_error" in r or "machines" not in r:
             if self.ok is not False:
                 err = r.get("_error") or r.get("error") or "bad answer"
@@ -347,6 +480,21 @@ class HubLink:
         self.ok = True
         with self.lock:
             self.view, self.view_at = r, time.monotonic()
+            for k, v in fout.items():                 # the hub has them now
+                if self.flags_out.get(k) == v:
+                    del self.flags_out[k]
+            pending = dict(self.flags_out)
+        hub_flags = r.get("flags") or {}
+        if self.on_flags and hub_flags:
+            diff = {k: v for k, v in hub_flags.items() if k in FLAGS and local.get(k) != v and k not in pending}
+            if diff:
+                meta = r.get("flags_meta") or {}
+                by = ", ".join(sorted({str((meta.get(k) or {}).get("by")) for k in diff}))
+                try:
+                    self.on_flags(diff, by)
+                except Exception as e:
+                    self.log(f"hub: applying switches {diff}: {e!r}")
+        self.flags_ver = r.get("flags_ver")
         self.since, self.epoch = r.get("seq", self.since), r.get("epoch", self.epoch)
         for q, key, levels, minutes in r.get("samples") or []:
             if self.on_samples:
@@ -393,6 +541,11 @@ class HubLink:
             return "hub: connected, no other machine online"
         return "hub: " + " | ".join(f"{n}@{c['machine']} lvl {c.get('level')} {c.get('mode')}" + (f" BC{c['bc_tier']}" if c.get("bc_tier") else "")
                                     for n, c in sorted(rem.items()))
+
+    def set_flag(self, k, value):
+        """Switched here (console key) -> to the hub with the next heartbeat (every BEAT_EVERY s)."""
+        with self.lock:
+            self.flags_out[k] = bool(value)
 
     def send_sample(self, key, levels, minutes):
         """A spot_stats measurement made here -> the other machines add it to theirs."""

@@ -1,0 +1,10 @@
+{"t": "2026-10-15T16:42:18", "map": "Devias", "map_idx": 2, "by": "cucaracha", "id": 1354, "x": 221, "y": 78, "d": 33, "event": "seen"}
+{"t": "2026-10-15T16:42:18", "map": "Devias", "map_idx": 2, "by": "bruto", "id": 1354, "x": 221, "y": 78, "d": 33, "event": "seen"}
+{"t": "2026-10-15T16:42:20", "map": "Devias", "map_idx": 2, "by": "bruto", "id": 1354, "x": 221, "y": 78, "event": "broken", "mine": false, "killer": 1286}
+{"t": "2026-10-15T16:42:20", "map": "Devias", "map_idx": 2, "by": "cucaracha", "id": 1354, "x": 221, "y": 78, "event": "broken", "mine": false, "killer": 1286}
+{"t": "2026-10-15T16:42:40", "map": "Devias", "map_idx": 2, "by": "wizzardo", "id": 1332, "x": 60, "y": 24, "d": 18, "event": "seen"}
+{"t": "2026-10-15T16:42:41", "map": "Devias", "map_idx": 2, "by": "bruto", "id": 1332, "x": 60, "y": 24, "d": 4, "event": "seen"}
+{"t": "2026-10-15T16:42:41", "map": "Devias", "map_idx": 2, "by": "wizzardo", "id": 1332, "x": 60, "y": 24, "event": "broken", "mine": false, "killer": 1336}
+{"t": "2026-10-15T16:42:41", "map": "Devias", "map_idx": 2, "by": "bruto", "id": 1332, "x": 60, "y": 24, "event": "broken", "mine": true}
+{"t": "2026-10-15T16:44:31", "map": "Devias", "map_idx": 2, "by": "wizzardo", "id": 1316, "x": 208, "y": 83, "d": 17, "event": "seen"}
+{"t": "2026-10-15T16:44:35", "map": "Devias", "map_idx": 2, "by": "wizzardo", "id": 1316, "x": 208, "y": 83, "event": "broken", "mine": true}

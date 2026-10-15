@@ -90,6 +90,7 @@ import mu_bc as B
 import mu_gi as GI
 import mu_bb as BB
 import mu_th as TH
+import mu_junk as JK
 import mu_chat as CH
 import mu_hub as HUB
 import roster as R
@@ -155,6 +156,10 @@ BB_AUTO             = False   # (Juan 2026-10-15: OFF by default) Big Boss on/of
 BB_TOGGLE_KEY       = "o"     # ... press O in the console to switch it live
 TH_AUTO             = True    # (Juan 2026-10-15) Treasure Hunt on/off AT STARTUP (mu_th.py, every 3 h at :40) ...
 TH_TOGGLE_KEY       = "t"     # ... press T in the console to switch it live
+GI_AUTO             = True    # Golden Invasion on/off AT STARTUP (mu_gi.py) ...
+GI_TOGGLE_KEY       = "g"     # ... press G in the console to switch it live
+# With a hub (hub.json), the switches live at the hub: B / G / T / O on ANY machine (or the buttons on the
+# hub's status page) switch that event on every machine, and a restart keeps them (Juan 2026-10-15).
 BC_TIERS            = B.BC_TIERS        # (castle, min lvl, max lvl): BC1 15-80 ... BC7 331-400
 BC_PLAN_SEC         = 900   # make the plan this long before the entry window opens
 BC_FARM_UNTIL_SEC   = 180   # holders keep farming until this long before the window opens (:57) ...
@@ -170,6 +175,10 @@ BC_WAIT_INVITE_SEC  = 8     # inside: after asking "party?", wait this long for 
 BC_ASK_PARTY_TEXT   = "party?"   # said once in normal chat when the first other player shows up ...
 BC_ASK_PARTY        = False      # ... only if True (Juan 2026-10-12: don't say it any more; we still wait, then invite)
 BC_WEAPON_TEXT      = ""       # stay quiet when the Archangel's weapon is picked up
+BC_LEAVE_STRANGER_WEAPON = True  # (Juan 2026-10-15) a player NOT in our party has the weapon -> no box for us:
+                                 # leave the castle right away (the /move gets the usual random 1-5 s wait).
+                                 # Only when the holder is identified by name; unknown holder -> rush as before.
+                                 # Logs: 5 of 5 named non-party holders -> no box; the 3 boxes all had an unknown holder.
                                             # (Juan 2026-10-12); "" = off
 BC_INVITE_EVERY     = 10    # seconds between invites to the same player
 BC_SHOW_WINDOW_AFTER = 2    # entry dialog not found this many times -> restore the window so you can click
@@ -450,6 +459,7 @@ class Hub:
         self.bc_on = BC_AUTO         # B in the console switches Blood Castle on/off
         self.bb_on = BB_AUTO         # O in the console switches the Big Boss on/off
         self.th_on = TH_AUTO         # T in the console switches the Treasure Hunt on/off
+        self.gi_on = GI_AUTO         # G in the console switches the Golden Invasion on/off
         self.stop = False
 
     def put(self, name, d):
@@ -542,6 +552,8 @@ class Agent:
         self.bb = BB.BigBoss(self) if BB.BB_ENABLED else None
         # Treasure Hunt (mu_th.py): every available character patrols its slice of the map for the chest
         self.th = TH.TreasureHunt(self) if TH.TH_ENABLED else None
+        # Junk (mu_junk.py): drop non-excellent gear while leveling; crystallize excellents after each Treasure Hunt
+        self.junk = JK.Junk(self) if JK.JUNK_ENABLED else None
         # Chat replies to other players (mu_chat.py; dry run = log only, see CH.CHAT_SEND)
         self.chat = CH.ChatAgent(self, hub.chat) if getattr(hub, "chat", None) else None
 
@@ -821,6 +833,9 @@ class Agent:
         if self.bc_tick():
             self.publish()
             return
+        if self.junk and self.junk.tick():      # Alquimista trip (after a Treasure Hunt): before vault / trades
+            self.publish()
+            return
         if self.vault_tick():
             self.publish()
             return
@@ -864,6 +879,11 @@ class Agent:
                 self.status()
             return
         self.mode = "level"
+        if self.junk:
+            try:
+                self.junk.drop_tick()               # drop non-excellent / non-ancient gear at my feet
+            except Exception as e:
+                self.log(f"JUNK drop error: {e!r}")
         self.level_tick()
         self.publish()
         if now - self.party_check >= PARTY_EVERY:
@@ -1828,7 +1848,7 @@ class Agent:
                 return True
         if self.th and self.th.quiet():             # Treasure Hunt (:40): from TH_QUIET_SEC before until it's over
             return True
-        return GI.GI_ENABLED and 47 <= time.localtime().tm_min <= 54     # Golden Invasion (:50)
+        return GI.GI_ENABLED and self.hub.gi_on and 47 <= time.localtime().tm_min <= 54     # Golden Invasion (:50)
 
     def maybe_start_trade(self):
         """Juan 2026-10-15: a character with TRADE_MIN_PLUS5+ Boxes of Kundun +5 goes to the main
@@ -2928,6 +2948,29 @@ class Agent:
                    if (pm) name = (pm.name || '').trim(); }
       return {me: false, name}; }"""
 
+    def bc_stranger_has_weapon(self, b, holder):
+        """BC_LEAVE_STRANGER_WEAPON: True (and the castle is marked over for us) when the weapon holder is
+        identified by name and is not me / not in my party. Unknown holder -> False (keep rushing)."""
+        if b.get("holder_checked") == holder:
+            return False                                 # already known to be ours
+        who = self.ev(self.HOLDER_JS, holder) or {}
+        name = (who.get("name") or "").strip()
+        if who.get("me"):
+            b["holder_checked"] = holder
+            return False
+        if not name:
+            return False                                 # out of view / not identified: try again next tick
+        party = [n.strip().lower() for n in (self.c.s.get("party") or [])]
+        if name.lower() in party:
+            b["holder_checked"] = holder
+            self.log(f"BC: weapon held by {name} (our party) -> staying for the box")
+            return False
+        self.log(f"BC: weapon held by {name}, NOT in our party {self.c.s.get('party') or '[]'} "
+                 "-> no box for us, leaving the castle")
+        b["leave_now"] = True
+        b["end_at"], b["phase"] = time.time(), "end"
+        return True
+
     def bc_weapon_shout(self, b, holder):
         """Once per castle: the weapon was just picked up by us or one of our party -> say BC_WEAPON_TEXT."""
         if not BC_WEAPON_TEXT or holder in (None, 255) or b.get("weapon_shout"):
@@ -3165,6 +3208,9 @@ class Agent:
                 self.log("BC: delivering the weapon to the Archangel")
                 self.ev(B.TALK_NPC_JS, B.ARCHANGEL_NPC)
             return True
+        if (BC_LEAVE_STRANGER_WEAPON and holder not in (None, 255) and not b.get("pick_try")
+                and self.bc_stranger_has_weapon(b, holder)):
+            return True                                   # end phase from the next tick: /move out, no box wait
         if holder not in (None, 255) and not b["rush"] and not b.get("pick_try"):
             b["rush"] = True
             self.log("BC: another player has the weapon -> back to the Archangel")
@@ -3300,7 +3346,7 @@ class Agent:
             if since_end >= t and t not in b.setdefault("ui_closed", set()):
                 b["ui_closed"].add(t)
                 self.close_dialogs(b, f"{t}s after the end")
-        if in_bc(s.get("map")) and not b["box"] and since_end < B.END_WAIT_SEC:
+        if in_bc(s.get("map")) and not b["box"] and since_end < B.END_WAIT_SEC and not b.get("leave_now"):
             if not self.go(s.get("map"), "", *B.ARCHANGEL, radius=4):
                 # still on the way back (far up the corridor when someone else delivered):
                 # keep walking - boxes are only in range near the Archangel
@@ -3498,6 +3544,29 @@ def coordinator(hub, agents):
         + (f" | keep leveling (re-checked every {BC_REPLAN_EVERY}s): {', '.join(rest)}" if rest else ""))
 
 
+EVENT_KEYS = {BC_TOGGLE_KEY: "bc", GI_TOGGLE_KEY: "gi", TH_TOGGLE_KEY: "th", BB_TOGGLE_KEY: "bb"}
+EVENT_TEXT = {
+    "bc": ("BLOOD CASTLE", "OFF (anyone already inside finishes that castle; nobody else goes)"),
+    "gi": ("GOLDEN INVASION", "OFF (anyone hunting stops, /pkclear if needed, and goes back to normal)"),
+    "th": ("TREASURE HUNT", "OFF (anyone hunting stops and goes back to normal; no reset hold)"),
+    "bb": ("BIG BOSS", "OFF (anyone at the boss stops and goes back to normal; no reset hold)"),
+}
+
+
+def switch_event(hub, ev, on, by=None):
+    """Event switch. by=None: switched here (console key) -> also to the hub, so every machine follows.
+    by="<machine>": the hub says so (switched on another machine / the status page)."""
+    on = bool(on)
+    if getattr(hub, ev + "_on") == on:
+        return
+    setattr(hub, ev + "_on", on)
+    name, off = EVENT_TEXT[ev]
+    src = f" (switched by {by})" if by else (" (every machine follows)" if hub.link else "")
+    log(f"=== {name} " + ("ON" if on else off) + src + " ===")
+    if by is None and hub.link:
+        hub.link.set_flag(ev, on)
+
+
 def read_keys(hub, agents):
     """P = pause/resume everyone, 1..5 = one character. A PAUSE file pauses everyone."""
     try:
@@ -3513,18 +3582,9 @@ def read_keys(hub, agents):
                 else:
                     log("R pressed, but this bot was not started by the supervisor -> "
                         "close it and start run_auto.sh to get restarts")
-            elif k == BC_TOGGLE_KEY:
-                hub.bc_on = not hub.bc_on
-                log("=== BLOOD CASTLE " + ("ON" if hub.bc_on else
-                    "OFF (anyone already inside finishes that castle; nobody else goes)") + " ===")
-            elif k == BB_TOGGLE_KEY:
-                hub.bb_on = not hub.bb_on
-                log("=== BIG BOSS " + ("ON" if hub.bb_on else
-                    "OFF (anyone at the boss stops and goes back to normal; no reset hold)") + " ===")
-            elif k == TH_TOGGLE_KEY:
-                hub.th_on = not hub.th_on
-                log("=== TREASURE HUNT " + ("ON" if hub.th_on else
-                    "OFF (anyone hunting stops and goes back to normal; no reset hold)") + " ===")
+            elif k in EVENT_KEYS:
+                ev = EVENT_KEYS[k]
+                switch_event(hub, ev, not getattr(hub, ev + "_on"))
             elif k == G.PAUSE_KEY:
                 if all(a.name in hub.paused for a in agents):
                     hub.paused.clear()
@@ -3580,6 +3640,9 @@ def main():
     if hub.link:                                # spot_stats measurements travel both ways
         hub.link.on_samples = hub.stats.apply_remote
         hub.stats.on_add = hub.link.send_sample
+        # event switches shared through the hub (B / G / T / O on any machine, or the status page)
+        hub.link.flags_fn = lambda: {ev: getattr(hub, ev + "_on") for ev in EVENT_TEXT}
+        hub.link.on_flags = lambda diff, by: [switch_event(hub, ev, on, by) for ev, on in diff.items()]
     if not hub.link:
         log("hub: no hub.json -> this machine runs alone")
     if CH.CHAT_ENABLED:
@@ -3595,8 +3658,10 @@ def main():
     log(f"Blood Castle is {'ON' if hub.bc_on else 'OFF'} (B in this window switches it)")
     log(f"Big Boss is {'ON' if hub.bb_on else 'OFF'} (O in this window switches it)")
     log(f"Treasure Hunt is {'ON' if hub.th_on else 'OFF'} (T in this window switches it)")
+    log(f"Golden Invasion is {'ON' if hub.gi_on else 'OFF'} (G in this window switches it)"
+        + (" | with the hub, these switches follow the hub (every machine, status page)" if hub.link else ""))
     log("Keys in this window: P = pause/resume everyone, B = Blood Castle on/off, O = Big Boss on/off, "
-        "T = Treasure Hunt on/off, R = restart now, "
+        "T = Treasure Hunt on/off, G = Golden Invasion on/off, R = restart now, "
         + ", ".join(f"{i + 1} = {a.name}" for i, a in enumerate(agents)) + " (pause/resume one)")
     last_summary = 0
     rc = EXIT_ALL_DEAD             # the loop ends by itself only when every character thread stopped

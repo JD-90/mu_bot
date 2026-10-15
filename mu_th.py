@@ -381,6 +381,9 @@ class TreasureHunt:
         v = getattr(a, "vault", None)
         if v and v.get("phase") not in (None, "go"):
             return "at the vault"
+        j = getattr(a, "junk", None)
+        if j and j.trip and j.trip.get("phase") not in ("go", "find"):
+            return "at the Alquimista"
         return None
 
     def bag_free(self):
@@ -687,6 +690,8 @@ class TreasureHunt:
             except Exception:
                 pass
         self.phase = "idle"
+        if getattr(a, "junk", None):
+            a.junk.hunt_over()                 # mu_junk: crystallize the excellents picked up (Juan 2026-10-15)
         if getattr(self, "showed", False):
             a.show_window = False
         a.step_key = None

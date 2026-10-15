@@ -172,7 +172,8 @@ GAME_OPTIONS = {
     "lootJewels": True,
     "lootExcellent": True,
     "lootAncient": True,
-    "lootHighLevel": True,
+    "lootHighLevel": False,     # (Juan 2026-10-15: non-excellent gear gets dropped by mu_junk; the helper
+                                # would pick a dropped +7 straight back up)
     "lootOther": False,         # ... except All other items
     "lootZen": 0,               # zen piles: off
     "hideEnteredGame": True,    # Game > Chat and alerts: hide "entered the game"

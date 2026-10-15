@@ -857,9 +857,13 @@ class GoldenInvasion:
                      + ("MAX: I hunt the Golden Invasion" if ok else f"not max ({GI_MIN_STAT}): no Golden Invasion"))
         self.max_stats = ok
 
+    def switched_on(self):
+        """hub.gi_on: G in the console / the hub page (shared by every machine through mu_hub)."""
+        return GI_ENABLED and bool(getattr(self.a.hub, "gi_on", True))
+
     def is_hunter(self):
         name = self.a.name.lower()
-        return GI_ENABLED and (name in GI_CHARS or bool(self.max_stats))
+        return self.switched_on() and (name in GI_CHARS or bool(self.max_stats))
 
     def eligible(self):
         a, s = self.a, self.c.s
@@ -882,6 +886,12 @@ class GoldenInvasion:
         """True while the Golden Invasion owns the character (the caller skips everything else)."""
         if not GI_ENABLED:
             return False
+        if not self.switched_on() and self.phase not in ("idle", "after"):
+            if self.phase == "hunt":
+                self.end_hunt("Golden Invasion switched off")     # -> "after" (/pkclear etc.), then idle
+                return True
+            self.ev(GI_SET_JS, False)
+            return self.finish("Golden Invasion switched off")
         if self.phase == "idle":
             self.check_stats()
             if not self.is_hunter():
