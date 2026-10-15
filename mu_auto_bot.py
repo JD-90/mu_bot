@@ -260,14 +260,25 @@ VAULT_STATE_JS = """
 """
 
 TRADE_YOURS_JS = """
-(minLvl) => { const it = Object.values(window.__eco.yourTradeItems || {}).filter(Boolean);
+([minLvl, cristal]) => { const it = Object.values(window.__eco.yourTradeItems || {}).filter(Boolean);
   const g = i => i.item || i;   // an item whose fields we can't read counts as a box (not as "other")
-  const other = i => g(i).group !== undefined && !(g(i).group === 14 && g(i).num === 11 && (g(i).lvl || 0) >= minLvl);
-  return {boxes: it.filter(i => !other(i)).length, other: it.filter(other).length}; }
+  const box = i => g(i).group === undefined || (g(i).group === 14 && g(i).num === 11 && (g(i).lvl || 0) >= minLvl);
+  const cr = i => !!cristal && g(i).group === cristal[0] && g(i).num === cristal[1];   // Cristales: only the main takes them
+  return {boxes: it.filter(box).length, crystals: it.filter(cr).length,
+          other: it.filter(i => !box(i) && !cr(i)).length}; }
+"""
+
+# bag slots of Cristal stacks (they ride along with the boxes to the main)
+CRYSTAL_SLOTS_JS = """
+([g, n]) => (window.__store.playerData.items || []).map((it, i) =>
+    (i >= 12 && i < 76 && it && it.group === g && it.num === n) ? i : -1).filter(i => i >= 0)
 """
 
 # alts give their Boxes of Kundun to the main character when they meet while leveling
 TRADE_BOXES         = True
+TRADE_CRYSTALS      = True    # (Juan 2026-10-15) a box trade with the MAIN (wizzardo) also hands him every Cristal
+                              # stack; never to anyone else (the vault keeper only gets boxes)
+CRYSTAL_ITEM        = (14, 31)
 TRADE_TO            = None  # character that receives the boxes; None = first account in accounts.json
 TRADE_MEET_RADIUS   = 15    # same map, this close, both leveling -> trade
 TRADE_NEAR          = 3     # the alt walks this close to the main (where he is leveling) and trades there
@@ -2239,11 +2250,13 @@ class Agent:
         if not st.get("open"):
             if t["phase"] == "confirm":
                 time.sleep(1)
-                left = len(self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or [])
-                self.boxes = left
+                boxes_left = len(self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or [])
+                self.boxes = boxes_left
+                left = boxes_left + len(self.give_crystal_slots(t))
                 before = t.get("before", t["n"])
                 if left < before:
-                    return self.trade_end(t, True, f"done, {before - left} box(es) given, {left} left")
+                    return self.trade_end(t, True, f"done, {before - left} item(s) given "
+                                                   f"({t.get('nc', 0)} of them Cristal stacks), {boxes_left} box(es) left")
                 # both confirmed and nothing moved: most likely his bag had no room
                 self.mark_lead_full(t)
                 return self.trade_end(t, False, "trade window closed, boxes still in my bag")
@@ -2259,13 +2272,19 @@ class Agent:
                 slots = self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or []
                 if not slots:
                     return self.trade_end(t, False, "no boxes in the bag any more")
-                t["before"] = len(slots)
+                cry = self.give_crystal_slots(t)
+                t["before"] = len(slots) + len(cry)
                 cap = t.get("lead_free")
-                if cap is not None and cap < len(slots):
-                    self.log(f"box trade: {t['lead']} has room for {cap} -> giving {cap} of {len(slots)}")
+                if cap is not None and cap < len(slots) + len(cry):
+                    self.log(f"box trade: {t['lead']} has room for {cap} -> giving {cap} of {len(slots) + len(cry)} "
+                             f"(boxes first)")
                     slots = slots[:max(1, cap)]
+                    cry = cry[:max(0, cap - len(slots))]
+                t["nc"] = len(cry)
+                slots = slots + cry
                 t["n"] = len(slots)
-                self.log(f"box trade: putting {len(slots)} box(es) in the trade window")
+                self.log(f"box trade: putting {len(slots) - len(cry)} box(es)"
+                         + (f" + {len(cry)} Cristal stack(s)" if cry else "") + " in the trade window")
                 for slot in slots:     # Inventory (0) -> my trade window (1)
                     for _ in range(8):
                         if not (self.ev(B.TRADE_STATE_JS) or {}).get("busy"):
@@ -2276,7 +2295,7 @@ class Agent:
                 self.trade_filled = True
                 t["filled_at"] = time.time()
                 return
-            # the safety check: confirm only when the MAIN sees exactly my boxes in his window
+            # the safety check: confirm only when the MAIN sees exactly my boxes (+ Cristales) in his window
             if st.get("mine", 0) >= t["n"] and t.get("lead_boxes", 0) >= t["n"]:
                 time.sleep(0.5)
                 self.log(f"box trade: {t['lead']} sees my {t['n']} box(es) -> confirming")
@@ -2288,6 +2307,12 @@ class Agent:
             return
         if t["phase"] == "confirm" and now - t["phase_at"] > 15:
             self.trade_end(t, False, f"{t['lead']} did not confirm")
+
+    def give_crystal_slots(self, t):
+        """Cristal stacks to hand over in this trade: all of them, but only to the main (TRADE_CRYSTALS)."""
+        if not TRADE_CRYSTALS or t["lead"] != self.hub.trade_to:
+            return []
+        return self.ev(CRYSTAL_SLOTS_JS, list(CRYSTAL_ITEM)) or []
 
     def mark_lead_full(self, t):
         """A trade that should have fit didn't go through: stop offering boxes to the main until
@@ -2320,12 +2345,14 @@ class Agent:
         if not st.get("open"):
             t["lead_open"], t["lead_boxes"] = False, 0
             return
-        box = self.ev(TRADE_YOURS_JS, B.KUNDUN_MIN_LVL) or {}
+        takes_cr = TRADE_CRYSTALS and self.name == self.hub.trade_to      # only the main takes Cristales
+        box = self.ev(TRADE_YOURS_JS, [B.KUNDUN_MIN_LVL, list(CRYSTAL_ITEM) if takes_cr else None]) or {}
         if box.get("other"):
-            self.log("box trade: something other than Kundun boxes in the window -> cancelling")
+            self.log("box trade: something other than Kundun boxes"
+                     + (" / Cristales" if takes_cr else "") + " in the window -> cancelling")
             self.ev("() => window.__eco.cancelTrade()")
             return self.trade_end(t, False, "unexpected items in the trade window")
-        t["lead_open"], t["lead_boxes"] = True, box.get("boxes", 0)
+        t["lead_open"], t["lead_boxes"] = True, box.get("boxes", 0) + box.get("crystals", 0)
         if t["phase"] == "confirm" and not st.get("myOk") and st.get("yours", 0) >= t["n"] and st.get("yourOk"):
             time.sleep(0.5)
             self.log(f"box trade: {st.get('yours')} box(es) in the window -> confirming")

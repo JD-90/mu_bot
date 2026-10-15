@@ -44,10 +44,10 @@ BB_ORDER         = ["wizzardo", "bruto", "cucaracha", "invalido", "mogulin"]   #
 BB_END_GRACE     = 10        # panel back to a countdown for this long (boss dead / gone) -> done (after the loot)
 BB_LOOT_SEC      = 5         # after the kill: spam pickups this long (Juan 2026-10-15: it's gone faster than that)
 BB_LIMIT_LOOT    = False     # (Juan 2026-10-15) take less of the pile (False = everyone grabs everything, as before):
-BB_LOOTERS       = 4         # ... only this many of our party loot each boss (picked from the boss's id + the party,
+BB_LOOTERS       = 5         # ... only this many of our party loot each boss (picked from the boss's id + the party,
                              #     so every machine agrees without talking); no party -> 3 in 5 chance
-BB_SKIP_CHANCE   = 0.2       # ... a looter ignores each item with this chance (decided once per item)
-BB_VALUABLE_ONLY = True      # ... only rings / pendants and Box of Kundun +5, nothing else
+BB_SKIP_CHANCE   = 0       # ... a looter ignores each item with this chance (decided once per item)
+BB_VALUABLE_ONLY = False      # ... only rings / pendants and Box of Kundun +5, nothing else
                              # (Space is not pressed while this is on: it would grab whatever is nearest)
 BB_SPACE_SPAM    = True      # also press Space while looting (Juan 2026-10-15) ...
 BB_SPACE_EVERY   = 0.1       # ... this often (s)
