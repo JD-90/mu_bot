@@ -730,7 +730,7 @@ WAIT_SPOT_JS = r"""
     }
   }
   out.sort((a, b) => b.score - a.score);     // prefer south-east (your Noria runs went that way)
-  return {spots: out.slice(0, 4), hereSafe: h ? safe(here[0], here[1]) : null, hereFlag: h ? w.getTerrainFlag(here[0], here[1]) : null};
+  return {spots: out.slice(0, 8), hereSafe: h ? safe(here[0], here[1]) : null, hereFlag: h ? w.getTerrainFlag(here[0], here[1]) : null};
 }
 """
 
@@ -1115,13 +1115,24 @@ class GoldenInvasion:
         return names
 
     def pick_pre_map(self):
-        """Where I wait before the start: hunters spread over GI_PRE_MAPS in accounts order."""
+        """Where I wait before the start: hunters spread over GI_PRE_MAPS in accounts order, each
+        taking the map with the fewest of ours so far. A hunter below DEVIAS_MIN_LEVEL can't go to
+        Devias: it takes the emptiest other map (it used to always fall back to Noria, landing on
+        top of whoever had Noria; 2026-10-15 15:49 wizzardo lvl 10 + bruto)."""
         hs = self.hunters()
-        i = hs.index(self.a.name) if self.a.name in hs else 0
-        m = GI_PRE_MAPS[i % len(GI_PRE_MAPS)]
-        if m == MAP_DEVIAS and (self.c.s.get("level") or 0) < DEVIAS_MIN_LEVEL:
-            m = MAP_NORIA
-        return m
+        if self.a.name not in hs:
+            hs = hs + [self.a.name]
+        snap = self.a.hub.snapshot()
+        used = {m: 0 for m in GI_PRE_MAPS}
+        for i, n in enumerate(hs):
+            lvl = (self.c.s.get("level") if n == self.a.name else (snap.get(n) or {}).get("level")) or 0
+            ok = [m for m in GI_PRE_MAPS if m != MAP_DEVIAS or lvl >= DEVIAS_MIN_LEVEL]
+            pref = GI_PRE_MAPS[i % len(GI_PRE_MAPS)]
+            m = min(ok, key=lambda mm: (used[mm], mm != pref, GI_PRE_MAPS.index(mm)))
+            used[m] += 1
+            if n == self.a.name:
+                return m
+        return MAP_NORIA
 
     def go_wait_spot(self):
         c, s = self.c, self.c.s
@@ -1140,9 +1151,19 @@ class GoldenInvasion:
                 self.wait_spot = (s.get("x"), s.get("y"))          # landed outside the safe zone: stay here
                 self.log(f"waiting in {MAP_NAMES[m]} at {self.wait_spot} (already outside the safe zone)")
             elif spots:
-                self.wait_spot = (spots[0]["x"], spots[0]["y"])
-                self.log(f"waiting in {MAP_NAMES[m]} at {self.wait_spot} ({spots[0]['edge']} tiles to the "
-                         f"safe-zone edge; town tile flag={r.get('hereFlag')})")
+                # our hunters waiting on the same map each take their own spot (GI_SPACING apart)
+                hub = self.a.hub
+                with hub.lock:
+                    taken = (getattr(hub, "gi_shared", None) or {}).setdefault("wait", {})
+                    others = [v for n, v in taken.items() if n != self.a.name and v[0] == m]
+                    free = [sp for sp in spots
+                            if all(math.hypot(sp["x"] - ox, sp["y"] - oy) >= GI_SPACING + 4 for _, ox, oy in others)]
+                    sp = free[0] if free else spots[len(others) % len(spots)]
+                    self.wait_spot = (sp["x"], sp["y"])
+                    taken[self.a.name] = (m, sp["x"], sp["y"])
+                self.log(f"waiting in {MAP_NAMES[m]} at {self.wait_spot} ({sp['edge']} tiles to the "
+                         f"safe-zone edge; town tile flag={r.get('hereFlag')}"
+                         + (f"; {len(others)} of ours already waiting here" if others else "") + ")")
             else:
                 self.wait_spot = (cx + 25, cy + 25)
                 self.log(f"could not read the safe zone in {MAP_NAMES[m]} (flag={r.get('hereFlag')}) -> "

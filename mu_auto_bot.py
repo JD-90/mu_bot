@@ -191,6 +191,13 @@ IDLE_WIGGLE_DOOR_SEC = 15       # Devias: stop wiggling and stand on the spot th
 # bar, Devias before the door) walk around instead: pick a random walkable SAFE-ZONE tile a few tiles
 # away, walk there, linger, pick another. Everyone used to bunch up on the bar / in front of the Spirit.
 IDLE_WANDER         = True
+# EXP watchdog (Juan 2026-10-15: bruto at Arena4 15:10-15:12 kept "casting" Twisting Slash with no
+# animation, hitting nothing, until moved by hand): helper on at the spot but the EXP doesn't move for
+# EXP_STALL_SEC -> clear the client's attack state, helper off, step a few tiles away, helper back on
+EXP_WATCH           = True
+EXP_STALL_SEC       = 45        # no EXP this long with the helper on -> unstick
+EXP_UNSTICK_STEP    = (2, 4)    # tiles to step away (random in this range)
+EXP_STALL_RELOAD    = 3         # this many unsticks in a row without EXP -> reload the page
 IDLE_WANDER_BAR     = 12        # Lorencia bar: wander up to this many tiles from the bar
 IDLE_WANDER_DEVIAS  = 8         # Devias: wander up to this many tiles from the Spirit of Archangel ...
 IDLE_WANDER_DEVIAS_MIN = 3      # ... but never closer than this to it (don't stand in front of him)
@@ -345,6 +352,29 @@ WANDER_PICK_JS = """
 """
 
 
+# EXP watchdog: what the client is busy with when the EXP stalls (logged), then clear its attack
+# state and switch off a leftover Blood Castle in-page loop
+EXP_STUCK_JS = """
+() => {
+  const w = window.__world, s = window.__store, h = w && w.playerEntity; if (!h) return null;
+  const p = h.transform.pos, G = window.__bcGrab;
+  let mobs = 0, near = null;
+  for (const e of (w.netObjsQuery ? w.netObjsQuery.entities : [])) {
+    if (!e.monsterAnimation || e.dying) continue;
+    const d = Math.hypot(e.transform.pos.x - p.x, e.transform.pos.z - p.z);
+    if (d <= 6) mobs++;
+    if (near === null || d < near) near = d;
+  }
+  const out = {mobs6: mobs, nearest: near === null ? null : Math.round(near * 10) / 10,
+               skill: s && s.currentSkill, attacking: !!w.attackTarget, castReq: !!w.castRequest,
+               bcLoop: !!(G && G.on)};
+  if (G && G.on) { G.on = false; G.tgt = null; G.id = null; }
+  w.attackTarget = null; w.castRequest = null; w.pickupTarget = null;
+  return out;
+}
+"""
+
+
 class SharedStats(G.SpotStats):
     """spot_stats.json shared by all threads. Party rates use the group bot's keys ("Arena2 47,83"),
     solo rates get their own ("Arena2/solo 47,83")."""
@@ -472,6 +502,9 @@ class Agent:
         self.big = False             # window maximized for manual play (BIG_ON_PAUSE)
         self.msgwin_at = 0
         self.helper_press_at = 0     # last non-blocking MU Helper key press (helper_async)
+        self.exp_seen = None         # EXP watchdog: (exp, level) last seen, when it last changed, unsticks in a row
+        self.exp_changed_at = 0
+        self.exp_unsticks = 0
         self.cap_fight = {}          # in-page fight loop while holding at the reset level (CAP_FIGHT)
         self.cap_armed = False       # armed it during this tick
         self.open_logged = None
@@ -1200,8 +1233,52 @@ class Agent:
         else:
             if self.cap_fight.get("grab_on"):
                 self.cap_fight_off(f"lvl {lvl}")
-            c.move_tick(step, follow=follow)
+            if not self.exp_watch(step, lvl):
+                c.move_tick(step, follow=follow)
         self.check_spot(step, spots, is_anchor=anchor is None and not levelee)
+
+    def exp_watch(self, step, lvl):
+        """Helper on at the spot but no EXP for EXP_STALL_SEC: the client got stuck on an attack the
+        server ignores (skill 'cast' with no animation). Clears the attack state, turns the helper off
+        and steps a few tiles away; move_tick then walks back and turns the helper on again.
+        True = handled this tick (skip move_tick)."""
+        c, s = self.c, self.c.s
+        now = time.time()
+        cur = (s.get("exp"), s.get("level"))
+        if cur != self.exp_seen:
+            if self.exp_seen is not None and self.exp_unsticks:
+                self.log(f"EXP moving again after {self.exp_unsticks} unstick(s)")
+            self.exp_seen, self.exp_changed_at, self.exp_unsticks = cur, now, 0
+            return False
+        cap = self.hub.reset_level or 400
+        on_spot = s.get("map") == step[3] and dist(s, step[4], step[5]) <= G.LEASH_RADIUS
+        if (not EXP_WATCH or not s.get("helper") or not on_spot or lvl >= cap
+                or (s.get("hp") or 0) <= 0 or self.paused):
+            self.exp_changed_at = now        # only count time spent farming with the helper on
+            return False
+        if now - self.exp_changed_at < EXP_STALL_SEC:
+            return False
+        self.exp_unsticks += 1
+        self.exp_changed_at = now
+        diag = self.ev(EXP_STUCK_JS) or {}
+        self.log(f"no EXP for {EXP_STALL_SEC}s with the helper on at ({s.get('x')},{s.get('y')}) -> unstick "
+                 f"#{self.exp_unsticks} | {diag}")
+        if self.exp_unsticks > EXP_STALL_RELOAD:
+            self.exp_unsticks = 0
+            c.reload_page(f"no EXP after {EXP_STALL_RELOAD} unsticks")
+            return True
+        c.set_helper(False)
+        x, y = s.get("x"), s.get("y")
+        if x is not None and y is not None:
+            d = random.randint(*EXP_UNSTICK_STEP)
+            cands = [(x + dx, y + dy) for dx in range(-d, d + 1) for dy in range(-d, d + 1)
+                     if max(abs(dx), abs(dy)) == d]
+            random.shuffle(cands)
+            for tx, ty in cands:
+                if self.ev(B.WALK_JS, [int(tx), int(ty)]):
+                    break
+        c.walk_target = None
+        return True
 
     def cap_fight_tick(self, step, lvl):
         """At the reset level the server keeps the MU Helper off until /reset (2026-10-14). A paired
