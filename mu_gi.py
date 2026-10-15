@@ -114,6 +114,10 @@ GI_CLOSE_DIST     = 1               # or small one) is about to die, walk to thi
 GI_CLOSE_ETA      = 5               # from there, so we stand on the box when it drops. "About to die" = this many
 GI_CLOSE_HP       = 0.15            # seconds left (from its HP bar) or HP under this fraction. Ice Storm hits the
 GI_CLOSE_STUCK_MS = 2000            # same from 1 tile; no progress walking for this long -> cast from where we are
+GI_SPAM_PICK_MS  = 300              # loot spam after a dragon dies: pickup request this often (was 50 ms: 12 refused
+                                    # pickups/s on a locked box -> server snapped bruto back 7x, 2026-10-15 18:54)
+GI_WALK_REPEAT_SEC = 1.5            # Python re-sends the same walk target at most this often (no re-path every tick)
+GI_CLOSE_REPATH_MS = 1200           # close-in: re-send the walk to the same tile at most this often (was 400 ms)
 GI_BIG_BOX_RADIUS = 10               # a free Box +5 this close is picked up BEFORE fighting players (Juan, 2026-10-12)
 GI_IGNORE_AFTER  = 20               # a target that got this many casts with <= 1 seen by the server ...
 GI_IGNORE_SEC    = 20               # ... is skipped this long (2026-10-11 23:50: 218 casts at the Noria gate, 1 seen)
@@ -510,7 +514,10 @@ GI_INSTALL_JS = r"""
     const defense = cfg.pvpMode !== 'attack';
     let target = null, why = '', pick = null;
     // 0. a free Box +5 close by: grab it before any fight (2026-10-11: two +5s lost while fighting players)
-    const bigBox = boxes.find(b => b.lvl >= 12 && (isSpammingLoot || (b.d <= cfg.bigBoxRadius && !G.boxFirstFail.has(b.e.netId) && !G.boxGaveUp.has(b.e.netId))));
+    // spam mode: any distance, and a box refused once is still retried until cfg.boxWait runs out (then given up)
+    const ffOk = b => { const ff = G.boxFirstFail.get(b.e.netId); return !ff || now - ff <= cfg.boxWait; };
+    const bigBox = boxes.find(b => b.lvl >= 12 && !G.boxGaveUp.has(b.e.netId) &&
+                     (isSpammingLoot ? ffOk(b) : (b.d <= cfg.bigBoxRadius && !G.boxFirstFail.has(b.e.netId))));
     
     if (isSpammingLoot && !bigBox) { 
       target = null; pick = null; why = 'rushing to dragon death location'; 
@@ -622,7 +629,7 @@ GI_INSTALL_JS = r"""
       w.castRequest = null; w.attackTarget = null;
       const t = G.closeTile(w, closeTo.p, me, cfg.closeDist);
       if (!t) { G.closeFail.add(closeTo.e.netId); G.closing = null; ev(`no free tile next to ${closeTo.name} -> casting from here`); }
-      else if (!G.closeTileXY || G.closeTileXY[0] !== t.x || G.closeTileXY[1] !== t.y || now - G.closeWalkAt > 400) {
+      else if (!G.closeTileXY || G.closeTileXY[0] !== t.x || G.closeTileXY[1] !== t.y || now - G.closeWalkAt > (cfg.closeRepathMs || 1200)) {
         G.closeTileXY = [t.x, t.y]; G.closeWalkAt = now;
         try {
           const mv = h.playerMoveTo, pf = h.pathfinding;
@@ -640,7 +647,7 @@ GI_INSTALL_JS = r"""
       }
     } else if (pick) {
       if (G.box !== pick.e.netId) { G.box = pick.e.netId; ev(`picking up Box +${pick.lvl - 7} (${Math.round(pick.d)} tiles)`); }
-      const pickDelay = (isSpammingLoot && pick.lvl >= 12) ? 50 : 250;
+      const pickDelay = (isSpammingLoot && pick.lvl >= 12) ? (cfg.spamPickMs || 300) : 250;
       if (now - G.lastPick > pickDelay) { G.lastPick = now; w.pickupTarget = pick.e; }
     } else {
       G.box = null;
@@ -942,9 +949,9 @@ class GoldenInvasion:
             a.show_window = True
 
     def cfg(self):
-        return {"version": 16, "close": GI_CLOSE, "closeDist": GI_CLOSE_DIST, "closeEta": GI_CLOSE_ETA, "closeHp": GI_CLOSE_HP, "closeStuckMs": GI_CLOSE_STUCK_MS, "clear": GI_CLEAR, "clearEta": GI_CLEAR_ETA, "clearMinEta": GI_CLEAR_MIN_ETA, "clearMax": GI_CLEAR_MAX, "clearKillMs": GI_CLEAR_KILL_SEC * 1000, "clearLeash": GI_CLEAR_LEASH, "potHp": GI_POT_HP, "castGap": GI_CAST_GAP_MS, "dragonLock": GI_DRAGON_LOCK, "areaHitRadius": GI_AREA_HIT_RADIUS, "areaHitMs": GI_AREA_HIT_MS, "pvpMode": GI_PVP_MODE, "bigBoxRadius": GI_BIG_BOX_RADIUS, "ignoreAfter": GI_IGNORE_AFTER, "ignoreMs": GI_IGNORE_SEC * 1000, "ours": list(getattr(self.a.hub, "friends", self.a.hub.names)), "skill": GI_SKILLS.get(self.a.name.lower(), 0), "potKey": GI_POTION_KEY,
+        return {"version": 17, "close": GI_CLOSE, "closeDist": GI_CLOSE_DIST, "closeEta": GI_CLOSE_ETA, "closeHp": GI_CLOSE_HP, "closeStuckMs": GI_CLOSE_STUCK_MS, "clear": GI_CLEAR, "clearEta": GI_CLEAR_ETA, "clearMinEta": GI_CLEAR_MIN_ETA, "clearMax": GI_CLEAR_MAX, "clearKillMs": GI_CLEAR_KILL_SEC * 1000, "clearLeash": GI_CLEAR_LEASH, "potHp": GI_POT_HP, "castGap": GI_CAST_GAP_MS, "dragonLock": GI_DRAGON_LOCK, "areaHitRadius": GI_AREA_HIT_RADIUS, "areaHitMs": GI_AREA_HIT_MS, "pvpMode": GI_PVP_MODE, "bigBoxRadius": GI_BIG_BOX_RADIUS, "ignoreAfter": GI_IGNORE_AFTER, "ignoreMs": GI_IGNORE_SEC * 1000, "ours": list(getattr(self.a.hub, "friends", self.a.hub.names)), "skill": GI_SKILLS.get(self.a.name.lower(), 0), "potKey": GI_POTION_KEY,
                 "potEvery": GI_POT_EVERY_MS, "hitWindow": GI_HIT_WINDOW_MS, "pvpRadius": GI_PVP_RADIUS,
-                "view": GI_VIEW, "boxWait": GI_BOX_WAIT_SEC * 1000, "loopMs": GI_LOOP_MS,
+                "view": GI_VIEW, "boxWait": GI_BOX_WAIT_SEC * 1000, "spamPickMs": GI_SPAM_PICK_MS, "closeRepathMs": GI_CLOSE_REPATH_MS, "loopMs": GI_LOOP_MS,
                 "barrierTries": GI_BARRIER_TRIES,
                 "buffs": [GI_BARRIER_SKILL, GI_FORTITUDE_SKILL] if GI_BARRIER else [],
                 "refreshSkill": GI_FORTITUDE_SKILL if GI_BARRIER else 0, "refreshMs": GI_FORTITUDE_REFRESH * 1000,
@@ -1404,16 +1411,18 @@ class GoldenInvasion:
         self.mark_seen(s, status)
         if self.call and status.get("mode") == "search":
             self.goal = None
-            self.ev(B.WALK_JS, [self.call["x"], self.call["y"]])
+            self.walk_once([self.call["x"], self.call["y"]], now)
             self.last_golden = now                        # walking to a dragon is not idle time
         elif status.get("mode") == "spam_loot":
             self.goal = None
             if status.get("spamPos"):
-                self.ev(B.WALK_JS, status.get("spamPos"))
+                self.walk_once(status.get("spamPos"), now)
             self.last_golden = now
         elif status.get("mode") == "search":
             self.share_pos(s)
-            if not self.keep_apart(s, now):
+            if status.get("big5") is not None:
+                self.search_step(s)                       # loot around: no spacing walk on top of the pickup
+            elif not self.keep_apart(s, now):
                 self.search_step(s)
         else:
             self.share_pos(s)
@@ -1455,6 +1464,15 @@ class GoldenInvasion:
         else:
             self.log(f"outlaw (state {hs}) after a kill -> /pkclear (try {self.pk_live_tries})")
         self.c.chat("/pkclear")
+
+    def walk_once(self, xy, now):
+        """WALK_JS, but the same target only every GI_WALK_REPEAT_SEC: re-sending a walk every tick makes the
+        client re-path from its own (interpolated) position and the server snaps us back (rubber-banding)."""
+        xy = [int(xy[0]), int(xy[1])]
+        if getattr(self, "walk_last", None) == xy and now - getattr(self, "walk_last_at", 0) < GI_WALK_REPEAT_SEC:
+            return
+        self.walk_last, self.walk_last_at = xy, now
+        self.ev(B.WALK_JS, xy)
 
     def leave_town(self, s, status):
         """Respawned (or wandered) into the Devias safe zone: warp to another Devias zone instead of walking out."""

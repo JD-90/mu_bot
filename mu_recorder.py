@@ -123,6 +123,13 @@ REC_JS = r"""
               const loud = /gold|invas|event|drop|item|kill|die|dead|death|notice|announce|message|chat|server|reward|exp|box|zen|money|monster/i.test(ev);
               if (first || (loud && (r.evLines[ev] = (r.evLines[ev] || 0) + 1) <= 30))
                 r.dom.push(`event ${first ? 'NEW ' : ''}${ev}: ${args.length ? payload(args[0]) : ''}`);
+              // server instant-moves (teleport / position snap-back): every one, with where the client thought we were
+              // (c1 08 15 <netId u16> <x> <y>; 2026-10-15: bruto got 7 in one minute = rubber-banding)
+              if (ev === 'ObjectMoved' && (r.evLines.__moved = (r.evLines.__moved || 0) + 1) <= 300) {
+                const hh = W.__world && W.__world.playerEntity;
+                const at = hh ? `(${Math.round(hh.transform.pos.x)},${Math.round(hh.transform.pos.z)})` : '?';
+                r.dom.push(`MOVED (server): ${args.length ? payload(args[0]) : ''} | me #${hh ? hh.netId : '?'} at ${at}`);
+              }
             }
           } catch (e) {}
           return orig(ev, ...args);
