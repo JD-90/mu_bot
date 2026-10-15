@@ -442,7 +442,7 @@ BAG_JS = """
 # anyone else: the selected skill, FIGHT_OTHER_RANGE. castRequest only (no attackTarget: that makes
 # the client chase the monster).
 # Python sets the goal + mode every tick, logs the events and a status line every FIGHT_LOG_SEC.
-GRAB_VERSION   = 7                   # v7 (2026-10-14): kill-phase zone at the bridge, no gate before the bridge drops,
+GRAB_VERSION   = 8                   # v7 (2026-10-14): kill-phase zone at the bridge, no gate before the bridge drops,
                                     # self-start at castle state 0, no buffs while just walking
 # Kill phase (Juan 2026-10-14): the bridge to the gate only drops once enough monsters are dead (castle
 # state 1 -> 4). Until then: no attacking the gate; clear monsters, never further than BRIDGE_ZONE_R tiles
@@ -700,7 +700,22 @@ BC_GRAB_JS = r"""
       if (meSafe !== !!G.wasSafe) { G.wasSafe = meSafe; if (meSafe) ev('in a safe zone: no fighting, walking out'); }
       // castle state straight from the packet hook (fresher than Python's tick)
       const S = W.__bcState, fresh = !!(S && S.t >= (c.stateSince || 0));
-      const killPhase = fresh ? (S.st === 0 || S.st === 1) : !!c.killPhase;
+      let killPhase = fresh ? (S.st === 0 || S.st === 1) : !!c.killPhase;
+      // v8 (2026-10-15, invalido BC6 11:05 on the Mac): the castle-state packet can stop coming (stuck at
+      // phase 1, kills 0/40) while the bridge is already down -> he farmed the bridge zone for minutes.
+      // The bridge is down when its tiles turn walkable (they weren't when the castle started) or when
+      // I've already been past the edge -> kill phase over, go for the gate.
+      if (killPhase && c.zone) {
+        const bx = c.zone[0], by = c.zone[1];
+        const bridgeWalk = !!(w.isWalkable && w.isWalkable(bx, by + 4) && w.isWalkable(bx, by + 6));
+        if (G.bridgeKey !== (c.stateSince || 0) + ':' + w.mapIndex) { G.bridgeKey = (c.stateSince || 0) + ':' + w.mapIndex; G.bridgeBase = bridgeWalk; G.bridgeDown = false; }
+        if (!G.bridgeDown && ((bridgeWalk && !G.bridgeBase) || p.z >= by + 4)) {
+          G.bridgeDown = true;
+          ev(`bridge is down (${p.z >= by + 4 ? 'I am past the edge' : 'its tiles turned walkable'}) while the castle state still says `
+             + `${fresh ? 'phase ' + S.st + ' (' + S.cur + '/' + S.max + ')' : 'kill phase'} -> going for the gate`);
+        }
+        if (G.bridgeDown) killPhase = false;
+      }
       // ── v7: waiting by the bridge: start the moment the castle state says it started (phase 0 =
       //    the barrier opens; we used to wait for phase 1, ~2 s later, + a Python tick) ──
       let goal = c.goal, mode = c.mode, goalR = c.goalR;
