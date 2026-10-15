@@ -43,7 +43,7 @@ BB_ENABLED       = True      # code switch; whether it runs is hub.bb_on (BB_AUT
 BB_ORDER         = ["wizzardo", "bruto", "cucaracha", "invalido", "mogulin"]   # each one's side of the boss
 BB_END_GRACE     = 10        # panel back to a countdown for this long (boss dead / gone) -> done (after the loot)
 BB_LOOT_SEC      = 5         # after the kill: spam pickups this long (Juan 2026-10-15: it's gone faster than that)
-BB_LIMIT_LOOT    = True      # (Juan 2026-10-15) take less of the pile (False = everyone grabs everything, as before):
+BB_LIMIT_LOOT    = False     # (Juan 2026-10-15) take less of the pile (False = everyone grabs everything, as before):
 BB_LOOTERS       = 4         # ... only this many of our party loot each boss (picked from the boss's id + the party,
                              #     so every machine agrees without talking); no party -> 3 in 5 chance
 BB_SKIP_CHANCE   = 0.2       # ... a looter ignores each item with this chance (decided once per item)
@@ -65,6 +65,8 @@ BB_CLOSE_DIST    = 1         # ... to this many tiles from it, on my side
 BB_CLOSE_STUCK_MS = 2000     # no progress walking for this long -> cast from where I am
 BB_PARTY_RADIUS  = 15        # ours this close to me (at the boss) take part in the party
 BB_INVITE_EVERY  = 4         # seconds between invites to the same character
+BB_MERGE_AFTER   = 4         # (Juan 2026-10-15) two parties of ours at the boss for this long -> the smaller one
+                             # disbands and joins the other (works without the hub: sizes from what's in view)
 BB_POT_HP        = 0.7       # potion (hotkey Q) when HP is under this fraction ...
 BB_POT_EVERY_MS  = 300       # ... at most this often
 BB_POTION_KEY    = 0         # item hotkey index: 0 = Q
@@ -661,6 +663,9 @@ class BigBoss:
         if s.get("partyRequest"):
             text = s.get("partyRequestText", "")
             who = next((n for n in friends if low(n) != low(a.name) and f'"{n}"' in text), None)
+            mi = getattr(self, "merge_into", None)
+            if who and mi and now < mi[1] and low(who) not in mi[0]:
+                who = None                     # joining the other party: not my old partner's invite
             if who and not in_party:
                 self.log(f"accepting {who}'s party invite")
                 self.ev("() => window.__social.partyRespond(true)")
@@ -675,11 +680,29 @@ class BigBoss:
             return
         mine = {low(n) for n in party}
         others = {n: self.party_of(n) for n in near if low(n) not in mine}
-        # two parties of ours here: a party of 2 joins a bigger one (one leave, no reshuffle)
-        if in_party and len(party) == 2:
-            bigger = [n for n, p in others.items() if len(p) > 2 and all(low(x) in ours_low for x in p)]
-            if bigger:
-                return a.leave_party(f"Big Boss: joining the bigger party of ours ({bigger[0]}'s)")
+        # two parties of ours here (2026-10-15: PC trio + Mac pair arrived in separate parties, the hub was
+        # offline): after BB_MERGE_AFTER s the smaller party leaves and joins the other one. The other
+        # party's size comes from the hub when known, else from how many of ours in view aren't in mine.
+        # Same size -> the party whose best BB_ORDER member comes later leaves. Both sides compute the same.
+        if in_party:
+            known = [p for p in others.values() if len(p) > 1 and all(low(x) in ours_low for x in p)]
+            other_size = max(len(p) for p in known) if known else len(others)
+            if other_size >= 2:
+                self.split_since = getattr(self, "split_since", None) or now
+                mine_best = min(order_index(n) for n in party)
+                other_best = min(order_index(n) for n in others)
+                leave = other_size > len(party) or (other_size == len(party) and other_best < mine_best)
+                if leave and now - self.split_since >= BB_MERGE_AFTER:
+                    self.split_since = None
+                    # for a while: only accept the other party's invite and don't invite anyone myself
+                    # (my old partner leaves too: we must not just re-form our pair)
+                    self.merge_into = ({low(n) for n in others}, now + 15)
+                    return a.leave_party(f"Big Boss: another party of ours here ({other_size} vs our {len(party)}: "
+                                         f"{', '.join(others)}) -> joining theirs")
+            else:
+                self.split_since = None
+        else:
+            self.split_since = None
         if not in_party and any(len(p) > 1 for p in others.values()):
             note = "waiting for an invite to the party of ours that's already here"
             if note != self.party_note:
@@ -688,6 +711,9 @@ class BigBoss:
             return
         if len(party) >= 5:
             return
+        mi = getattr(self, "merge_into", None)
+        if mi and now < mi[1] and not in_party:
+            return                             # waiting for the other party's invite
         # alone (first here) or already in a party of ours: invite ours here who aren't in a party
         for n, p in others.items():
             if len(p) > 1:
