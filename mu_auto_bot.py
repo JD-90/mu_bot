@@ -72,6 +72,7 @@ Pause: P pauses / resumes EVERY character. Keys 1-5 pause / resume ONE character
 Options: every account gets GAME_OPTIONS (mu_group_bot.py: W A S D, loot filter, FOV 60, 115%
        interface, sound off, hide "entered the game") and MU Helper on HELPER_KEY.
 """
+import json
 import math
 import os
 import random
@@ -120,6 +121,7 @@ SOLO_OWN_SPOT       = True  # plain leveling (not pairs): each character takes a
                             # the route; it joins (and parties with) another of ours only when every spot of the
                             # leg is taken. A spot freeing up later -> the one sharing moves there (Juan 2026-10-15)
 SOLO_SPOT_CHECK     = 5     # seconds between "is someone of ours on my spot / did a spot free up" checks
+SPOT_CLAIM_TTL      = 30    # mu_hub: a spot claim (renewed every SOLO_SPOT_CHECK) lapses this long after its holder left
 SOLO_DEATHS_TO_SWITCH = 3   # my deaths at one spot within DEATH_WINDOW_SEC -> switch (not on the best spot)
 
 # leveling pairs (after a grand reset a character can't kill anything: another one carries it)
@@ -240,6 +242,13 @@ TRADE_GIVEUP_SEC    = 3600  # ... it waits this long
 TRADE_MIN_FREE      = 1     # the main needs at least this many free bag cells, or nobody offers him boxes
 TRADE_FULL_SEC      = 7200  # a trade the main failed to take while his bag looked big enough -> treat him
                             # as full until his free space goes up (or this long passes)
+TRADE_MIN_PLUS5     = 4     # Juan 2026-10-15: with this many Boxes of Kundun +5 a character goes to the main
+                            # (wherever he levels, any machine) and gives him ALL its Kundun boxes (+1..+5)
+TRADE_PLUS5_LVL     = 12    # item level of a Box of Kundun +5
+TRADE_TRAVEL_SEC    = 180   # giving up on reaching the main after this long (then TRADE_RETRY_SEC)
+TRADE_REMOTE_LAG    = 6     # extra seconds of slack when the other side is on another machine (3 s heartbeat)
+WARP_MIN_LEVEL      = {m: min(f for f, _, _, mm, _ in G.ROUTE if mm == m) for m in {r[3] for r in G.ROUTE}}
+MAP_ALIAS           = {m: a for a, m in G.MAP_INDEX.items()}
 TRADE_BC_QUIET      = 180   # no new trades from BC_PLAN_SEC + this before a castle opens until the door closes
 
 # restarts (mu_supervisor.py)
@@ -289,10 +298,30 @@ class SharedStats(G.SpotStats):
     def __init__(self, path):
         super().__init__(path)
         self.lock = threading.Lock()
+        self.on_add = None           # mu_hub: send each measurement to the other machines
 
-    def add(self, *a):
+    def add(self, alias, spot, levels, minutes):
         with self.lock:
-            super().add(*a)
+            super().add(alias, spot, levels, minutes)
+        if self.on_add and minutes > 0 and levels >= 0:
+            try:
+                self.on_add(self.key(alias, spot), levels, minutes)
+            except Exception:
+                pass
+
+    def apply_remote(self, key, levels, minutes):
+        """A measurement made on another machine (same math as add(), not sent back)."""
+        if minutes <= 0 or levels < 0:
+            return
+        with self.lock:
+            d = self.data.setdefault(key, {"levels": 0.0, "minutes": 0.0})
+            keep = 0.5 ** (minutes / G.STATS_HALF_LIFE_MIN)
+            d["levels"] = d["levels"] * keep + levels
+            d["minutes"] = d["minutes"] * keep + minutes
+            try:
+                self.path.write_text(json.dumps(self.data, indent=1, sort_keys=True), encoding="utf-8")
+            except OSError:
+                pass
 
     def ranked(self, alias, spots):
         """Solo spots nobody has measured yet are ranked by the party data (only for the ORDER;
@@ -328,7 +357,7 @@ class Hub:
         self.open_at = None          # next Blood Castle entry window (epoch seconds)
         self.plan = None             # {"key", "open_at", "assign": {name: (tier, role)}, "started", "out"}
         self.trade = None            # box trade in progress: {"alt", "lead", "phase", "start", "phase_at", "n", ...}
-        self.trade_to = TRADE_TO or (names[0] if names else None)
+        self.trade_to = TRADE_TO or (R.NAMES[0] if R.NAMES else (names[0] if names else None))   # roster's first = wizzardo, on every machine
         self.lead_full = None        # {"free", "at"}: the main couldn't take boxes -> no trades until he has more room
         self.pair_round = set()      # paired characters that /reset now (the whole pair reached the reset level)
         self.pair_deaths = {}        # leveler -> [(time, name)] deaths of its levelees (for its spot switching)
@@ -381,6 +410,7 @@ class Agent:
         self.mode = "start"
         self.anchor_name = None
         self.share_with = None       # SOLO_OWN_SPOT: every spot taken -> farming on this character's spot
+        self.spot_claim = None       # mu_hub claim key of the spot I hold ("spot:<map>:<x>,<y>")
         self.solo_check = 0
         self.win_check = 0
         self.user_opened = False     # you restored this window by hand: keep_minimized leaves it open
@@ -397,6 +427,8 @@ class Agent:
         self.bag_keys_logged = False
         self.bag_low_logged = False
         self.boxes_at = 0
+        self.boxes5 = 0              # Boxes of Kundun +5 in the bag (checked with self.boxes)
+        self.trade_trip = None       # on the way to the main with boxes: {"since"}
         self.my_trade = None
         self.trade_next = 0
         self.trade_fails = 0
@@ -579,7 +611,7 @@ class Agent:
             "share_with": self.share_with,
             "target": target, "rate": self.recent_rate(),
             "bc": self.bcs is not None,
-            "bc_away": self.bcs is not None and self.bcs.get("phase") not in ("climb", "farm"), "boxes": self.boxes, "bag_free": self.bag_free,
+            "bc_away": self.bcs is not None and self.bcs.get("phase") not in ("climb", "farm"), "boxes": self.boxes, "boxes5": self.boxes5, "bag_free": self.bag_free,
             "assisted": self.assisted(), "leveler": self.leveler_name if self.assisted() else None,
             "pair_lead": bool(self.my_levelees()), "parked": self.pair_parked,
             "gi_hunter": bool(self.gi and self.gi.is_hunter()),
@@ -837,8 +869,73 @@ class Agent:
         self.log("=== RESUMED ===")
 
     # ── leveling ──
+    def remote_on_leg(self):
+        """Our characters on OTHER machines (mu_hub) leveling on, or heading to, a spot of my current
+        leg, matched by the spot's map + x,y (so a different ROUTE order there doesn't matter):
+        {name: info} with my leg's "step" / "spot" index ("spot" None while they scout)."""
+        link = self.hub.link
+        if not link or self.step_key is None:
+            return {}
+        leg = G.ROUTE[self.step_key]
+        spots = leg[4]
+        out = {}
+        for n, i in link.remote().items():
+            t = i.get("target")
+            if not i.get("online") or i.get("paused") or i.get("mode") != "level" or not t or len(t) < 3:
+                continue
+            idx = next((k for k, sp in enumerate(spots)
+                        if (getattr(sp, "map", leg[3]), sp[0], sp[1]) == (t[0], t[1], t[2])), None)
+            if idx is None:
+                continue
+            out[n] = dict(i, name=n, remote=True, step=self.step_key, target=tuple(t),
+                          spot=None if i.get("scouting") else idx,
+                          step_since=float("inf"))   # other clock: never "came first" (claims decide)
+        return out
+
+    def spot_key(self, idx=None):
+        """Hub claim key of a spot of my leg: "spot:<map>:<x>,<y>"."""
+        leg = G.ROUTE[self.step_key]
+        sp = leg[4][self.spot_idx if idx is None else idx]
+        return f"spot:{getattr(sp, 'map', leg[3])}:{sp[0]},{sp[1]}"
+
+    def spot_claim_tick(self, alias, spots):
+        """SOLO_OWN_SPOT across machines: hold a hub claim on my spot (renewed every check). A
+        character on another machine that claimed it first keeps it -> I move to a free spot, or
+        share his when every spot is taken. Same-machine conflicts stay with own_spot_tick's rule.
+        Returns True when I moved / started sharing."""
+        link = self.hub.link
+        if not link or not link.connected():
+            return False                       # alone (or hub offline): only this machine's rules
+        key = None if (self.share_with or self.scouting or self.step_key is None) else self.spot_key()
+        if self.spot_claim and self.spot_claim != key:
+            threading.Thread(target=link.release, args=(self.spot_claim, self.name), daemon=True).start()
+            self.spot_claim = None
+        if key is None:
+            return False
+        res = link.claim(key, self.name, SPOT_CLAIM_TTL)
+        if res is None:
+            return False                       # hub offline: only this machine's rules
+        if res.get("ok"):
+            self.spot_claim = key
+            return False
+        if res.get("machine") == link.machine:
+            return False                       # one of mine holds it: own_spot_tick decides
+        owner = res.get("owner")
+        free = [i for i in (self.free_spots(spots) or self.free_spots(spots, with_bad=True)) if i != self.spot_idx]
+        if free:
+            self.log(f"{alias}: {owner} ({res.get('machine')}) holds spot {self.spot_idx + 1} -> "
+                     f"moving to spot {free[0] + 1} {spots[free[0]]}")
+            self.spot_idx = free[0]
+            self.new_spot()
+            self.c.walk_target = None
+        else:
+            self.share_with = owner
+            self.log(f"{alias}: every spot is taken -> sharing {owner}'s spot ({res.get('machine')}, party)")
+        return True
+
     def peers_on_step(self):
         snap = self.hub.snapshot()
+        snap = {**self.remote_on_leg(), **snap}                         # + other machines (mu_hub)
         return [i for n, i in snap.items() if n != self.name and i.get("online") and i.get("mode") == "level"
                 and i.get("step") == self.step_key and not i.get("paused")
                 and not i.get("assisted") and not i.get("pair_lead")]   # pairs farm on their own
@@ -853,6 +950,7 @@ class Agent:
         """SOLO_OWN_SPOT: spots of my leg other characters of ours are on (pairs included, scouting
         ones not): {spot index: [their info]}."""
         snap = snap if snap is not None else self.hub.snapshot()
+        snap = {**self.remote_on_leg(), **snap}       # + our characters on other machines (mu_hub)
         out = {}
         for n, i in snap.items():
             if n == self.name or not i.get("online") or i.get("paused") or i.get("mode") != "level":
@@ -891,6 +989,8 @@ class Agent:
         if now - self.solo_check < SOLO_SPOT_CHECK or self.scouting:
             return
         self.solo_check = now
+        if self.spot_claim_tick(alias, spots):
+            return
         if self.share_with:
             free = self.free_spots(spots, snap)
             if free:
@@ -900,7 +1000,7 @@ class Agent:
                 self.spot_idx = free[0]
                 self.new_spot()
             return
-        here = self.taken_spots(snap).get(self.spot_idx) or []
+        here = [p for p in self.taken_spots(snap).get(self.spot_idx) or [] if not p.get("remote")]   # other machines: the claim decides
         first = [p for p in here if (p.get("step_since", 0), p["name"]) < (self.step_since, self.name)]
         if not first:
             return
@@ -960,7 +1060,7 @@ class Agent:
                         self.log(f"{alias}: {len(spots) - len(order)} of {len(spots)} spots taken by ours "
                                  f"-> looking for my own among the other {len(order)}")
                 else:
-                    first = self.find_anchor()
+                    first = self.find_anchor() or next(iter(self.peers_on_step()), None)   # (other machine's too)
                     if first:
                         self.share_with = first["name"]
                         self.log(f"{alias}: every spot is taken by ours -> sharing {first['name']}'s spot (party)")
@@ -1450,6 +1550,8 @@ class Agent:
         grp = self.pair_group(snap)
         if grp:
             return self.pair_party_tick(grp, snap)
+        if SOLO_OWN_SPOT:
+            snap = {**self.remote_on_leg(), **snap}  # sharing a spot with a character on another machine
 
         # invites: accept our own characters, and strangers (LEVEL_ACCEPT_STRANGERS), only when not in a party
         if s.get("partyRequest"):
@@ -1528,6 +1630,9 @@ class Agent:
             slots = self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL)
             if slots is not None:
                 self.boxes = len(slots)
+            plus5 = self.ev(B.KUNDUN_SLOTS_JS, TRADE_PLUS5_LVL)
+            if plus5 is not None:
+                self.boxes5 = len(plus5)
         return self.boxes
 
     def update_bag_free(self):
@@ -1564,48 +1669,109 @@ class Agent:
         return GI.GI_ENABLED and 47 <= time.localtime().tm_min <= 54     # Golden Invasion (:50)
 
     def maybe_start_trade(self):
+        """Juan 2026-10-15: a character with TRADE_MIN_PLUS5+ Boxes of Kundun +5 goes to the main
+        (TRADE_TO, any machine) wherever he is leveling and gives him all its Kundun boxes. Only
+        while both are leveling (events come first: Big Boss / GI / BC ticks run before this).
+        Returns the trade, "travel" while on the way, or None."""
         hub, c, s = self.hub, self.c, self.c.s
         now = time.time()
         lvl = s.get("level") or 0
         if self.bcs or now < self.trade_next or (s.get("hp") or 0) <= 0 or c.shop_pending \
                 or lvl >= (hub.reset_level or 10 ** 6) or s.get("x") is None:
-            return None
-        if self.boxes_count() <= 0 or self.trade_quiet():
-            return None
-        lead = hub.snapshot().get(hub.trade_to)
+            return self.trade_trip_end()
+        if self.boxes_count() <= 0 or self.boxes5 < TRADE_MIN_PLUS5 or self.trade_quiet():
+            return self.trade_trip_end()
+        if self.pair_group(hub.snapshot()):
+            return self.trade_trip_end()        # carrying / being carried: stays with the pair
+        lead, remote = self.peer_info(hub.trade_to)
         if not lead or not lead.get("online") or lead.get("paused") or lead.get("mode") != "level" \
-                or lead.get("bc") or (lead.get("hp") or 0) <= 0:
-            return None
-        if lead.get("map") != s.get("map") or lead.get("x") is None or \
-                math.hypot(lead["x"] - s["x"], lead["y"] - s["y"]) > TRADE_MEET_RADIUS:
-            return None
+                or lead.get("bc") or (lead.get("hp") or 0) <= 0 or lead.get("map") is None:
+            return self.trade_trip_end("{} is not leveling right now".format(hub.trade_to))
         free = lead.get("bag_free")
         if hub.lead_full or (free is not None and free < TRADE_MIN_FREE):
             if now - getattr(self, "full_logged", 0) > 1800:
                 self.full_logged = now
                 self.log(f"{hub.trade_to}'s bag is full ({free} free) -> keeping my {self.boxes} box(es) for now")
-            return None
+            return self.trade_trip_end()
+        if lead.get("map") != s.get("map") or lead.get("x") is None or \
+                math.hypot(lead["x"] - s["x"], lead["y"] - s["y"]) > TRADE_MEET_RADIUS:
+            return self.trade_travel(lead)
+        if remote:
+            link = hub.link
+            res = link.trade("start", hub.trade_to, self.name, fields={"n": self.boxes, "phase": "meet"}) if link else None
+            if not res or not res.get("ok"):
+                if res and res.get("alt"):
+                    self.log(f"{res['alt']} is already trading with {hub.trade_to} -> waiting")
+                return "travel" if self.trade_trip else None
         with hub.lock:
             if hub.trade is not None:
-                return None
+                return "travel" if self.trade_trip else None
             t = {"alt": self.name, "lead": hub.trade_to, "phase": "meet", "start": now, "phase_at": now,
-                 "n": self.boxes, "requests": 0, "ok": False, "lead_free": free}
+                 "n": self.boxes, "requests": 0, "ok": False, "lead_free": free, "remote": remote}
             hub.trade = t
-        self.log(f"met {hub.trade_to} with {self.boxes} Box(es) of Kundun -> trading right here")
+        self.trade_trip = None
+        self.log(f"met {hub.trade_to}{' (' + lead.get('machine', '') + ')' if remote else ''} with "
+                 f"{self.boxes} Box(es) of Kundun ({self.boxes5} +5) -> trading right here")
         return t
+
+    def peer_info(self, name):
+        """(info, remote?) of one of our characters: this machine's snapshot, else the hub's view."""
+        o = self.hub.snapshot().get(name)
+        if o is not None:
+            return o, False
+        link = self.hub.link
+        o = link.remote().get(name) if link else None
+        return (o, True) if o is not None else (None, False)
+
+    def trade_travel(self, lead):
+        """On the way to the main: /move to his map (if my level allows it) and walk up to him."""
+        now = time.time()
+        lvl = self.c.s.get("level") or 0
+        m = lead.get("map")
+        need = WARP_MIN_LEVEL.get(m)
+        alias = MAP_ALIAS.get(m)
+        if need is None or alias is None or lvl < need:
+            if now - getattr(self, "travel_logged", 0) > 600:
+                self.travel_logged = now
+                self.log(f"{self.boxes5} Box(es) +5 for {self.hub.trade_to}, but he is on map {m} "
+                         f"({alias or '?'}, needs lvl {need or '?'}) -> not reachable from lvl {lvl}, waiting")
+            return self.trade_trip_end()
+        if not self.trade_trip:
+            self.trade_trip = {"since": now}
+            self.log(f"{self.boxes5} Box(es) +5 ({self.boxes} Kundun in all) -> going to {self.hub.trade_to} "
+                     f"at {alias} ({lead.get('x')}, {lead.get('y')})")
+        elif now - self.trade_trip["since"] > TRADE_TRAVEL_SEC:
+            self.log(f"could not reach {self.hub.trade_to} in {TRADE_TRAVEL_SEC}s -> back to leveling, "
+                     f"next try in {TRADE_RETRY_SEC // 60} min")
+            self.trade_next = now + TRADE_RETRY_SEC
+            return self.trade_trip_end()
+        self.go(m, alias, int(lead["x"]), int(lead["y"]), radius=max(TRADE_NEAR, TRADE_MEET_RADIUS - 5))
+        return "travel"
+
+    def trade_trip_end(self, why=None):
+        if self.trade_trip:
+            if why:
+                self.log(f"stopped going to {self.hub.trade_to}: {why}")
+            self.trade_trip = None
+            self.c.walk_target = None          # leveling walks back to my spot
+        return None
 
     def trade_phase(self, t, phase):
         with self.hub.lock:
             if self.hub.trade is t:
                 t["phase"], t["phase_at"] = phase, time.time()
 
-    def trade_end(self, t, ok, why):
+    def trade_end(self, t, ok, why, tell=True):
         with self.hub.lock:
             if self.hub.trade is not t:
                 return
             self.hub.trade = None
             t["ok"] = ok
         self.log(f"box trade {t['alt']} -> {t['lead']}: {why}")
+        if t.get("remote") and tell and self.hub.link:     # the other machine's side sees it on its next sync
+            side = "alt" if self.name == t["alt"] else "lead"
+            threading.Thread(target=self.hub.link.trade, args=("end", t["lead"], t["alt"]),
+                             kwargs={"side": side, "ok": ok, "why": why}, daemon=True).start()
 
     def trade_cleanup(self, t):
         """My side after a trade ended (either side may have ended it)."""
@@ -1628,6 +1794,56 @@ class Agent:
                 self.trade_next = now + wait
                 self.log(f"box trade failed ({self.trade_fails} in a row) -> next try in {wait // 60} min")
 
+    def trade_sync(self, t):
+        """Box trade with a character on the other machine: post the fields my side owns, take the
+        other side's. False when the session is over (ended by the other side, gone, hub lost)."""
+        link = self.hub.link
+        side = "alt" if self.name == t["alt"] else "lead"
+        own = ("phase", "n", "requests") if side == "alt" else ("lead_open", "lead_boxes")
+        res = link.trade("sync", t["lead"], t["alt"], side=side, fields={k: t.get(k) for k in own}) if link else None
+        now = time.time()
+        if res is None:
+            t.setdefault("hub_lost", now)
+            if now - t["hub_lost"] > TRADE_OFFLINE_GRACE:
+                self.trade_end(t, False, "lost the hub", tell=False)
+                return False
+            return True
+        t.pop("hub_lost", None)
+        if res.get("gone") or res.get("ended"):
+            e = res.get("ended") or {}
+            with self.hub.lock:
+                if self.hub.trade is t:
+                    self.hub.trade = None
+                    t["ok"] = bool(e.get("ok"))
+            if self.name == t["lead"] or not e.get("by") == "alt":
+                self.log(f"box trade {t['alt']} -> {t['lead']}: {e.get('why') or 'session gone'}"
+                         + (f" (ended by {e['by']})" if e.get("by") else ""))
+            return False
+        other = res.get("lead_fields" if side == "alt" else "alt_fields") or {}
+        for k, v in other.items():
+            if side == "lead" and k == "phase" and v != t.get("phase"):
+                t["phase_at"] = now
+            t[k] = v
+        return True
+
+    def remote_trade_for_me(self):
+        """I'm the main: a giver on the other machine opened a trade session with me -> my mirror of it."""
+        link = self.hub.link
+        if not link or self.name != self.hub.trade_to:
+            return None
+        sess = link.trades().get(self.name)
+        if not sess or sess.get("ended") or sess.get("machine") == link.machine or (sess.get("age") or 0) > 10:
+            return None
+        now = time.time()
+        f = sess.get("alt_fields") or {}
+        with self.hub.lock:
+            if self.hub.trade is not None:
+                return None
+            t = {"alt": sess["alt"], "lead": self.name, "phase": f.get("phase", "meet"), "start": now,
+                 "phase_at": now, "n": f.get("n", 0), "requests": 0, "ok": False, "remote": True}
+            self.hub.trade = t
+        return t
+
     def trade_tick(self):
         """True while a box trade takes over this character (leveling paused)."""
         if not TRADE_BOXES:
@@ -1636,8 +1852,13 @@ class Agent:
         t = self.my_trade
         if t is None:
             t = hub.trade
+            if t is None and self.name == hub.trade_to:
+                t = self.remote_trade_for_me()
             if t is None and self.name != hub.trade_to:
                 t = self.maybe_start_trade()
+                if t == "travel":
+                    self.mode = "trade"
+                    return True
             if t is None or self.name not in (t["alt"], t["lead"]):
                 return False
             self.my_trade, self.trade_sent, self.trade_filled = t, 0, False
@@ -1645,21 +1866,27 @@ class Agent:
             self.c.walk_target = None
             if self.name == t["lead"]:
                 self.log(f"{t['alt']} has {t['n']} Box(es) of Kundun for me -> stopping here to trade")
+        if t.get("remote") and hub.trade is t and not self.trade_sync(t):
+            self.trade_cleanup(t)
+            return False
         if hub.trade is not t:
             self.trade_cleanup(t)
             return False
         now = time.time()
-        other = hub.snapshot().get(t["lead"] if self.name == t["alt"] else t["alt"]) or {}
+        other, _ = self.peer_info(t["lead"] if self.name == t["alt"] else t["alt"])
+        other = other or {}
         off_key = "off_" + self.name
         if other.get("online") and not other.get("paused"):
             t.pop(off_key, None)
         else:
             t.setdefault(off_key, now)      # a few seconds offline (map loading) is fine
+        grace = TRADE_OFFLINE_GRACE + (TRADE_REMOTE_LAG if t.get("remote") else 0)
         if self.bcs or other.get("bc"):
             self.trade_end(t, False, "Blood Castle comes first")
-        elif other.get("paused") or now - t.get(off_key, now) > TRADE_OFFLINE_GRACE:
+        elif other.get("paused") or now - t.get(off_key, now) > grace:
             self.trade_end(t, False, "the other character is offline / paused")
-        elif other.get("map") is not None and other.get("map") != self.c.s.get("map"):
+        elif other.get("map") is not None and other.get("map") != self.c.s.get("map") \
+                and now - t["start"] > (TRADE_REMOTE_LAG if t.get("remote") else 0):
             self.trade_end(t, False, "not on the same map any more")
         elif now - t["start"] > TRADE_TIMEOUT:
             self.trade_end(t, False, f"took more than {TRADE_TIMEOUT}s (phase {t['phase']})")
@@ -3035,6 +3262,9 @@ def main():
     hub = Hub(names)
     log(R.startup_line(names))
     hub.link = HUB.make_link(hub.snapshot, log)
+    if hub.link:                                # spot_stats measurements travel both ways
+        hub.link.on_samples = hub.stats.apply_remote
+        hub.stats.on_add = hub.link.send_sample
     if not hub.link:
         log("hub: no hub.json -> this machine runs alone")
     if CH.CHAT_ENABLED:

@@ -39,7 +39,11 @@ CLAIM_TTL_MAX = 3 * 3600
 # fields of Hub.snapshot() that go to the other machines (plain JSON, no internals)
 SHARE_FIELDS = ("online", "paused", "mode", "map", "x", "y", "level", "resets", "hp", "party",
                 "step", "spot", "target", "rate", "bc", "bc_away", "boxes", "bag_free",
-                "assisted", "leveler", "pair_lead", "gi_hunter", "bc_tier", "bc_role")
+                "assisted", "leveler", "pair_lead", "gi_hunter", "bc_tier", "bc_role",
+                "scouting", "share_with", "boxes5")
+TRADE_IDLE_SEC = 30     # a trade session nobody synced for this long is dropped
+TRADE_ENDED_KEEP = 20   # an ended one stays visible this long (the other side must see "ended")
+SAMPLES_KEEP = 2000     # spot_stats samples the server remembers (other machines fetch the ones they miss)
 
 
 def load_config():
@@ -66,12 +70,29 @@ class HubState:
         self.machines = {}      # machine -> {"at": t, "chars": {name: {...}}, "addr": ip}
         self.claims = {}        # key -> {"owner", "machine", "until", "at"}
         self.started = time.time()
+        self.epoch = f"{int(self.started)}"   # changes when the server restarts (sample numbers start over)
+        self.samples = []       # [(seq, machine, key, levels, minutes)] spot_stats samples from every machine
+        self.seq = 0
+        self.trades = {}        # lead -> box trade session between machines (see trade())
 
-    def beat(self, machine, chars, addr):
+    def beat(self, machine, chars, addr, samples=None, since=None, epoch=None):
         now = time.time()
         with self.lock:
             self.machines[machine] = {"at": now, "chars": chars or {}, "addr": addr}
-            return self.view(now)
+            for smp in samples or []:
+                try:
+                    key, levels, minutes = str(smp[0]), float(smp[1]), float(smp[2])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                self.seq += 1
+                self.samples.append((self.seq, machine, key, levels, minutes))
+            del self.samples[:-SAMPLES_KEEP]
+            v = self.view(now)
+            if epoch != self.epoch or since is None:
+                since = self.seq if since is None else 0   # first contact: only new samples; server restarted: all kept
+            v["samples"] = [[q, k, l, m] for q, mc, k, l, m in self.samples if q > since and mc != machine]
+            v["seq"], v["epoch"] = self.seq, self.epoch
+            return v
 
     def view(self, now=None):
         now = now or time.time()
@@ -81,12 +102,49 @@ class HubState:
                          for m, d in self.machines.items()},
             "claims": {k: {"owner": c["owner"], "machine": c["machine"], "left": round(c["until"] - now)}
                        for k, c in self.claims.items()},
+            "trades": {l: {"alt": t["alt"], "machine": t["machine"], "age": round(now - t["at"], 1),
+                           "ended": t["ended"], "alt_fields": t["alt_fields"]} for l, t in self.trades.items()},
             "uptime": round(now - self.started),
         }
 
     def _expire(self, now):
         for k in [k for k, c in self.claims.items() if c["until"] <= now]:
             del self.claims[k]
+        for k in [k for k, t in self.trades.items()
+                  if now - t["at"] > (TRADE_ENDED_KEEP if t["ended"] else TRADE_IDLE_SEC)]:
+            del self.trades[k]
+
+    def trade(self, body, machine):
+        """Box trade between characters on different machines. One session per receiver ("lead").
+        op start: the giver ("alt") opens it (refused while another giver's session is live);
+        op sync:  each side posts the fields it owns and gets the whole session back;
+        op end:   either side closes it (ok + why), the other side sees "ended" on its next sync."""
+        now = time.time()
+        op, lead, alt = body.get("op"), str(body.get("lead")), str(body.get("alt"))
+        with self.lock:
+            self._expire(now)
+            t = self.trades.get(lead)
+            if op == "start":
+                if t and not t["ended"] and t["alt"] != alt:
+                    return {"ok": False, "alt": t["alt"]}
+                t = self.trades[lead] = {"alt": alt, "lead": lead, "machine": machine, "at": now,
+                                         "ended": None, "alt_fields": dict(body.get("fields") or {}),
+                                         "lead_fields": {}}
+                return {"ok": True}
+            if not t or t["alt"] != alt:
+                return {"ok": False, "gone": True}
+            if op == "sync":
+                side = "alt_fields" if body.get("side") == "alt" else "lead_fields"
+                t[side].update(body.get("fields") or {})
+                if not t["ended"]:
+                    t["at"] = now
+                return {"ok": True, "ended": t["ended"], "alt_fields": t["alt_fields"], "lead_fields": t["lead_fields"]}
+            if op == "end":
+                if not t["ended"]:
+                    t["ended"] = {"ok": bool(body.get("ok")), "why": body.get("why"), "by": body.get("side")}
+                    t["at"] = now
+                return {"ok": True}
+        return {"ok": False, "error": "bad op"}
 
     def claim(self, key, owner, machine, ttl):
         """Take `key` for `owner` (or renew it). Refused while someone else holds it."""
@@ -169,10 +227,13 @@ def make_handler(state, key):
             path = self.path.split("?", 1)[0]
             if path == "/beat":
                 return self._send(200, state.beat(str(body.get("machine")), body.get("chars"),
-                                                  self.client_address[0]))
+                                                  self.client_address[0], body.get("samples"),
+                                                  body.get("since"), body.get("epoch")))
             if path == "/claim":
                 return self._send(200, state.claim(str(body.get("key")), body.get("owner"),
                                                    body.get("machine"), body.get("ttl")))
+            if path == "/trade":
+                return self._send(200, state.trade(body, body.get("machine")))
             if path == "/release":
                 return self._send(200, state.release(str(body.get("key")), body.get("owner")))
             self._send(404, {"error": "not found"})
@@ -224,6 +285,10 @@ class HubLink:
         self.ok = None             # None = never tried, True/False = last beat worked
         self.fail_since = None
         self.seen = set()          # remote characters already announced in the log
+        self.outbox = []           # spot_stats samples to send: [key, levels, minutes]
+        self.since, self.epoch = None, None   # last sample number / server epoch received
+        self.on_samples = None     # callback(key, levels, minutes) for samples from other machines
+        self.samples_in = 0
         self.stop = False
         self.server = start_server(cfg, log) if cfg.get("serve") else None
 
@@ -261,7 +326,10 @@ class HubLink:
         return out
 
     def beat(self):
-        r = self._call("/beat", {"machine": self.machine, "chars": self.local_chars()})
+        with self.lock:
+            out, self.outbox = self.outbox, []
+        r = self._call("/beat", {"machine": self.machine, "chars": self.local_chars(), "samples": out,
+                                 "since": self.since, "epoch": self.epoch})
         if "_error" in r or "machines" not in r:
             if self.ok is not False:
                 err = r.get("_error") or r.get("error") or "bad answer"
@@ -270,6 +338,8 @@ class HubLink:
                          f"-> carrying on alone, retrying every {BEAT_EVERY}s")
                 self.fail_since = time.monotonic()
             self.ok = False
+            with self.lock:                   # keep the samples for the next try (bounded)
+                self.outbox = (out + self.outbox)[-500:]
             return
         if self.ok is not True:
             others = [m for m in r["machines"] if m != self.machine]
@@ -277,6 +347,14 @@ class HubLink:
         self.ok = True
         with self.lock:
             self.view, self.view_at = r, time.monotonic()
+        self.since, self.epoch = r.get("seq", self.since), r.get("epoch", self.epoch)
+        for q, key, levels, minutes in r.get("samples") or []:
+            if self.on_samples:
+                try:
+                    self.on_samples(key, levels, minutes)
+                    self.samples_in += 1
+                except Exception as e:
+                    self.log(f"hub: spot sample {key}: {e!r}")
         for n in self.remote():
             if n not in self.seen:
                 self.seen.add(n)
@@ -316,6 +394,12 @@ class HubLink:
         return "hub: " + " | ".join(f"{n}@{c['machine']} lvl {c.get('level')} {c.get('mode')}" + (f" BC{c['bc_tier']}" if c.get("bc_tier") else "")
                                     for n, c in sorted(rem.items()))
 
+    def send_sample(self, key, levels, minutes):
+        """A spot_stats measurement made here -> the other machines add it to theirs."""
+        with self.lock:
+            self.outbox.append([key, round(levels, 3), round(minutes, 3)])
+            del self.outbox[:-500]
+
     # ── claims ──
     def claim(self, key, owner, ttl=60):
         """{"ok": True/False, "owner", "machine", "left"} or None when the hub is unreachable."""
@@ -325,6 +409,16 @@ class HubLink:
     def release(self, key, owner):
         r = self._call("/release", {"key": key, "owner": owner})
         return None if "_error" in r else r
+
+    def trade(self, op, lead, alt, **kw):
+        """Box trade session at the hub (see HubState.trade). None when the hub is unreachable."""
+        r = self._call("/trade", dict(kw, op=op, lead=lead, alt=alt, machine=self.machine))
+        return None if "_error" in r else r
+
+    def trades(self):
+        """Live sessions as of the last heartbeat: {lead: {"alt", "machine", "age", "ended", "alt_fields"}}."""
+        with self.lock:
+            return dict((self.view or {}).get("trades") or {})
 
     def claims(self):
         with self.lock:
