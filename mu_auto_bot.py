@@ -226,7 +226,8 @@ TRADE_FROM_JS = """
 VAULT_STATE_JS = """
 () => { const e = window.__eco, s = window.__store; if (!e) return null;
   return {open: !!e.vaultOpen, locked: !!(e.vaultLocked && !e.vaultUnlocked),
-          items: (e.vaultItems || []).filter(Boolean).length, pending: !!(s && s.pendingItemMove)}; }
+          items: (e.vaultItems || []).slice(0, 120).filter(Boolean).length, page: e.vaultPage || 0,
+          pending: !!(s && s.pendingItemMove)}; }
 """
 
 TRADE_YOURS_JS = """
@@ -264,6 +265,7 @@ VAULT_NPC_TYPE      = 240   # "Baz, Storage Guard", Lorencia (147,145) and (146,
 VAULT_SPOT          = (145, 140)   # where Juan stood to open it (south Baz)
 VAULT_TIMEOUT       = 300   # whole vault trip
 VAULT_RETRY_SEC     = 600   # failed trip -> next try
+VAULT_FULL_RETRY_SEC = 6 * 3600   # vault full (non-VIP = 1 page, 120 cells): don't walk there again for this long
 TRADE_BC_QUIET      = 180   # no new trades from BC_PLAN_SEC + this before a castle opens until the door closes
 
 # restarts (mu_supervisor.py)
@@ -1871,6 +1873,16 @@ class Agent:
                     self.ev("() => window.__eco.closeVault()")
                     return self.vault_end(f"stored {v['moved']} box(es), vault now holds "
                                           f"{(self.ev(VAULT_STATE_JS) or {}).get('items', '?')} item(s)", ok=True)
+                if st.get("page"):
+                    self.ev("() => window.__eco.setVaultPage(0)")   # page 2 is VIP only: never move there
+                    return True
+                room = self.ev("(i) => { const s = window.__store, it = s.playerData.items[i];"
+                               " return it ? s.findFreeSquare(2, it) : -1; }", slots[0])
+                if room is None or room < 0 or room >= 120:
+                    self.ev("() => window.__eco.closeVault()")
+                    return self.vault_end(f"vault page 1 is FULL ({st.get('items')} item(s)) -> keeping "
+                                          f"{len(slots)} box(es); stored {v['moved']} this trip",
+                                          ok=v["moved"] > 0, retry=VAULT_FULL_RETRY_SEC)
                 v["last"], v["move_at"] = slots[0], now
                 self.ev("(i) => window.__store.autoMoveItem(0, i, 2)", slots[0])   # Inventory (0) -> Vault (2)
                 return True
