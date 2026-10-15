@@ -142,6 +142,8 @@ LEVELEE_VIT_EVERY   = 60    # seconds between checks for free points
 BC_AUTO             = True    # (Juan 2026-10-14: on by default) Blood Castle on/off AT STARTUP. Press B in the console to switch it live
                               # (off until the bots seem human enough; Juan 2026-10-11)
 BC_TOGGLE_KEY       = "b"
+BB_AUTO             = False   # (Juan 2026-10-15: OFF by default) Big Boss on/off AT STARTUP (mu_bb.py) ...
+BB_TOGGLE_KEY       = "o"     # ... press O in the console to switch it live
 BC_TIERS            = B.BC_TIERS        # (castle, min lvl, max lvl): BC1 15-80 ... BC7 331-400
 BC_PLAN_SEC         = 900   # make the plan this long before the entry window opens
 BC_FARM_UNTIL_SEC   = 180   # holders keep farming until this long before the window opens (:57) ...
@@ -327,6 +329,7 @@ class Hub:
         self.paused = set()
         self.pause_all = False       # P / PAUSE file: everyone paused, windows stay minimized
         self.bc_on = BC_AUTO         # B in the console switches Blood Castle on/off
+        self.bb_on = BB_AUTO         # O in the console switches the Big Boss on/off
         self.stop = False
 
     def put(self, name, d):
@@ -683,7 +686,13 @@ class Agent:
                 self.status()
             return
         self.add_vit()
-        if lvl >= hub.reset_level and self.pair_may_reset():
+        if lvl >= hub.reset_level and self.bb and self.bb.hold_reset():
+            if not getattr(self, "bb_hold_logged", False):
+                self.bb_hold_logged = True
+                self.log("reset level, but the Big Boss is close (or up) -> no /reset until it's over "
+                         "(a reset would put me below the Tarkan /move level)")
+        elif lvl >= hub.reset_level and self.pair_may_reset():
+            self.bb_hold_logged = False
             self.mode = "reset"
             self.publish()
             return self.reset_tick()
@@ -2857,6 +2866,10 @@ def read_keys(hub, agents):
                 hub.bc_on = not hub.bc_on
                 log("=== BLOOD CASTLE " + ("ON" if hub.bc_on else
                     "OFF (anyone already inside finishes that castle; nobody else goes)") + " ===")
+            elif k == BB_TOGGLE_KEY:
+                hub.bb_on = not hub.bb_on
+                log("=== BIG BOSS " + ("ON" if hub.bb_on else
+                    "OFF (anyone at the boss stops and goes back to normal; no reset hold)") + " ===")
             elif k == G.PAUSE_KEY:
                 if all(a.name in hub.paused for a in agents):
                     hub.paused.clear()
@@ -2922,7 +2935,8 @@ def main():
         threads.append(t)
         time.sleep(3)    # stagger the browser launches
     log(f"Blood Castle is {'ON' if hub.bc_on else 'OFF'} (B in this window switches it)")
-    log("Keys in this window: P = pause/resume everyone, B = Blood Castle on/off, R = restart now, "
+    log(f"Big Boss is {'ON' if hub.bb_on else 'OFF'} (O in this window switches it)")
+    log("Keys in this window: P = pause/resume everyone, B = Blood Castle on/off, O = Big Boss on/off, R = restart now, "
         + ", ".join(f"{i + 1} = {a.name}" for i, a in enumerate(agents)) + " (pause/resume one)")
     last_summary = 0
     rc = EXIT_ALL_DEAD             # the loop ends by itself only when every character thread stopped

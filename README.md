@@ -28,6 +28,7 @@ Use `./restart_bot.sh` to restart the supervised auto bot, or create a `RESTART`
 ## Controls (auto bot)
 - `P` in the console pauses / resumes everyone, `1`-`5` pause / resume one character (order of `accounts.json`) so you can play it.
 - `B` in the console switches Blood Castle on / off. It starts as `BC_AUTO` near the top of `mu_auto_bot.py` (currently off). Switching off drops anyone who hasn't entered a castle yet; anyone already inside finishes it.
+- `O` in the console switches the Big Boss (`mu_bb.py`) on / off. It starts as `BB_AUTO` near the top of `mu_auto_bot.py` (off). Switching off sends anyone at the boss back to normal and drops the reset hold before the boss.
 - Restart to load code changes, but not between :45 and :10 (Blood Castle time).
 
 ## Idle wiggle

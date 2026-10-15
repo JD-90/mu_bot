@@ -22,11 +22,14 @@ turns into "<Map> <x>,<y>":
          valuable), then Box of Kundun +5, then the rest; my side first. Direct pickup request (no walking,
          like the Blood Castle weapon grab) the instant a drop appears, + the client's walk-in pickup, +
          Space presses (BB_SPACE_SPAM)
-  DONE   loot time over, or the panel is back to a countdown (killed before we got there / kill not seen)
+  LINGER after the loot, BB_LINGER_SEC (6-18 s, random per character) of small steps around the corpse,
+         so our characters don't all leave at the same moment
+  DONE   linger over, or the panel is back to a countdown (killed before we got there / kill not seen)
          -> leave the boss party, back to whatever it was doing
          (a Golden Invasion it interrupted can start again if it is still running)
 """
 import math
+import random
 import re
 import time
 
@@ -34,7 +37,7 @@ import mu_bc as B
 import mu_group_bot as G
 
 # ───────────────────────────── CONFIG ─────────────────────────────
-BB_ENABLED       = True
+BB_ENABLED       = True      # code switch; whether it runs is hub.bb_on (BB_AUTO at startup, O key in the console)
 BB_ORDER         = ["wizzardo", "bruto", "cucaracha", "invalido", "mogulin"]   # each one's side of the boss
 BB_END_GRACE     = 10        # panel back to a countdown for this long (boss dead / gone) -> done (after the loot)
 BB_LOOT_SEC      = 5         # after the kill: spam pickups this long (Juan 2026-10-15: it's gone faster than that)
@@ -78,6 +81,11 @@ BB_MAPS = {
     "Tarkan":   (8, ["Tarkan", "Tarkan2"], 140),
 }
 BB_WARP_TRIES    = 4         # warps that did not land on the map -> skip this boss
+BB_LINGER_SEC    = (6, 18)   # (Juan 2026-10-15) after the loot: idle this long (random per character) walking
+BB_LINGER_RADIUS = 3         # around the boss corpse (within this many tiles), so we don't all warp out at once ...
+BB_LINGER_STEP   = (1.5, 4)  # ... a small step every this many seconds (random)
+BB_HOLD_RESET_SEC = 360      # (Juan 2026-10-15) no /reset from this long before the spawn until the boss is over:
+                             # a reset drops the level to 1, below every boss map's /move level (Tarkan 140)
 # ──────────────────────────────────────────────────────────────────
 
 # Event panel row: "Big Boss04:53" / "Big Boss2:57:12" (countdown), "Big BossActive", "Big BossNoria 37,159"
@@ -361,6 +369,18 @@ class BigBoss:
             self.last_skip_log = key
             self.log(f"skipping this Big Boss: {why}")
 
+    def hold_reset(self):
+        """True from BB_HOLD_RESET_SEC before the spawn until the boss is over (or while I'm at it).
+        Only matters for a character whose level can /move to every boss map (>= the highest minimum)."""
+        if not self.switched_on() or not BB_HOLD_RESET_SEC:
+            return False
+        if self.active():
+            return True
+        t = self.timer or {}
+        if t.get("map") or t.get("active"):
+            return True                        # the boss is up right now
+        return t.get("secs") is not None and t["secs"] <= BB_HOLD_RESET_SEC
+
     def busy_reason(self):
         a = self.a
         if a.bcs is not None and a.bcs.get("phase") in ("inside", "end"):
@@ -369,8 +389,13 @@ class BigBoss:
             return "trading boxes"
         return None
 
+    def switched_on(self):
+        return BB_ENABLED and bool(getattr(self.a.hub, "bb_on", False))
+
     def tick(self):
-        if not BB_ENABLED:
+        if not self.switched_on():
+            if self.active():
+                return self.finish("Big Boss switched off (O)")
             return False
         if self.active():
             try:
@@ -415,6 +440,9 @@ class BigBoss:
         self.arrived_at = None
         self.first_hit_at = None
         self.dead_at = None
+        self.dead_pos = None
+        self.linger_until = None
+        self.linger_next = 0
         self.countdown_since = None
         self.deaths = 0
         self.was_dead = False
@@ -472,6 +500,8 @@ class BigBoss:
         a, c, s = self.a, self.c, self.c.s
         a.mode = "bb"
         now = time.time()
+        if self.linger_until is not None:
+            return self.linger_tick(now)
         if BB_RECORD:
             try:
                 c.rec.tick()
@@ -486,6 +516,9 @@ class BigBoss:
             self.log(e)
             if e.startswith("boss DIED"):
                 self.dead_at = now
+                m = re.search(r"\((\d+),(\d+)\)", e)
+                if m:
+                    self.dead_pos = (int(m.group(1)), int(m.group(2)))
         if st.get("err"):
             self.log(f"fight loop error: {st['err']}")
         status = st.get("status") or {}
@@ -508,7 +541,10 @@ class BigBoss:
             self.countdown_since = self.countdown_since or now
         if self.dead_at:
             self.loot_burst()
-            return self.finish("boss dead, loot time over")
+            self.ev(BB_SET_JS, False)                  # loot over: stop the in-page loop, just hang around
+            self.linger_until = time.time() + random.uniform(*BB_LINGER_SEC)
+            self.log(f"lingering {self.linger_until - time.time():.0f} s around the corpse before going back")
+            return True
         elif self.countdown_since and now - self.countdown_since >= BB_END_GRACE and mode not in ("fight", "closing", "approach"):
             return self.finish("the panel is counting down again (boss dead or gone)")
         if dead:
@@ -626,6 +662,26 @@ class BigBoss:
                 continue
             self.invited[n] = now
             self.log(f"party invite {n}: {self.ev(G.INVITE_JS, n)}")
+
+    def linger_tick(self, now):
+        """After the loot: a few small random steps around the corpse, then back to normal."""
+        s = self.c.s
+        if now >= self.linger_until:
+            return self.finish("boss dead, loot + linger over")
+        if (s.get("hp") or 0) <= 0:
+            return True
+        if now >= self.linger_next:
+            self.linger_next = now + random.uniform(*BB_LINGER_STEP)
+            cx, cy = self.dead_pos or (s.get("x"), s.get("y"))
+            if cx is None:
+                return True
+            for _ in range(6):
+                a = random.uniform(0, 2 * math.pi)
+                r = random.uniform(1, BB_LINGER_RADIUS)
+                x, y = int(round(cx + math.cos(a) * r)), int(round(cy + math.sin(a) * r))
+                if (x, y) != (s.get("x"), s.get("y")) and self.ev(B.WALK_JS, [x, y]):
+                    break
+        return True
 
     def loot_burst(self):
         """The boss died: BB_LOOT_SEC of pickups (the in-page loop spams the pickup requests) + Space presses."""
