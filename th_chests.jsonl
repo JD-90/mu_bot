@@ -8,3 +8,7 @@
 {"t": "2026-10-15T16:42:41", "map": "Devias", "map_idx": 2, "by": "bruto", "id": 1332, "x": 60, "y": 24, "event": "broken", "mine": true}
 {"t": "2026-10-15T16:44:31", "map": "Devias", "map_idx": 2, "by": "wizzardo", "id": 1316, "x": 208, "y": 83, "d": 17, "event": "seen"}
 {"t": "2026-10-15T16:44:35", "map": "Devias", "map_idx": 2, "by": "wizzardo", "id": 1316, "x": 208, "y": 83, "event": "broken", "mine": true}
+{"t": "2026-10-15T19:41:23", "map": "Tarkan", "map_idx": 8, "by": "wizzardo", "id": 891, "x": 149, "y": 97, "d": 31, "event": "seen"}
+{"t": "2026-10-15T19:41:27", "map": "Tarkan", "map_idx": 8, "by": "wizzardo", "id": 891, "x": 149, "y": 97, "event": "broken", "mine": false, "killer": 883}
+{"t": "2026-10-15T19:44:56", "map": "Tarkan", "map_idx": 8, "by": "bruto", "id": 964, "x": 110, "y": 155, "d": 13, "event": "seen"}
+{"t": "2026-10-15T19:44:59", "map": "Tarkan", "map_idx": 8, "by": "bruto", "id": 964, "x": 110, "y": 155, "event": "broken", "mine": true}

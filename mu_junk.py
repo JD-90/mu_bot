@@ -10,11 +10,16 @@ Getting rid of junk (Juan 2026-10-15). Two parts, both per character, only while
          The loot filter's "High level items" is OFF now (mu_group_bot.GAME_OPTIONS), otherwise the
          MU Helper would pick a dropped +7 straight back up.
 
-2. CRYSTALLIZE  after every Treasure Hunt, a character carrying excellent gear that is NOT end-game
+2. CRYSTALLIZE  after every /reset (Juan 2026-10-15; was: after every Treasure Hunt), a character carrying excellent gear that is NOT end-game
          top gear (CRYST_KEEP = the server's "best gear of each class") takes it to the Alquimista
          (npcType 693, next to the Chaos Goblin in Noria) and crystallizes it ("Cristalizar", up to 8
          items and 500k zen per batch), then takes the Cristales back to the bag.
          Only weapons, shields and set parts (the Alquimista refuses wings, rings, pendants).
+         Juan 2026-10-15 (cucaracha's recording): talk to him -> "Cristalizar" (menu) -> put items on the
+         table until it holds 8 or the next one doesn't fit -> "Cristalizar" (button at the bottom) -> take
+         the Cristales off the table (with Cristales on the table it won't crystallize) -> next items.
+         (v1 put 8 at once without checking the room -> "There is no room for that item", bruto stuck.) At the end the Cristales are joined into stacks in the bag (they
+         don't stack by themselves). Zen is no problem (no zen check).
          Items at +CRYST_MAX_LVL+1 or higher are kept too (fusion material, see the guide).
          The trip waits while an event / trade / Blood Castle is on (mu_auto_bot.trade_quiet) and
          is forgotten CRYST_DUE_SEC after the hunt.
@@ -50,12 +55,17 @@ JUNK_NEVER       = {(4, 7), (4, 15)} | set(B.WEAPON_CODES)   # bolts, arrows, Bl
 
 CRYST_ENABLED    = True      # part 2 on/off
 CRYST_SKIP_CHARS = {"wizzardo"}   # these characters never crystallize (Juan 2026-10-15: not the main)
-CRYST_DUE_SEC    = 3600      # after a Treasure Hunt, try for this long (events / trades come first)
+CRYST_DUE_SEC    = 7200      # after a Treasure Hunt / bot start, try for this long (events / trades / resets come first;
+                             # right after the :40 hunt come GI :50 and BC :00, so the trip usually starts ~:05)
+CRYST_CHECK_EVERY = 10      # while due: look at the bag this often
+CRYST_AFTER_RESET = True     # (Juan 2026-10-15) a trip is due after every /reset (and grand reset), if I carry any
+CRYST_AFTER_TH   = False     # ... no longer after every Treasure Hunt (resets come far more often); True = both
+CRYST_MIN_LEVEL  = 10        # right after a reset: wait until /move Noria is allowed (level 10)
 CRYST_RETRY_SEC  = 300       # failed trip -> try again after this long (while still due)
 CRYST_TIMEOUT    = 300       # whole trip
-CRYST_FEE        = 500_000   # zen per batch
-CRYST_ZEN_KEEP   = 200_000   # don't go below this after paying
-CRYST_BATCH      = 8         # items per batch (the Alquimista's limit)
+CRYST_ITEM_SEC   = 10        # extra trip time allowed per item to crystallize
+CRYST_BATCH      = 8         # items per Cristalizar (the Alquimista's maxBatch)
+CRYST_STACK_MAX  = 255       # Cristales per stack (the stack size is the item's durability byte)
 CRYST_MAX_LVL    = 12        # +13 and up are kept (fusion material)
 ALCHEMIST_NPC    = 693       # npcType of the Alquimista
 ALCHEMIST_MAP    = (3, "Noria")
@@ -111,7 +121,7 @@ DROP_JS = """
 
 MIX_STATE_JS = """
 () => { const e = window.__eco, s = window.__store; if (!e || !s) return null;
-  const tray = (e.mixItems || []).map((it, i) => it ? {slot: i, g: it.group, n: it.num} : null).filter(Boolean);
+  const tray = (e.mixItems || []).map((it, i) => it ? {slot: i, g: it.group, n: it.num, d: it.durability} : null).filter(Boolean);
   return {open: !!e.mixOpen, kind: e.mixKind, tray, pending: !!e.mixPending, result: e.mixResult,
           refusal: e.mixRefusal, moving: !!s.pendingItemMove, picked: !!s.pickedItem,
           money: Number(s.playerData.money) || 0}; }
@@ -136,6 +146,57 @@ NPC_POS_JS = """
 """
 
 
+# click a control of the Alquimista's window by its text / tooltip ("menu" = an entry with that text,
+# "button" = the image button whose tooltip is that text). "clicked" / "not found"
+CLICK_TEXT_JS = """
+([kind, text]) => {
+  const win = document.querySelector('.v097d-alchemist') || document.getElementById('alchemist');
+  if (!win) return 'no window';
+  const norm = v => (v || '').replace(/\\s+/g, ' ').trim().toLowerCase(), want = text.toLowerCase();
+  const els = [...win.querySelectorAll('*')].filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+  // cucaracha's recording 2026-10-15: menu entry = div.v097d-quest-proceed[role=button] > span "Cristalizar";
+  // bottom button = div.v097d-button (text "Cristalizar"); Close = div.v097d-button "Close"
+  const sel = kind === 'button' ? '.v097d-button' : '.v097d-quest-proceed';
+  let el = els.find(e => e.matches(sel) && norm(e.textContent) === want);
+  if (!el && kind === 'menu')
+    el = els.find(e => e.childElementCount === 0 && norm(e.textContent) === want && !/band|title/.test(String(e.className)));
+  if (!el) return 'not found';
+  for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'])
+    el.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window}));
+  return 'clicked';
+}
+"""
+
+# bag slots of excellent gear that fit on the table right now (the client's own free-square search)
+FITS_JS = """
+([cg, cn]) => { const s = window.__store; if (!s || !s.findFreeSquare) return null;
+  const items = s.playerData.items || [], fits = [];
+  for (let i = 12; i < Math.min(items.length, 76); i++) { const it = items[i];
+    if (it && it.isExcellent && !(it.group === cg && it.num === cn)) { try { if (s.findFreeSquare(3, it) >= 0) fits.push(i); } catch (e) {} } }
+  return {fits}; }
+"""
+
+# Cristales in the bag: [{slot, n}] (n = stack size)
+CRYSTALS_JS = """
+([g, n]) => { const s = window.__store; if (!s) return null;
+  const items = s.playerData.items || [], out = [];
+  for (let i = 12; i < Math.min(items.length, 76); i++) { const it = items[i];
+    if (it && it.group === g && it.num === n) out.push({slot: i, n: Number(it.durability ?? 1) || 1}); }
+  return {stacks: out, pending: !!s.pendingItemMove, picked: !!s.pickedItem}; }
+"""
+
+# move `n` pieces of the stack in bag slot `from` onto the same item in slot `to`: the server's
+# "/dividir <from> <to> <n>" chat command (client: __store.sendSplitCommand, used when laying pieces)
+SPLIT_JS = """
+([from, to, n]) => { const s = window.__store;
+  if (!s || s.pickedItem || s.pendingItemMove) return 'busy';
+  if (typeof s.sendSplitCommand === 'function') { s.sendSplitCommand(from, to, n); return 'sent'; }
+  if (window.__social && window.__social.sendChat) { window.__social.sendChat(`/dividir ${from} ${to} ${n}`); return 'sent (chat)'; }
+  return 'no way to send';
+}
+"""
+
+
 def describe(items, limit=8):
     s = ", ".join(f"{i['g']}/{i['n']} +{i['lvl']}" for i in items[:limit])
     return s + (f" +{len(items) - limit} more" if len(items) > limit else "")
@@ -148,7 +209,12 @@ class Junk:
         self.last_drop = None        # (slot, key, time) waiting to see the slot empty
         self.skip = {}               # "slot:key" -> until (didn't drop)
         self.dropped = 0
-        self.due = None              # time of the Treasure Hunt that made a trip due
+        self.due = time.time()       # a trip is due since: bot start, and after every Treasure Hunt
+        self.th_seen = None          # (2026-10-15) every Treasure Hunt makes it due, also for characters
+                                     # that skipped it (low level / busy): they may carry excellents too
+        self.wait_why = None         # last "waiting because" logged
+        self.check_at = 0
+        self.resets_seen = None      # reset counter last seen (a change = a reset happened)
         self.next_try = 0
         self.trip = None
 
@@ -170,6 +236,10 @@ class Junk:
 
     # called by mu_th when a Treasure Hunt ends
     def hunt_over(self):
+        if CRYST_AFTER_TH:
+            self.make_due()
+
+    def make_due(self):
         if JUNK_ENABLED and CRYST_ENABLED and self.a.name.lower() not in CRYST_SKIP_CHARS:
             self.due, self.next_try = time.time(), 0
 
@@ -216,33 +286,48 @@ class Junk:
         now = time.time()
         t = self.trip
         if t is None:
+            r = s.get("resets")
+            if r is not None and r != self.resets_seen:
+                if self.resets_seen is not None and CRYST_AFTER_RESET:
+                    self.make_due()                  # after every reset: excellents picked up meanwhile -> Alquimista
+                self.resets_seen = r
+            th = getattr(a, "th", None)
+            if th is not None and not th.active() and th.handled != self.th_seen:
+                self.th_seen = th.handled            # a Treasure Hunt went by (hunted or skipped)
+                if th.handled is not None:
+                    self.hunt_over()
             if not (JUNK_ENABLED and CRYST_ENABLED) or self.due is None or now < self.next_try \
                     or self.a.name.lower() in CRYST_SKIP_CHARS:
                 return False
             if now - self.due > CRYST_DUE_SEC:
-                self.log(f"crystallizing still not done {CRYST_DUE_SEC // 60} min after the Treasure Hunt -> "
-                         f"forgetting it until the next one")
+                self.log(f"crystallizing still not done {CRYST_DUE_SEC // 60} min after it became due -> "
+                         f"forgetting it until the next Treasure Hunt")
                 self.due = None
                 return False
-            if a.bcs or a.my_trade or a.vault or (s.get("hp") or 0) <= 0 or c.shop_pending \
-                    or (s.get("level") or 0) >= (a.hub.reset_level or 10 ** 6) or a.trade_quiet():
+            if now - self.check_at < CRYST_CHECK_EVERY:
                 return False
-            ht = a.hub.trade
-            if ht and a.name in (ht.get("alt"), ht.get("lead")):
-                return False
+            self.check_at = now
             b = self.bag()
             if b is None:
                 return False
             if not b["cryst"]:
-                self.due = None
+                self.due, self.wait_why = None, None
                 return False
-            if b["money"] < CRYST_FEE + CRYST_ZEN_KEEP:
-                self.log(f"{len(b['cryst'])} excellent item(s) to crystallize but only {b['money']:,} zen "
-                         f"(needs {CRYST_FEE + CRYST_ZEN_KEEP:,}) -> not going")
-                self.due = None
+            ht = a.hub.trade
+            why = ("Blood Castle" if a.bcs else "box trade" if a.my_trade or (ht and a.name in (ht.get("alt"), ht.get("lead")))
+                   else "vault trip" if a.vault else "dead" if (s.get("hp") or 0) <= 0 else "buying Zen Chests" if c.shop_pending
+                   else "at the reset level" if (s.get("level") or 0) >= (a.hub.reset_level or 10 ** 6)
+                   else f"level {s.get('level')} (Noria needs {CRYST_MIN_LEVEL})" if (s.get("level") or 0) < CRYST_MIN_LEVEL
+                        and s.get("map") != ALCHEMIST_MAP[0]
+                   else "an event is on / coming" if a.trade_quiet() else None)
+            if why:
+                if why != self.wait_why:
+                    self.wait_why = why
+                    self.log(f"{len(b['cryst'])} excellent item(s) to crystallize, waiting: {why}")
                 return False
+            self.wait_why = None
             t = self.trip = {"since": now, "phase": "go", "phase_at": now, "tries": 0, "batches": 0,
-                             "items": 0, "crystals": 0}
+                             "items": 0, "skip": set()}
             self.log(f"{len(b['cryst'])} excellent item(s) to crystallize ({describe(b['cryst'])}) -> "
                      f"going to the Alquimista in Noria")
         a.mode = "crystal"
@@ -250,7 +335,7 @@ class Junk:
             return True
         if a.bcs or a.trade_quiet() and t["phase"] in ("go", "find", "open"):
             return self.end("an event is coming", ok=False)
-        if now - t["since"] > CRYST_TIMEOUT:
+        if now - t["since"] > CRYST_TIMEOUT + CRYST_ITEM_SEC * t.get("todo", 0):
             return self.end(f"took more than {CRYST_TIMEOUT}s (phase {t['phase']})", ok=False)
         try:
             return self.step(t, now)
@@ -284,10 +369,9 @@ class Junk:
         st = self.ev(MIX_STATE_JS) or {}
         if t["phase"] == "open":
             if st.get("open") and st.get("kind") == "alchemist":
-                if st.get("tray"):
-                    self.phase(t, "collect")         # something left on the table from before
-                else:
-                    self.phase(t, "load")
+                r = self.ev(CLICK_TEXT_JS, ["menu", "Cristalizar"])      # 1. "Cristalizar" in his menu
+                self.log(f"Alquimista window open -> 'Cristalizar' menu: {r}")
+                self.phase(t, "clear")
                 return True
             if st.get("open"):                       # some other mix window
                 self.ev("() => window.__eco.closeMix(false)")
@@ -304,69 +388,121 @@ class Junk:
             t["tries"] += 1
             t["phase_at"] = now
             return True
+        if t["phase"] == "stack":
+            return self.stack_step(t, now)
         if not (st.get("open") and st.get("kind") == "alchemist"):
-            return self.end(f"the Alquimista's window closed (phase {t['phase']})", ok=t["batches"] > 0)
-        if st.get("moving") or st.get("pending"):
+            return self.end(f"the Alquimista's window closed (phase {t['phase']})", ok=t["items"] > 0)
+        if st.get("moving") or st.get("pending") or st.get("picked"):
+            return True
+        tray = st.get("tray") or []
+        if t["phase"] == "clear":                    # take EVERYTHING off the table (Cristales block the next mix)
+            if tray:
+                if now - t.get("move_at", 0) < 1:
+                    return True
+                if now - t["phase_at"] > 20:
+                    return self.end(f"couldn't take {len(tray)} thing(s) off the table (bag full?)", ok=False, retry=3600)
+                t["move_at"] = now
+                self.ev("(i) => window.__store.autoMoveItem(3, i, 0)", tray[0]["slot"])   # table -> bag
+                return True
+            if t.get("stop_after_clear"):
+                self.ev("() => window.__eco.closeMix()")
+                self.phase(t, "stack")
+                return True
+            self.phase(t, "load")
+            t["batch"] = []
             return True
         if t["phase"] == "load":
-            b = self.bag() or {}
-            on_tray = [x for x in st.get("tray") or [] if (x["g"], x["n"]) != CRYST_ITEM]
-            todo = b.get("cryst") or []
-            if todo and len(on_tray) < CRYST_BATCH and now - t["phase_at"] < 30:
-                if t.get("last") == todo[0]["slot"] and now - t.get("move_at", 0) < 3:
-                    return True                      # the server hasn't answered yet
-                t["last"], t["move_at"] = todo[0]["slot"], now
-                self.ev("(i) => window.__store.autoMoveItem(0, i, 3)", todo[0]["slot"])   # bag -> tray
+            # Juan 2026-10-15 (cucaracha's recording): put items on the table until it holds CRYST_BATCH or the
+            # next one doesn't fit, then Cristalizar, take the Cristales off, carry on with the rest
+            b = self.ev(FITS_JS, [CRYST_ITEM[0], CRYST_ITEM[1]]) or {}
+            on = [x for x in tray if (x["g"], x["n"]) != CRYST_ITEM]
+            if any((x["g"], x["n"]) == CRYST_ITEM for x in tray):
+                self.phase(t, "clear")
                 return True
-            if not on_tray:
-                return self.end("nothing went onto the table", ok=t["batches"] > 0)
-            if (st.get("money") or 0) < CRYST_FEE:
-                self.log(f"only {st.get('money'):,} zen for the {CRYST_FEE:,} fee")
-                self.phase(t, "collect")
-                t["abort"] = True
+            last = t.get("cur")
+            if last and now - t.get("move_at", 0) < 3 and any(x["slot"] == last["slot"] and x["key"] == last["key"]
+                                                               for x in (self.bag() or {}).get("cryst") or []):
+                return True                          # the last one hasn't left the bag yet
+            if last and any(x["slot"] == last["slot"] and x["key"] == last["key"] for x in (self.bag() or {}).get("cryst") or []):
+                t["skip"].add(f"{last['slot']}:{last['key']}")
+                self.log(f"{last['g']}/{last['n']} +{last['lvl']} (slot {last['slot']}) didn't go onto the table -> skipping it")
+            t["cur"] = None
+            todo = [x for x in (self.bag() or {}).get("cryst") or [] if f"{x['slot']}:{x['key']}" not in t["skip"]]
+            t["todo"] = len(todo)
+            fits = set(b.get("fits") or [])
+            nxt = next((x for x in todo if x["slot"] in fits), None)
+            if nxt and len(on) < CRYST_BATCH:
+                t["cur"], t["move_at"] = nxt, now
+                t["batch"].append(f"{nxt['g']}/{nxt['n']} +{nxt['lvl']}")
+                self.ev("(i) => window.__store.autoMoveItem(0, i, 3)", nxt["slot"])   # bag -> table
                 return True
-            # give the Alquimista a moment to price the table, then crystallize
+            if not on:
+                if todo:                             # nothing fits an EMPTY table?
+                    for x in todo:
+                        t["skip"].add(f"{x['slot']}:{x['key']}")
+                    self.log(f"{len(todo)} item(s) don't fit the empty table ({describe(todo)}) -> skipping them")
+                self.ev("() => window.__eco.closeMix()")
+                self.phase(t, "stack")
+                return True
             if now - t.get("move_at", 0) < 1.5:
-                return True
-            t["batch"] = len(on_tray)
-            names = ", ".join(f"{x['g']}/{x['n']}" for x in on_tray)
-            self.log(f"crystallizing {len(on_tray)} item(s) ({names})")
-            self.ev("() => window.__eco.mix()")
+                return True                          # let him price the table
+            r = self.ev(CLICK_TEXT_JS, ["button", "Cristalizar"])    # "Cristalizar" at the bottom
+            if r != "clicked":
+                self.ev("() => window.__eco.mix()")                  # what that button calls (c1 05 86 01 00)
+            t["mix_how"], t["batch_n"] = r, len(on)
             self.phase(t, "mix")
             return True
         if t["phase"] == "mix":
             if st.get("result") == "success":
-                n = len(st.get("tray") or [])
+                t["items"] += t.get("batch_n", 0)
                 t["batches"] += 1
-                t["items"] += t.get("batch", 0)
-                self.log(f"batch {t['batches']} done: {t.get('batch')} item(s) -> {n} stack(s) of Cristales on the table")
-                self.phase(t, "collect")
+                cr = sum(y.get("d") or 0 for y in tray if (y["g"], y["n"]) == CRYST_ITEM)
+                self.log(f"batch {t['batches']}: crystallized {t.get('batch_n')} item(s) ({', '.join(t.get('batch') or [])}) "
+                         f"-> {cr} Cristales ({t['items']} done, {max(t.get('todo', 0), 0)} left; button: {t.get('mix_how')})")
+                self.phase(t, "clear")               # Cristales off the table, next batch
                 return True
-            if st.get("result") == "failed" or st.get("refusal"):
-                self.log(f"crystallize refused: {st.get('refusal') or st.get('result')} -> taking the items back")
-                t["abort"] = True
-                self.phase(t, "collect")
-                return True
-            if now - t["phase_at"] > 10:
-                self.log("no answer to Cristalizar -> taking the items back")
-                t["abort"] = True
-                self.phase(t, "collect")
+            if st.get("result") == "failed" or st.get("refusal") or now - t["phase_at"] > 10:
+                why = st.get("refusal") or st.get("result") or "no answer"
+                for y in tray:
+                    if (y["g"], y["n"]) != CRYST_ITEM:
+                        t["skip"].add(f"tray:{y['g']}/{y['n']}")
+                self.log(f"Cristalizar refused ({why}) for {', '.join(t.get('batch') or [])} -> taking them back")
+                t["refused"] = t.get("refused", 0) + 1
+                if t["refused"] >= 2:
+                    self.phase(t, "clear")
+                    t["stop_after_clear"] = True
+                else:
+                    self.phase(t, "clear")
             return True
-        if t["phase"] == "collect":
-            tray = st.get("tray") or []
-            if tray:
-                if now - t.get("move_at", 0) < 1:
-                    return True
-                if now - t["phase_at"] > 30:
-                    return self.end("couldn't take everything off the table (bag full?)", ok=False, retry=3600)
-                t["move_at"] = now
-                self.ev("(i) => window.__store.autoMoveItem(3, i, 0)", tray[0]["slot"])   # tray -> bag
-                return True
-            if not t.get("abort") and (self.bag() or {}).get("cryst"):
-                self.phase(t, "load")                # next batch
-                return True
-            self.ev("() => window.__eco.closeMix()")
-            return self.end(f"{t['batches']} batch(es), {t['items']} item(s) crystallized", ok=not t.get("abort"))
+        return True
+
+    def stack_step(self, t, now):
+        """5. Join the Cristales in the bag: the server's "/dividir <from slot> <to slot> <count>" (what the
+        client sends when you lay pieces of a stack on another) moves `count` pieces onto the other stack.
+        Fill the biggest stack that isn't full (255 = the count is one byte) from the smallest one."""
+        b = self.ev(CRYSTALS_JS, list(CRYST_ITEM)) or {}
+        if b.get("pending") or b.get("picked"):
+            return True
+        stacks = b.get("stacks") or []
+        sig = tuple(sorted((x["slot"], x["n"]) for x in stacks))
+        if t.get("join_sig") == sig and now - t.get("move_at", 0) < 3:
+            return True                              # wait for the server to answer the last move
+        if t.get("join_sig") == sig and t.get("join_sent"):
+            t["join_stuck"] = t.get("join_stuck", 0) + 1
+        t["join_sent"] = False
+        open_ = sorted([x for x in stacks if x["n"] < CRYST_STACK_MAX], key=lambda x: (-x["n"], x["slot"]))
+        if len(open_) < 2 or t.get("join_stuck", 0) >= 3 or now - t["phase_at"] > 60:
+            full = sum(1 for x in stacks if x["n"] >= CRYST_STACK_MAX)
+            extra = " (joining stopped: no change from the server)" if t.get("join_stuck", 0) >= 3 else ""
+            return self.end(f"{t['items']} item(s) crystallized; Cristales in the bag: {sum(x['n'] for x in stacks)} "
+                            f"in {len(stacks)} stack(s), {full} full{extra}", ok=True)
+        dst, src = open_[0], open_[-1]
+        k = min(src["n"], CRYST_STACK_MAX - dst["n"])
+        r = self.ev(SPLIT_JS, [src["slot"], dst["slot"], k])
+        t["join_sig"], t["move_at"], t["join_sent"] = sig, now, True
+        t["joins"] = t.get("joins", 0) + 1
+        if t["joins"] <= 10:
+            self.log(f"Cristales: /dividir {src['slot']} {dst['slot']} {k} ({src['n']} -> onto {dst['n']}): {r}")
         return True
 
     def end(self, why, ok, retry=None):

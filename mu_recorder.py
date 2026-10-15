@@ -19,6 +19,10 @@ What it records (only changes, so the file stays readable):
   * other players within RECORD_PLAYER_RADIUS: arriving / leaving / dying / outlaw state changes,
     who you are attacking, the selected skill, and your HP while a player is close (PvP)
   * on stop: a summary (monsters seen by name, events by count, items gained / lost)
+  * (2026-10-15, for the Alquimista) every CLICK in the game's windows (element, its text / title /
+    classes, the window it is in), every packet the client SENDS (hex, plus the text of chat-command
+    packets), the Chaos Machine / Alquimista table (open, kind, items on it, result, refusal) whenever it
+    changes, and the full text of JSON packets such as "Alchemist"
 """
 import threading
 import time
@@ -53,6 +57,8 @@ REC_JS = r"""
       return short(d, 220);
     } catch (e) { return '?'; }
   };
+  const txt = u => { try { const t = new TextDecoder().decode(u); const i = t.indexOf('{');
+                      return i >= 0 ? t.slice(i) : null; } catch (e) { return null; } };
   const hero = w.playerEntity, p = s.playerData || {};
   const pos = hero ? {x: Math.round(hero.transform.pos.x), y: Math.round(hero.transform.pos.z)} : {x: p.x, y: p.y};
   const near = e => hero ? Math.hypot(e.transform.pos.x - hero.transform.pos.x, e.transform.pos.z - hero.transform.pos.z) : 0;
@@ -69,7 +75,8 @@ REC_JS = r"""
     return r; };
   const bag = () => { const m = {};
     (p.items || []).forEach((it, i) => { if (i < 12 || !it) return;
-      const k = `${it.name || it.itemName || (it.group + '/' + it.num)}${it.lvl ? ' +' + it.lvl : ''}`;
+      const k = `${it.name || it.itemName || (it.group + '/' + it.num)}${it.lvl ? ' +' + it.lvl : ''}` +
+                (it.group === 14 && it.num === 31 ? ` [slot ${i} d${it.durability}]` : '');
       m[k] = (m[k] || 0) + 1; });
     return m; };
   const evRows = () => Array.from(document.querySelectorAll('.event-row-label'))
@@ -121,7 +128,12 @@ REC_JS = r"""
               r.evCount[ev] = (r.evCount[ev] || 0) + 1;
               r.evMin[ev] = (r.evMin[ev] || 0) + 1;
               const loud = /gold|invas|event|drop|item|kill|die|dead|death|notice|announce|message|chat|server|reward|exp|box|zen|money|monster/i.test(ev);
-              if (first || (loud && (r.evLines[ev] = (r.evLines[ev] || 0) + 1) <= 30))
+              const craft = /alchem|mix|chaos|craft|stack|inventory|itemmov|storage|npcwindow/i.test(ev);
+              if (craft && (r.evLines[ev] = (r.evLines[ev] || 0) + 1) <= 300) {
+                let j = null; try { const a0 = args[0]; if (a0 && a0.byteLength !== undefined)
+                  j = txt(new Uint8Array(a0.buffer || a0, a0.byteOffset || 0, a0.byteLength)); } catch (e) {}
+                r.dom.push(`event ${ev}: ${j ? 'JSON ' + short(j, 1500) : (args.length ? payload(args[0]) : '')}`);
+              } else if (first || (loud && (r.evLines[ev] = (r.evLines[ev] || 0) + 1) <= 30))
                 r.dom.push(`event ${first ? 'NEW ' : ''}${ev}: ${args.length ? payload(args[0]) : ''}`);
               // server instant-moves (teleport / position snap-back): every one, with where the client thought we were
               // (c1 08 15 <netId u16> <x> <y>; 2026-10-15: bruto got 7 in one minute = rubber-banding)
@@ -137,6 +149,44 @@ REC_JS = r"""
         W.__recBus = name;
       }
       out.push(`event bus: hooked '${W.__recBus}' (methods: ${fns.join(',')})`);
+    }
+    // every click in the UI: what was clicked (2026-10-15: to learn the Alquimista's buttons)
+    if (!W.__recClick) {
+      W.__recClick = true;
+      const desc = el => { if (!el || el.nodeType !== 1) return '?';
+        const cls = (typeof el.className === 'string' ? el.className : '').trim().split(/\s+/).slice(0, 4).join('.');
+        const own = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join(' ').replace(/\s+/g, ' ').trim();
+        const all = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        const attrs = ['title', 'aria-label', 'role', 'data-tip', 'id'].map(a => el.getAttribute && el.getAttribute(a) ? `${a}="${el.getAttribute(a)}"` : '').filter(Boolean).join(' ');
+        return `<${el.tagName.toLowerCase()}${cls ? '.' + cls : ''}${attrs ? ' ' + attrs : ''}> own "${short(own, 60)}" all "${short(all, 80)}"`; };
+      const onClick = ev => { const r = W.__rec; if (!W.__recOn || !r) return;
+        const el = ev.target; if (!el || el.tagName === 'CANVAS') return;
+        const win = el.closest && el.closest('[id],[class*="v097d-"]');
+        const chain = []; let c = el; for (let i = 0; c && i < 3; i++, c = c.parentElement) chain.push(desc(c));
+        r.dom.push(`CLICK ${ev.type} at (${ev.clientX},${ev.clientY}) in ${win ? (win.id ? '#' + win.id : '') + '.' + String(win.className).split(' ')[0] : '?'}: ` + chain.join(' < '));
+      };
+      document.addEventListener('click', onClick, true);
+      document.addEventListener('contextmenu', onClick, true);
+    }
+    // every packet the client sends (hex; chat-command packets also as text)
+    if (s && typeof s.sendToGS === 'function' && !s.__recSend) {
+      const origSend = s.sendToGS.bind(s);
+      s.sendToGS = function (buf, ...rest) {
+        try { const r = W.__rec;
+          if (W.__recOn && r) {
+            const u = new Uint8Array(buf.buffer || buf, buf.byteOffset || 0, buf.byteLength);
+            const code = hex(u, 3), k = 'send ' + code;
+            r.evMin[k] = (r.evMin[k] || 0) + 1;
+            const walk = u[0] === 0xc1 && (u[2] === 0xd4 || u[2] === 0x18 || u[2] === 0x0e);   // walk / animation / ping spam
+            if (!walk && (r.evLines[k] = (r.evLines[k] || 0) + 1) <= 200) {
+              const t = (() => { try { return new TextDecoder().decode(u.slice(13)).replace(/\0+/g, ' ').trim(); } catch (e) { return ''; } })();
+              r.dom.push(`SEND [${u.length}b] ${hex(u, 40)}` + (u[2] === 0x00 && t ? ` text "${short(t, 120)}"` : ''));
+            }
+          }
+        } catch (e) {}
+        return origSend(buf, ...rest);
+      };
+      s.__recSend = true;
     }
     // new text appearing on screen (announcements, dialogs, notices)
     if (!W.__recObs) {
@@ -209,6 +259,17 @@ REC_JS = r"""
   const helper = !!(s.muHelper && s.muHelper.active);
   if (helper !== R.helper) { out.push('MU Helper ' + (helper ? 'ON' : 'OFF')); R.helper = helper; }
   if (p.money !== R.money) { const d = (p.money || 0) - (R.money || 0); out.push(`zen ${d >= 0 ? '+' : ''}${d} -> ${p.money}`); R.money = p.money; }
+  // Chaos Machine / Alquimista table
+  const eco = W.__eco;
+  if (eco) {
+    const tray = (eco.mixItems || []).map((it, i) => it ? `${i}:${it.group}/${it.num}${it.lvl ? '+' + it.lvl : ''}${it.isExcellent ? ' exc' : ''}${it.durability !== undefined ? ' d' + it.durability : ''}` : null).filter(Boolean);
+    const ms = `open ${!!eco.mixOpen} kind ${eco.mixKind} pending ${!!eco.mixPending} result ${eco.mixResult} refusal ${eco.mixRefusal} | table [${tray.join(', ')}]`;
+    if (ms !== R.mix && (eco.mixOpen || (R.mix && R.mix.startsWith('open true')))) out.push('MIX ' + ms);
+    R.mix = ms;
+  }
+  if (s.pickedItem && !R.picked) { const it = s.pickedItem.item || {}; out.push(`picked up in hand: ${it.group}/${it.num}${it.lvl ? ' +' + it.lvl : ''} from storage ${s.pickedItem.fromStorage} slot ${s.pickedItem.fromSlot}${s.pickedItem.split ? ' (split)' : ''}`); }
+  if (!s.pickedItem && R.picked) out.push('hand empty');
+  R.picked = !!s.pickedItem;
   // bag
   const b = bag();
   for (const k of new Set([...Object.keys(b), ...Object.keys(R.bag)])) {
