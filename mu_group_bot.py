@@ -18,11 +18,15 @@ import math
 import os
 import re
 import sys
+import random
 import time
 from datetime import datetime
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, Error as PWError
+
+# Juan 2026-10-15: wait a random 1-5 s before every /move so the warps don't look scripted.
+MOVE_DELAY_RANGE = (1.0, 5.0)
 from mu_bc import BloodCastle
 from mu_recorder import Recorder
 import roster as R
@@ -556,6 +560,10 @@ class Char:
         return s.get("ready") and s.get("inGame") and not s.get("connectionLost")
 
     def chat(self, text):
+        if text.lower().startswith("/move"):
+            delay = random.uniform(*MOVE_DELAY_RANGE)
+            self.log(f"waiting {delay:.1f}s before {text}")
+            time.sleep(delay)
         self.log(f"chat: {text}")
         self.page.evaluate("(t) => window.__social.sendChat(t)", text)
         time.sleep(1.2)

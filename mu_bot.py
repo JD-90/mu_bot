@@ -13,11 +13,15 @@ import json
 import math
 import re
 import sys
+import random
 import time
 from datetime import datetime
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, Error as PWError
+
+# Juan 2026-10-15: wait a random 1-5 s before every /move so the warps don't look scripted.
+MOVE_DELAY_RANGE = (1.0, 5.0)
 
 # ───────────────────────────── CONFIG ─────────────────────────────
 URL       = "https://mu.mormon.garden/"
@@ -135,6 +139,10 @@ class Bot:
             return {"ready": False}
 
     def chat(self, text):
+        if text.lower().startswith("/move"):
+            delay = random.uniform(*MOVE_DELAY_RANGE)
+            log(f"waiting {delay:.1f}s before {text}")
+            time.sleep(delay)
         log(f"chat: {text}")
         self.page.evaluate(CHAT_JS, text)
         time.sleep(1.2)  # client rate-limits chat
