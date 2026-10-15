@@ -222,6 +222,13 @@ TRADE_FROM_JS = """
 """
 
 # what the other side put in my trade window: Kundun boxes / anything else
+# vault window (mu_eco): open / PIN-locked / items inside / an item move waiting for the server
+VAULT_STATE_JS = """
+() => { const e = window.__eco, s = window.__store; if (!e) return null;
+  return {open: !!e.vaultOpen, locked: !!(e.vaultLocked && !e.vaultUnlocked),
+          items: (e.vaultItems || []).filter(Boolean).length, pending: !!(s && s.pendingItemMove)}; }
+"""
+
 TRADE_YOURS_JS = """
 (minLvl) => { const it = Object.values(window.__eco.yourTradeItems || {}).filter(Boolean);
   const g = i => i.item || i;   // an item whose fields we can't read counts as a box (not as "other")
@@ -249,6 +256,14 @@ TRADE_TRAVEL_SEC    = 180   # giving up on reaching the main after this long (th
 TRADE_REMOTE_LAG    = 6     # extra seconds of slack when the other side is on another machine (3 s heartbeat)
 WARP_MIN_LEVEL      = {m: min(f for f, _, _, mm, _ in G.ROUTE if mm == m) for m in {r[3] for r in G.ROUTE}}
 MAP_ALIAS           = {m: a for a, m in G.MAP_INDEX.items()}
+VAULT_KEEPER        = "mogulin"   # Juan 2026-10-15: takes the boxes once the main holds MAIN_PLUS5_FULL +5,
+                                  # and stores them in his account vault (None = no keeper)
+MAIN_PLUS5_FULL     = 10    # the main keeps this many Boxes of Kundun +5 (lower ones don't count)
+VAULT_DEPOSIT_AT    = 20    # the keeper goes to the vault with this many Kundun boxes (+1..+5)
+VAULT_NPC_TYPE      = 240   # "Baz, Storage Guard", Lorencia (147,145) and (146,110)
+VAULT_SPOT          = (145, 140)   # where Juan stood to open it (south Baz)
+VAULT_TIMEOUT       = 300   # whole vault trip
+VAULT_RETRY_SEC     = 600   # failed trip -> next try
 TRADE_BC_QUIET      = 180   # no new trades from BC_PLAN_SEC + this before a castle opens until the door closes
 
 # restarts (mu_supervisor.py)
@@ -429,6 +444,9 @@ class Agent:
         self.boxes_at = 0
         self.boxes5 = 0              # Boxes of Kundun +5 in the bag (checked with self.boxes)
         self.trade_trip = None       # on the way to the main with boxes: {"since"}
+        self.trade_dest = TRADE_TO   # who I'm taking my boxes to (main or vault keeper)
+        self.vault = None            # vault keeper: trip to the vault in progress
+        self.vault_next = 0
         self.my_trade = None
         self.trade_next = 0
         self.trade_fails = 0
@@ -663,8 +681,9 @@ class Agent:
             c.was_online = True
             c.select_tries = 0
             self.check_msgwin()
-            if TRADE_BOXES and self.name == hub.trade_to:
+            if TRADE_BOXES and self.name in self.receivers():
                 self.update_bag_free()
+                self.boxes_count()          # published (boxes / boxes5): givers pick the main or the keeper by it
             if not c.gfx_done:
                 c.set_low_graphics()
             elif G.MINIMIZE_WINDOWS and not c.minimized and not G.HEADLESS and not self.show_window:
@@ -716,6 +735,9 @@ class Agent:
             self.publish()
             return
         if self.bc_tick():
+            self.publish()
+            return
+        if self.vault_tick():
             self.publish()
             return
         if self.trade_tick():
@@ -786,7 +808,7 @@ class Agent:
             bc += f" | VIT {s.get('vit')} ({s.get('points')} free pts)"
         if self.cap_fight.get("grab_on"):
             bc += " | fighting without helper (reset level)"
-        if self.name == self.hub.trade_to and self.bag_free is not None:
+        if self.name in self.receivers() and self.bag_free is not None:
             bc += f" | bag {self.bag_free} free" + (" (FULL for trades)" if self.hub.lead_full else "")
         self.log(f"lvl {s.get('level')} r{s.get('resets')} | {where} | "
                  f"{'%.1f' % r if r is not None else '?'} lvl/min | hp {s.get('hp')}/{s.get('maxHP')} | "
@@ -1683,34 +1705,37 @@ class Agent:
             return self.trade_trip_end()
         if self.pair_group(hub.snapshot()):
             return self.trade_trip_end()        # carrying / being carried: stays with the pair
-        lead, remote = self.peer_info(hub.trade_to)
+        dest = self.trade_dest = self.trade_target()
+        if not dest:
+            return self.trade_trip_end()
+        lead, remote = self.peer_info(dest)
         if not lead or not lead.get("online") or lead.get("paused") or lead.get("mode") != "level" \
                 or lead.get("bc") or (lead.get("hp") or 0) <= 0 or lead.get("map") is None:
-            return self.trade_trip_end("{} is not leveling right now".format(hub.trade_to))
+            return self.trade_trip_end("{} is not leveling right now".format(dest))
         free = lead.get("bag_free")
-        if hub.lead_full or (free is not None and free < TRADE_MIN_FREE):
+        if (hub.lead_full and dest == hub.trade_to) or (free is not None and free < TRADE_MIN_FREE):
             if now - getattr(self, "full_logged", 0) > 1800:
                 self.full_logged = now
-                self.log(f"{hub.trade_to}'s bag is full ({free} free) -> keeping my {self.boxes} box(es) for now")
+                self.log(f"{dest}'s bag is full ({free} free) -> keeping my {self.boxes} box(es) for now")
             return self.trade_trip_end()
         if lead.get("map") != s.get("map") or lead.get("x") is None or \
                 math.hypot(lead["x"] - s["x"], lead["y"] - s["y"]) > TRADE_MEET_RADIUS:
             return self.trade_travel(lead)
         if remote:
             link = hub.link
-            res = link.trade("start", hub.trade_to, self.name, fields={"n": self.boxes, "phase": "meet"}) if link else None
+            res = link.trade("start", dest, self.name, fields={"n": self.boxes, "phase": "meet"}) if link else None
             if not res or not res.get("ok"):
                 if res and res.get("alt"):
-                    self.log(f"{res['alt']} is already trading with {hub.trade_to} -> waiting")
+                    self.log(f"{res['alt']} is already trading with {dest} -> waiting")
                 return "travel" if self.trade_trip else None
         with hub.lock:
             if hub.trade is not None:
                 return "travel" if self.trade_trip else None
-            t = {"alt": self.name, "lead": hub.trade_to, "phase": "meet", "start": now, "phase_at": now,
+            t = {"alt": self.name, "lead": dest, "phase": "meet", "start": now, "phase_at": now,
                  "n": self.boxes, "requests": 0, "ok": False, "lead_free": free, "remote": remote}
             hub.trade = t
         self.trade_trip = None
-        self.log(f"met {hub.trade_to}{' (' + lead.get('machine', '') + ')' if remote else ''} with "
+        self.log(f"met {dest}{' (' + lead.get('machine', '') + ')' if remote else ''} with "
                  f"{self.boxes} Box(es) of Kundun ({self.boxes5} +5) -> trading right here")
         return t
 
@@ -1733,15 +1758,15 @@ class Agent:
         if need is None or alias is None or lvl < need:
             if now - getattr(self, "travel_logged", 0) > 600:
                 self.travel_logged = now
-                self.log(f"{self.boxes5} Box(es) +5 for {self.hub.trade_to}, but he is on map {m} "
+                self.log(f"{self.boxes5} Box(es) +5 for {self.trade_dest}, but he is on map {m} "
                          f"({alias or '?'}, needs lvl {need or '?'}) -> not reachable from lvl {lvl}, waiting")
             return self.trade_trip_end()
         if not self.trade_trip:
             self.trade_trip = {"since": now}
-            self.log(f"{self.boxes5} Box(es) +5 ({self.boxes} Kundun in all) -> going to {self.hub.trade_to} "
+            self.log(f"{self.boxes5} Box(es) +5 ({self.boxes} Kundun in all) -> going to {self.trade_dest} "
                      f"at {alias} ({lead.get('x')}, {lead.get('y')})")
         elif now - self.trade_trip["since"] > TRADE_TRAVEL_SEC:
-            self.log(f"could not reach {self.hub.trade_to} in {TRADE_TRAVEL_SEC}s -> back to leveling, "
+            self.log(f"could not reach {self.trade_dest} in {TRADE_TRAVEL_SEC}s -> back to leveling, "
                      f"next try in {TRADE_RETRY_SEC // 60} min")
             self.trade_next = now + TRADE_RETRY_SEC
             return self.trade_trip_end()
@@ -1751,10 +1776,122 @@ class Agent:
     def trade_trip_end(self, why=None):
         if self.trade_trip:
             if why:
-                self.log(f"stopped going to {self.hub.trade_to}: {why}")
+                self.log(f"stopped going to {self.trade_dest}: {why}")
             self.trade_trip = None
             self.c.walk_target = None          # leveling walks back to my spot
         return None
+
+    def receivers(self):
+        """Characters that take boxes and never give them: the main and the vault keeper."""
+        return {n for n in (self.hub.trade_to, VAULT_KEEPER) if n}
+
+    def trade_target(self):
+        """Juan 2026-10-15: boxes go to the main (TRADE_TO) until he holds MAIN_PLUS5_FULL Boxes +5,
+        then to the vault keeper. None = nobody to give to (I'm a receiver myself)."""
+        if self.name in self.receivers():
+            return None
+        main = self.hub.trade_to
+        info, _ = self.peer_info(main)
+        if VAULT_KEEPER and info and (info.get("boxes5") or 0) >= MAIN_PLUS5_FULL:
+            return VAULT_KEEPER
+        return main
+
+    # ── vault keeper (VAULT_KEEPER): stores the Boxes of Kundun in the account vault ──
+    def vault_tick(self):
+        """True while the keeper is on a vault trip (leveling paused). With VAULT_DEPOSIT_AT+ Kundun
+        boxes, while leveling (events, trades and BC come first): /move Lorencia, walk to Baz, Storage
+        Guard (npcType 240), open the vault, move every box bag -> vault one at a time (checking each
+        left the bag), close it, back to leveling."""
+        if not VAULT_KEEPER or self.name != VAULT_KEEPER:
+            return False
+        c, s = self.c, self.c.s
+        now = time.time()
+        v = self.vault
+        if v is None:
+            if now < self.vault_next or self.bcs or self.my_trade or (s.get("hp") or 0) <= 0 or c.shop_pending \
+                    or (s.get("level") or 0) >= (self.hub.reset_level or 10 ** 6) or self.trade_quiet():
+                return False
+            if self.boxes_count() < VAULT_DEPOSIT_AT:
+                return False
+            t = self.hub.trade
+            if t and self.name in (t.get("alt"), t.get("lead")):
+                return False                 # a giver is on its way / trading with me
+            v = self.vault = {"since": now, "phase": "go", "phase_at": now, "moved": 0, "tries": 0,
+                              "start_boxes": self.boxes}
+            self.log(f"VAULT: {self.boxes} Box(es) of Kundun ({self.boxes5} +5) -> taking them to the vault in Lorencia")
+        self.mode = "vault"
+        if (s.get("hp") or 0) <= 0:
+            return True
+        if self.bcs or self.trade_quiet() and v["phase"] in ("go", "open"):
+            return self.vault_end("an event is coming", ok=False, retry=60)
+        if now - v["since"] > VAULT_TIMEOUT:
+            return self.vault_end(f"took more than {VAULT_TIMEOUT}s (phase {v['phase']})", ok=False)
+        try:
+            if v["phase"] == "go":
+                if self.go(0, "Lorencia", *VAULT_SPOT, radius=3):
+                    self.vault_phase(v, "open")
+                return True
+            st = self.ev(VAULT_STATE_JS) or {}
+            if v["phase"] == "open":
+                if st.get("open"):
+                    if st.get("locked"):
+                        return self.vault_end("the vault has a PIN -> unlock it by hand", ok=False, retry=3600)
+                    self.log(f"VAULT: open ({st.get('items')} item(s) inside)")
+                    self.vault_phase(v, "move")
+                    return True
+                if now - v["phase_at"] < 4 and v["tries"]:
+                    return True
+                if v["tries"] >= 3:
+                    return self.vault_end("Baz, Storage Guard did not open the vault", ok=False)
+                c.set_helper(False)
+                c.close_windows()
+                found = self.ev(B.TALK_NPC_JS, VAULT_NPC_TYPE)
+                v["tries"] += 1
+                v["phase_at"] = now
+                if not found:
+                    self.log("VAULT: Baz, Storage Guard not in view -> walking to the vault spot again")
+                    self.vault_phase(v, "go")
+                return True
+            if v["phase"] == "move":
+                if not st.get("open"):
+                    return self.vault_end("the vault window closed", ok=v["moved"] > 0)
+                if st.get("pending"):
+                    return True
+                slots = self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or []
+                last = v.get("last")
+                if last is not None:
+                    if last in slots:
+                        if now - v["move_at"] < 3:
+                            return True              # the server hasn't answered yet
+                        return self.vault_end(f"a box did not move (slot {last}) -> vault full? "
+                                              f"({st.get('items')} item(s) inside)", ok=v["moved"] > 0, retry=3600)
+                    v["moved"] += 1
+                    v["last"] = None
+                if not slots:
+                    self.ev("() => window.__eco.closeVault()")
+                    return self.vault_end(f"stored {v['moved']} box(es), vault now holds "
+                                          f"{(self.ev(VAULT_STATE_JS) or {}).get('items', '?')} item(s)", ok=True)
+                v["last"], v["move_at"] = slots[0], now
+                self.ev("(i) => window.__store.autoMoveItem(0, i, 2)", slots[0])   # Inventory (0) -> Vault (2)
+                return True
+        except Exception as e:
+            self.log(f"VAULT error: {e!r}")
+        return True
+
+    def vault_phase(self, v, phase):
+        v["phase"], v["phase_at"], v["tries"] = phase, time.time(), 0
+
+    def vault_end(self, why, ok, retry=None):
+        self.log(f"VAULT: {why}")
+        try:
+            self.ev("() => { const e = window.__eco; if (e && e.vaultOpen) e.closeVault(); }")
+        except Exception:
+            pass
+        self.vault = None
+        self.vault_next = time.time() + (VAULT_RETRY_SEC if retry is None and not ok else (retry or 60))
+        self.boxes_at = 0                     # recount the bag
+        self.c.walk_target = None             # leveling walks back to my spot
+        return False
 
     def trade_phase(self, t, phase):
         with self.hub.lock:
@@ -1829,7 +1966,7 @@ class Agent:
     def remote_trade_for_me(self):
         """I'm the main: a giver on the other machine opened a trade session with me -> my mirror of it."""
         link = self.hub.link
-        if not link or self.name != self.hub.trade_to:
+        if not link or self.name not in self.receivers():
             return None
         sess = link.trades().get(self.name)
         if not sess or sess.get("ended") or sess.get("machine") == link.machine or (sess.get("age") or 0) > 10:
@@ -1852,9 +1989,9 @@ class Agent:
         t = self.my_trade
         if t is None:
             t = hub.trade
-            if t is None and self.name == hub.trade_to:
+            if t is None and self.name in self.receivers():
                 t = self.remote_trade_for_me()
-            if t is None and self.name != hub.trade_to:
+            if t is None and self.name not in self.receivers():
                 t = self.maybe_start_trade()
                 if t == "travel":
                     self.mode = "trade"
