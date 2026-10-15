@@ -187,6 +187,17 @@ IDLE_WIGGLE_EVERY   = (15, 40)  # seconds between steps (random in this range)
 IDLE_WIGGLE_STEP    = (1, 1) # tiles per step (random in this range; (1, 1) = always 1)
 IDLE_WIGGLE_LEASH   = 2         # never further than this many tiles from the waiting spot
 IDLE_WIGGLE_DOOR_SEC = 15       # Devias: stop wiggling and stand on the spot this long before the door opens
+# idle wander (Juan 2026-10-15): the long waits in town (Lorencia bar after the cloak, levelee at the
+# bar, Devias before the door) walk around instead: pick a random walkable SAFE-ZONE tile a few tiles
+# away, walk there, linger, pick another. Everyone used to bunch up on the bar / in front of the Spirit.
+IDLE_WANDER         = True
+IDLE_WANDER_BAR     = 12        # Lorencia bar: wander up to this many tiles from the bar
+IDLE_WANDER_DEVIAS  = 8         # Devias: wander up to this many tiles from the Spirit of Archangel ...
+IDLE_WANDER_DEVIAS_MIN = 3      # ... but never closer than this to it (don't stand in front of him)
+IDLE_WANDER_MIN     = 4         # each new point is at least this many tiles from where I stand
+IDLE_WANDER_PAUSE   = (6, 25)   # seconds to linger at each point (random in this range)
+IDLE_WANDER_GIVEUP  = 12        # a point not reached in this long (blocked path) -> pick another
+IDLE_WANDER_DOOR_SEC = 12       # Devias: walk back to the Spirit this long before the door opens
 
 # windows
 WINDOW_CHECK_EVERY  = 30    # seconds between window checks
@@ -305,6 +316,31 @@ ENTER_BUTTON_JS = """
   if (!el) return {dialog: true, text: any.map(e => e.textContent).join(' | ').slice(0, 200)};
   const r = el.getBoundingClientRect();
   return {dialog: true, x: r.left + r.width / 2, y: r.top + r.height / 2, label: el.textContent};
+}
+"""
+
+
+# idle wander: a random walkable safe-zone tile within r of home (>= keepOff from home, >= minStep
+# from where I stand), preferring tiles no other player stands on/next to
+WANDER_PICK_JS = """
+([hx, hy, r, keepOff, mx, my, minStep]) => {
+  const w = window.__world; if (!w || !w.isWalkable) return null;
+  const safe = (x, y) => !w.getTerrainFlag || (w.getTerrainFlag(x, y) & 1) === 1;
+  const others = [];
+  for (const e of (w.netObjsQuery ? w.netObjsQuery.entities : []))
+    if (!e.localPlayer && e.charAppearance) others.push([e.transform.pos.x, e.transform.pos.z]);
+  const free = (x, y) => others.every(([ox, oy]) => Math.hypot(ox - x, oy - y) > 2);
+  let fallback = null;
+  for (let i = 0; i < 300; i++) {
+    const a = Math.random() * 2 * Math.PI, d = keepOff + Math.random() * (r - keepOff);
+    const x = Math.round(hx + Math.cos(a) * d), y = Math.round(hy + Math.sin(a) * d);
+    const dh = Math.hypot(x - hx, y - hy);
+    if (dh > r || dh < keepOff || Math.hypot(x - mx, y - my) < minStep) continue;
+    if (!w.isWalkable(x, y) || !safe(x, y)) continue;
+    if (free(x, y)) return [x, y];
+    if (!fallback) fallback = [x, y];
+  }
+  return fallback;
 }
 """
 
@@ -464,6 +500,9 @@ class Agent:
         self.vit_fails = 0
         self.wig_home = None         # waiting spot I'm idle-wiggling around: (map, x, y)
         self.wig_next = 0
+        self.wan_target = None       # idle wander: point I'm walking to, when I set it, linger-until
+        self.wan_set_at = 0
+        self.wan_until = 0
         # Golden Invasion hunter (mu_gi.py): GI.GI_CHARS + every character with max stats (checked live)
         self.gi = GI.GoldenInvasion(self) if GI.GI_ENABLED else None
         # Big Boss (mu_bb.py): every available character goes, one party of ours, back to normal after
@@ -1485,7 +1524,7 @@ class Agent:
             c.walk_target = None
             return True
         m, x, y = B.BAR_SPOT
-        if self.park(m, "Lorencia", x, y, radius=3):
+        if self.park(m, "Lorencia", x, y, radius=3, wander=IDLE_WANDER_BAR):
             c.set_helper(False)
         return True
 
@@ -2383,20 +2422,52 @@ class Agent:
         self.ev(B.WALK_JS, [x, y])
         return False
 
-    def park(self, map_idx, alias, x, y, radius=2):
+    def park(self, map_idx, alias, x, y, radius=2, wander=0, keep_off=0):
         """go() for a spot where the character only WAITS: once there, it idle-wiggles around it
-        (and counts as arrived while within IDLE_WIGGLE_LEASH tiles of it)."""
+        (and counts as arrived while within IDLE_WIGGLE_LEASH tiles of it). wander > 0: instead of
+        wiggling it walks around up to that many tiles from the spot (IDLE_WANDER), never closer
+        than keep_off tiles to it."""
         c, s = self.c, self.c.s
         home = (map_idx, x, y)
-        if (IDLE_WIGGLE and self.wig_home == home and s.get("map") == map_idx
-                and dist(s, x, y) <= max(radius, IDLE_WIGGLE_LEASH + 0.5)):
+        wander = wander if IDLE_WANDER else 0
+        leash = wander + 2 if wander else IDLE_WIGGLE_LEASH + 0.5
+        if ((wander or IDLE_WIGGLE) and self.wig_home == home and s.get("map") == map_idx
+                and dist(s, x, y) <= max(radius, leash)):
             c.walk_target = None
-            self.idle_wiggle(home)
+            self.idle_wander(home, wander, keep_off) if wander else self.idle_wiggle(home)
             return True
-        if not self.go(map_idx, alias, x, y, radius):
+        if not self.go(map_idx, alias, x, y, max(radius, wander)):   # wandering: anywhere in the area counts
             return False
-        self.idle_wiggle(home)
+        self.idle_wander(home, wander, keep_off) if wander else self.idle_wiggle(home)
         return True
+
+    def idle_wander(self, home, radius, keep_off=0):
+        """Waiting in town: walk to a random walkable safe-zone tile within `radius` of home (at least
+        keep_off from it), linger IDLE_WANDER_PAUSE seconds, pick another one."""
+        s = self.c.s
+        now = time.time()
+        if self.wig_home != home:            # just arrived: a short look around, then start walking
+            self.wig_home = home
+            self.wan_target, self.wan_until = None, now + random.uniform(1, 4)
+            return
+        x, y = s.get("x"), s.get("y")
+        if x is None or y is None or (s.get("hp") or 0) <= 0 or s.get("helper"):
+            return
+        if self.wan_target:
+            tx, ty = self.wan_target
+            if math.hypot(x - tx, y - ty) <= 1.5:                 # there: linger
+                self.wan_target, self.wan_until = None, now + random.uniform(*IDLE_WANDER_PAUSE)
+            elif now - self.wan_set_at > IDLE_WANDER_GIVEUP:      # blocked: linger here, then another
+                self.wan_target, self.wan_until = None, now + random.uniform(2, 6)
+            return
+        if now < self.wan_until:
+            return
+        _, hx, hy = home
+        pt = self.ev(WANDER_PICK_JS, [hx, hy, radius, keep_off, int(x), int(y), IDLE_WANDER_MIN])
+        if pt and self.ev(B.WALK_JS, [int(pt[0]), int(pt[1])]):
+            self.wan_target, self.wan_set_at = (int(pt[0]), int(pt[1])), now
+        else:
+            self.wan_until = now + 5
 
     def idle_wiggle(self, home):
         """Standing at a waiting spot: every IDLE_WIGGLE_EVERY seconds take a 1-2 tile step to a random
@@ -2505,11 +2576,13 @@ class Agent:
                 self.bc_done(f"no cloak +{tier} and no time left to buy one")
             return
         if since_open < -BC_DEVIAS_SEC:
-            self.park(*bar)          # wait at the bar (safe zone, no EXP)
+            self.park(*bar, wander=IDLE_WANDER_BAR)   # wait around the bar (safe zone, no EXP), walking about
             return
         m, x, y = B.SPIRIT_SPOT
-        if since_open < -IDLE_WIGGLE_DOOR_SEC:
-            self.park(m, "Devias", x, y, radius=1)     # wait by the Spirit, wiggling a little
+        door_sec = IDLE_WANDER_DOOR_SEC if IDLE_WANDER else IDLE_WIGGLE_DOOR_SEC
+        if since_open < -door_sec:
+            # wait around the Spirit, walking about (not standing in front of him)
+            self.park(m, "Devias", x, y, radius=1, wander=IDLE_WANDER_DEVIAS, keep_off=IDLE_WANDER_DEVIAS_MIN)
             return
         if not self.go(m, "Devias", x, y, radius=1):   # back on the spot for the click
             return
