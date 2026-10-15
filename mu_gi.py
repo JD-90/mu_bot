@@ -25,6 +25,8 @@ Timeline (start = the event start read from the event panel, normally :50:00):
                         (areas with leftover loot count as already searched)
                       * never runs back to town; after a death it respawns and carries on
                       * /pkclear right after every kill (GI_PKCLEAR_ON_KILL: as soon as we turn outlaw)
+  door-5min  a hunter with a Blood Castle in the plan ends the hunt GI_BC_LEAVE_SEC (5 min) before the door
+                    opens (on a Golden Dragon: when the door opens) -> AFTER, then cloak + bar, Devias at :59:30
   end        AFTER  /pkclear if still outlaw (sells ONE Zen Chest at the Lorencia bar first if zen is short),
                     then back to normal (leveling / Blood Castle if still in a castle's range)
 
@@ -53,6 +55,9 @@ GI_WAIT_SEC      = 15               # be at the waiting spot this long before th
 GI_HUNT_SEC      = 900              # the event lasts 15 min (:50 -> :05): hunt until the end ... (Juan 2026-10-11:
                                     # dragons are much tougher now, 3 min was too short)
 GI_IDLE_SEC      = 90               # ... or until no golden mob was in view this long (dead / warping don't count)
+GI_BC_LEAVE_SEC  = 300              # a hunter that has a Blood Castle in the plan ends the hunt this long before the
+                                   # door opens (:55) -> cloak at the bar, Devias at BC_DEVIAS_SEC (Juan 2026-10-14).
+                                   # Fighting over a Golden Dragon (dragon lock): stays until the door opens, then goes
 GI_SEARCH_AGE    = 180              # a searched area counts as unsearched again after this long (long hunts)
 GI_MIN_LEFT      = 10               # (Juan 2026-10-14) fewer golden mobs than this left in total -> stop searching and
                                     # end the hunt (a fight / dragon lock in progress is finished first; 0 = off)
@@ -104,6 +109,11 @@ GI_DRAGON_LOCK   = True             # (Juan, 2026-10-12) fighting over a Golden 
 GI_DRAGON_LOCK_DIST = 16            # "fighting over it" = targeting the dragon, or a player while the dragon is this close
 GI_DRAGON_BOX_GRACE = 8             # dragon gone from view: wait this long for its box to show up before letting go
 GI_DRAGON_LOCK_MAX = 900            # safety cap: the lock never keeps a hunt alive longer than this past the normal end
+GI_CLOSE          = True            # (Juan 2026-10-14) close in for the kill: when the golden we're hitting (dragon
+GI_CLOSE_DIST     = 1               # or small one) is about to die, walk to this many tiles from it and keep casting
+GI_CLOSE_ETA      = 5               # from there, so we stand on the box when it drops. "About to die" = this many
+GI_CLOSE_HP       = 0.15            # seconds left (from its HP bar) or HP under this fraction. Ice Storm hits the
+GI_CLOSE_STUCK_MS = 2000            # same from 1 tile; no progress walking for this long -> cast from where we are
 GI_BIG_BOX_RADIUS = 10               # a free Box +5 this close is picked up BEFORE fighting players (Juan, 2026-10-12)
 GI_IGNORE_AFTER  = 20               # a target that got this many casts with <= 1 seen by the server ...
 GI_IGNORE_SEC    = 20               # ... is skipped this long (2026-10-11 23:50: 218 casts at the Noria gate, 1 seen)
@@ -175,6 +185,7 @@ GI_INSTALL_JS = r"""
     hostile: new Map(), target: null, targetIsPlayer: false, lastTargetName: null,
     box: null, boxFirstFail: new Map(), boxGaveUp: new Set(), lastPick: 0, pickFails: 0,
     lootSpamUntil: 0, lootSpamPos: null, lastSeenDragon: null,
+    mHp: new Map(), closing: null, closeBest: 0, closeProg: 0, closeWalkAt: 0, closeTileXY: null, closeFail: new Set(),
     hitsOnMe: 0, events: [], status: {}, recentTargets: new Map(), chatSeen: new WeakSet(),
     barrier: false, wasSafe: null, bQueue: [], bTries: 0, bAt: 0, bDone: 0, bEvents: [], buffAt: {},
     comboIdx: 0, comboAt: 0, attackSkill: null, ignored: new Map(), tStats: new Map(), tPrev: null, safeSkipped: 0,
@@ -215,6 +226,14 @@ GI_INSTALL_JS = r"""
       if (G.dHpId !== id) { G.dHpId = id; G.dHp = []; }
       const now = Date.now(); G.dHp.push([now, u[5]]);
       while (G.dHp.length && now - G.dHp[0][0] > 15000) G.dHp.shift();
+    } catch (e) {} });
+    // HP bar of ANY monster we hit -> G.mHp (close in for the kill, GI_CLOSE)
+    bus.on('MonsterHealthStatus', d => { try { const u = u8(d);
+      const id = ((u[3] & 0x7f) << 8) | u[4], now = Date.now();
+      let h = G.mHp.get(id); if (!h) { h = []; G.mHp.set(id, h); }
+      h.push([now, u[5]]);
+      while (h.length && now - h[0][0] > 15000) h.shift();
+      if (G.mHp.size > 300) for (const [k, v] of G.mHp) if (!v.length || now - v[v.length - 1][0] > 20000) G.mHp.delete(k);
     } catch (e) {} });
     // who is hitting the dragon: a player's skill on it, an area skill on/next to it, a plain attack on it
     G.dragonHit = (caster, how) => {
@@ -287,6 +306,25 @@ GI_INSTALL_JS = r"""
   const P = e => ({x: e.transform.pos.x, y: e.transform.pos.z});
   G.ent = id => { const w = W.__world; if (!w) return null;
     return (w.byNetId && w.byNetId.get ? w.byNetId.get(id) : null) || w.netObjsQuery.entities.find(x => x.netId === id) || null; };
+  // seconds until death from an HP history [[t, hp0-255], ...] (same estimate as the dragon's), null = unknown
+  G.etaOf = (h, now) => {
+    if (!h || h.length < 2) return null;
+    const last = h[h.length - 1], first = h.find(x => last[0] - x[0] <= 10000) || h[0];
+    const dt = (last[0] - first[0]) / 1000, dh = first[1] - last[1];
+    return (dt >= 2 && dh > 0) ? Math.max(0, last[1] / (dh / dt) - (now - last[0]) / 1000) : null;
+  };
+  // walkable tile GI_CLOSE_DIST from the target, the one nearest to me
+  G.closeTile = (w, tp, me, r) => {
+    let best = null; const tx = Math.round(tp.x), ty = Math.round(tp.y);
+    for (let dx = -r; dx <= r; dx++) for (let dy = -r; dy <= r; dy++) {
+      if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+      const x = tx + dx, y = ty + dy;
+      if (x < 3 || y < 3 || x > 252 || y > 252 || !w.isWalkable(x, y)) continue;
+      const d = Math.hypot(x - me.x, y - me.y);
+      if (!best || d < best.d) best = {x, y, d};
+    }
+    return best;
+  };
   // a player hit me: target them right away (also potions); logged once per attack spell
   G.markHostile = (e, how) => {
     const now = Date.now(), name = (e.objectNameInWorld || '').trim();
@@ -551,7 +589,48 @@ GI_INSTALL_JS = r"""
       if (e && e.dying) { ev('player DIED: ' + r.name); G.recentTargets.delete(id); }
       else if (now - r.at > 10000) G.recentTargets.delete(id);
     }
-    if (target) {
+    // ── close in for the kill (Juan 2026-10-14): golden about to die -> walk to GI_CLOSE_DIST tiles of it ──
+    let closeTo = null, closeInfo = '';
+    if (cfg.close && target && !isPlayer) {
+      const id = target.e.netId, hist = G.mHp.get(id);
+      const hpNow = hist && hist.length ? hist[hist.length - 1][1] : null;
+      const tEta = G.etaOf(hist, now);
+      const dying = (hpNow !== null && hpNow <= cfg.closeHp * 255) || (tEta !== null && tEta <= cfg.closeEta);
+      if (dying && !G.closeFail.has(id)) {
+        const need = target.d > cfg.closeDist + (G.closing === id ? 0.8 : 0.9);
+        closeInfo = `hp ${hpNow === null ? '?' : Math.round(hpNow / 2.55)}%` + (tEta !== null ? `, ~${tEta.toFixed(1)} s left` : '');
+        if (need) closeTo = target;
+        else if (G.closing === id) { ev(`next to ${target.name} (${target.d.toFixed(1)} tiles) -> casting from here`); G.closing = null; }
+      }
+    }
+    if (closeTo) {
+      const id = closeTo.e.netId;
+      if (G.closing !== id) {
+        G.closing = id; G.closeBest = closeTo.d; G.closeProg = now; G.closeWalkAt = 0; G.closeTileXY = null;
+        ev(`closing in on ${closeTo.name} (${closeInfo}, ${closeTo.d.toFixed(1)} tiles) -> ${cfg.closeDist} tile`);
+      }
+      if (closeTo.d < G.closeBest - 0.3) { G.closeBest = closeTo.d; G.closeProg = now; }
+      else if (now - G.closeProg > cfg.closeStuckMs) {
+        G.closeFail.add(id); G.closing = null; closeTo = null;
+        ev(`could not get next to ${target.name} in ${cfg.closeStuckMs / 1000} s -> casting from here`);
+        if (G.closeFail.size > 100) G.closeFail.clear();
+      }
+    } else if (G.closing !== null && (!target || target.e.netId !== G.closing || isPlayer)) G.closing = null;
+    if (closeTo) {
+      // walk instead of casting this tick (a cast still in its animation finishes; nothing new is queued)
+      G.box = null;
+      w.castRequest = null; w.attackTarget = null;
+      const t = G.closeTile(w, closeTo.p, me, cfg.closeDist);
+      if (!t) { G.closeFail.add(closeTo.e.netId); G.closing = null; ev(`no free tile next to ${closeTo.name} -> casting from here`); }
+      else if (!G.closeTileXY || G.closeTileXY[0] !== t.x || G.closeTileXY[1] !== t.y || now - G.closeWalkAt > 400) {
+        G.closeTileXY = [t.x, t.y]; G.closeWalkAt = now;
+        try {
+          const mv = h.playerMoveTo, pf = h.pathfinding;
+          mv.point.x = t.x; mv.point.y = t.y; mv.handled = false; mv.sendToServer = true;
+          pf.from.x = h.transform.pos.x; pf.from.y = h.transform.pos.z; pf.to.x = t.x; pf.to.y = t.y; pf.calculated = false;
+        } catch (e) { G.closeFail.add(closeTo.e.netId); G.closing = null; ev('close-in walk error: ' + String(e).slice(0, 100)); }
+      }
+    } else if (target) {
       G.box = null;
       try { const sk = G.pickSkill(now, s); G.attackSkill = sk; if (sk && s.currentSkill !== sk) s.selectSkill(sk); } catch (e) {}
       if (!isPlayer) w.attackTarget = target.e;
@@ -569,7 +648,7 @@ GI_INSTALL_JS = r"""
     if (!target && G.target !== null) { w.attackTarget = null; w.castRequest = null; }
     G.target = target ? target.e.netId : null;
     G.status = {safePlayers: safeN, ignored: G.ignored.size, mode: (isSpammingLoot && !pick) ? 'spam_loot' : (target ? (isPlayer ? 'pvp' : (target.e.npcType === 79 ? 'dragon' : 'golden')) : (pick ? 'box' : 'search')),
-      spamPos: G.lootSpamPos, target: tName, why, players: players.length, near: players.filter(x => x.d <= cfg.pvpRadius).length,
+      spamPos: G.lootSpamPos, closing: !!closeTo, target: tName, why, players: players.length, near: players.filter(x => x.d <= cfg.pvpRadius).length,
       goldens: goldens.length, dragon: dragon ? [Math.round(dragon.p.x), Math.round(dragon.p.y), Math.round(dragon.d)] : null,
       helping, eta: eta === null ? null : Math.round(eta), hitters: G.dHitters.size, boxes: boxes.length, loot: loot.slice(0, 20), hp, maxHp: pd.maxHP, heroState: h.heroState,
       big5: (() => { const b = boxes.find(x => x.lvl >= 12 && !G.boxGaveUp.has(x.e.netId)); return b ? Math.round(b.d) : null; })(),
@@ -863,7 +942,7 @@ class GoldenInvasion:
             a.show_window = True
 
     def cfg(self):
-        return {"version": 14, "clear": GI_CLEAR, "clearEta": GI_CLEAR_ETA, "clearMinEta": GI_CLEAR_MIN_ETA, "clearMax": GI_CLEAR_MAX, "clearKillMs": GI_CLEAR_KILL_SEC * 1000, "clearLeash": GI_CLEAR_LEASH, "potHp": GI_POT_HP, "castGap": GI_CAST_GAP_MS, "dragonLock": GI_DRAGON_LOCK, "areaHitRadius": GI_AREA_HIT_RADIUS, "areaHitMs": GI_AREA_HIT_MS, "pvpMode": GI_PVP_MODE, "bigBoxRadius": GI_BIG_BOX_RADIUS, "ignoreAfter": GI_IGNORE_AFTER, "ignoreMs": GI_IGNORE_SEC * 1000, "ours": list(self.a.hub.names), "skill": GI_SKILLS.get(self.a.name.lower(), 0), "potKey": GI_POTION_KEY,
+        return {"version": 16, "close": GI_CLOSE, "closeDist": GI_CLOSE_DIST, "closeEta": GI_CLOSE_ETA, "closeHp": GI_CLOSE_HP, "closeStuckMs": GI_CLOSE_STUCK_MS, "clear": GI_CLEAR, "clearEta": GI_CLEAR_ETA, "clearMinEta": GI_CLEAR_MIN_ETA, "clearMax": GI_CLEAR_MAX, "clearKillMs": GI_CLEAR_KILL_SEC * 1000, "clearLeash": GI_CLEAR_LEASH, "potHp": GI_POT_HP, "castGap": GI_CAST_GAP_MS, "dragonLock": GI_DRAGON_LOCK, "areaHitRadius": GI_AREA_HIT_RADIUS, "areaHitMs": GI_AREA_HIT_MS, "pvpMode": GI_PVP_MODE, "bigBoxRadius": GI_BIG_BOX_RADIUS, "ignoreAfter": GI_IGNORE_AFTER, "ignoreMs": GI_IGNORE_SEC * 1000, "ours": list(getattr(self.a.hub, "friends", self.a.hub.names)), "skill": GI_SKILLS.get(self.a.name.lower(), 0), "potKey": GI_POTION_KEY,
                 "potEvery": GI_POT_EVERY_MS, "hitWindow": GI_HIT_WINDOW_MS, "pvpRadius": GI_PVP_RADIUS,
                 "view": GI_VIEW, "boxWait": GI_BOX_WAIT_SEC * 1000, "loopMs": GI_LOOP_MS,
                 "barrierTries": GI_BARRIER_TRIES,
@@ -907,11 +986,45 @@ class GoldenInvasion:
             if rel >= GI_HUNT_SEC and not self.locked():
                 self.end_hunt("event time is over")
                 return True
+            bc = self.bc_due()
+            if bc is not None:
+                self.left_for_bc = a.hub.open_at
+                self.end_hunt(f"Blood Castle {bc} opens in {max(int(a.hub.open_at - time.time()), 0)} s")
+                return True
             self.hunt(rel)
             return True
         if self.phase == "after":
             return self.after()
         return False
+
+    def bc_due(self):
+        """The castle tier when this hunter is in the Blood Castle plan and it's time to leave the hunt
+        (GI_BC_LEAVE_SEC before the door opens; with the dragon lock on, once the door is open); else None."""
+        a = self.a
+        hub = a.hub
+        plan, open_at = hub.plan, hub.open_at
+        if not hub.bc_on or not plan or open_at is None:
+            return None
+        bcs = a.bcs
+        if bcs is not None:
+            if bcs.get("entered"):
+                return None
+            tier = bcs["tier"]
+        else:
+            asg = plan["assign"].get(a.name)
+            if not asg or a.name in plan["out"]:
+                return None
+            tier = asg[0]
+        until = open_at - time.time()
+        if until > GI_BC_LEAVE_SEC or until < -(B.BC_DOOR_CLOSE_SEC - B.BC_ENTRY_NEEDS_SEC):
+            return None
+        if self.locked() and until > 0:
+            if not getattr(self, "bc_lock_logged", None) == open_at:
+                self.bc_lock_logged = open_at
+                self.log(f"Blood Castle {tier} in {int(until)} s, but we're on a Golden Dragon -> "
+                         f"staying until the door opens")
+            return None
+        return tier
 
     # ── PREP: potions in Noria ──
     def prep(self):
@@ -1290,6 +1403,7 @@ class GoldenInvasion:
                      f"(near {status.get('near')}) | goldens {status.get('goldens')} | hp {status.get('hp')}/"
                      f"{status.get('maxHp')} | pots {status.get('pots')} | casts {status.get('casts')}/"
                      f"{status.get('myCasts')} seen | skill {status.get('attackSkill')} | left {counts and counts.get('total')}"
+                     + (" | closing in" if status.get("closing") else "")
                      + (f" | dragon ~{status.get('eta')} s left, {status.get('hitters')} other(s) hitting it" if status.get('eta') is not None else ""))
 
     def pkclear_on_kill(self, status, s):

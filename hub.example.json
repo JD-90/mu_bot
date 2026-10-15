@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy to hub.json (git-ignored, one per machine). The PC serves; the Mac points at the PC's LAN IP (the PC bot logs it at startup). Same key on both. No hub.json = this machine runs alone.",
+  "machine": "pc",
+  "serve": true,
+  "port": 47300,
+  "url": "http://127.0.0.1:47300",
+  "key": "pick-a-secret-and-use-it-on-both-machines"
+}

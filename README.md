@@ -49,6 +49,18 @@ Until the levelee has `ASSIST_UNTIL_RESETS` (5) resets:
 
 At 5 resets the pair splits by itself; the next grand reset (detected when the reset counter drops to 0) starts it again.
 
+## Several machines (roster.json)
+
+Each machine's `accounts.json` lists only the logins that machine runs. `roster.json` (committed, the same on every machine) lists **all** our characters and which machine runs each. Everything that asks "is this player one of ours?" uses it: Golden Invasion never fights them, Blood Castle doesn't treat them as strangers, scouting doesn't count them as crowd, chat replies ignore them. Add a new character to `roster.json` before running it. The startup log prints `roster: ...` and warns about characters missing from it. (Phase 0: the machines don't share levels or positions yet — see the multi-machine plan.)
+
+### Shared hub (hub.json)
+
+With a `hub.json` (git-ignored, template `hub.example.json`) the bots also share live state: the PC bot runs a small server (`mu_hub.py`, port 47300), every bot sends its characters' level/map/position/mode every 3 s, and Blood Castle castles are **claimed** at the hub so the PC and the Mac never send two characters to the same castle (another machine's claim makes the planner pick the next castle). Hub unreachable -> each machine plans only among its own characters. No `hub.json` -> the machine runs alone, as before.
+
+- PC: `"serve": true`, url `http://127.0.0.1:47300`. On first start Windows Firewall asks about Python: allow **Private networks**. The startup log prints the address the Mac must use.
+- Mac: `"serve": false`, `"machine": "mac"`, url `http://<PC LAN IP>:47300`, same `key`. Check with `python3 mu_hub.py test` (the VPN must allow local-network access).
+- Status page: `http://<PC LAN IP>:47300/?key=<key>` in any browser on the network. The 5-minute summary in the log adds a `hub:` line with the other machine's characters.
+
 ## Restarting without the console (supervisor)
 
 `run_auto.bat` on Windows or `./run_auto.sh` on macOS starts `mu_supervisor.py`, which runs `mu_auto_bot.py` in the same window (P / B / 1-5 still work) and logs to `supervisor.log`.

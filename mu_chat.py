@@ -38,6 +38,7 @@ from datetime import datetime
 
 import mu_group_bot as G
 from mu_bc import in_bc
+import roster as R
 
 # ───────────────────────────── CONFIG ─────────────────────────────
 CHAT_ENABLED     = False
@@ -204,6 +205,7 @@ class ChatHub:
 
     def __init__(self, names):
         self.names = list(names)
+        self.friends = R.friends(names)      # + our characters on other machines: never answered
         self.lower = {n.lower(): n for n in names}
         self.name_res = {n: _name_re(n) for n in names}
         self.lock = threading.Lock()
@@ -223,7 +225,7 @@ class ChatHub:
                 f"(model {CHAT_MODEL}, API key {'found' if self.key else 'MISSING'})")
 
     def ours(self, name):
-        return (name or "").lower() in self.lower
+        return (name or "").lower() in self.lower or R.is_ours(name)
 
     def mentioned(self, text):
         return [n for n, r in self.name_res.items() if r.search(text or "")]
@@ -345,7 +347,7 @@ class ChatAgent:
         if now < self.next_poll:
             return
         self.next_poll = now + CHAT_POLL_SEC
-        r = self.a.ev(POLL_JS, [self.hub.names, NEAR_RADIUS])
+        r = self.a.ev(POLL_JS, [self.hub.friends, NEAR_RADIUS])
         if not r:
             return
         self.near = r.get("near") or []

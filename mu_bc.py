@@ -23,6 +23,8 @@ opens in <= 10 minutes, the group stops leveling and:
 import math
 import time
 
+import roster as R
+
 # ───────────────────────────── CONFIG ─────────────────────────────
 BC_ENABLED        = True
 BC_TIERS          = [(1, 15, 80), (2, 81, 130), (3, 131, 180), (4, 181, 230),
@@ -452,8 +454,8 @@ BRIDGE_ZONE_R  = 8
 # not in the party any more) don't count. Never longer than DELIVER_WAIT_MAX, nor with less than
 # DELIVER_MIN_REM seconds left on the castle clock.
 DELIVER_WAIT_PARTY = True
-DELIVER_SPAWN_R    = 10
-DELIVER_WAIT_MAX   = 90
+DELIVER_SPAWN_R    = 12
+DELIVER_WAIT_MAX   = 6
 DELIVER_MIN_REM    = 60
 BC_USE_HELPER  = False               # True = the old behaviour (helper bursts when stuck, helper at the statue)
 GRAB_LOOP_MS   = 50                  # in-page check period (20x/s), on top of the ItemsDropped event
@@ -1037,7 +1039,7 @@ class BloodCastle:
         return ok
 
     def scan(self, c, item=(0, 0, None), r=CLEAR_RADIUS):
-        ours = [m.name for m in self.g.members]
+        ours = R.friends([m.name for m in self.g.members])   # + our characters on other machines
         g, n, l = (item + (None,))[:3]
         return self.ev(c, SCAN_JS, [ours, r, g, n, l]) or {"players": [], "monsters": 0, "items": []}
 

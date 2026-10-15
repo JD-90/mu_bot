@@ -15,6 +15,8 @@ Leveling (each character, independently):
   * Strangers' party invites are accepted while leveling (LEVEL_ACCEPT_STRANGERS, not for pairs, only when
     not in a party). Once in, say LEVEL_AFK_TEXT once (at most every LEVEL_AFK_EVERY s); the party is
     left when we move on to another spot / leg, go to reset, Blood Castle, Golden Invasion or a box trade.
+  * Accepting another player's party invite (leveling or Blood Castle; not when WE invited):
+    PARTY_THANKS_DELAY s later say one of PARTY_THANKS_TEXTS ("thx", "gracias", ...).
 
 Blood Castle (15 minutes before every castle, BC_PLAN_SEC):
   * One character per castle level (BC1..BC7, lower castles first).
@@ -63,7 +65,7 @@ Pause: P pauses / resumes EVERY character. Keys 1-5 pause / resume ONE character
        accounts.json). A paused character's window is restored so you can play it; the others
        keep going. While paused, everything you do in that window is written to mu_record.log
        (mu_recorder.py) so new events can be learned from it. Characters in BIG_ON_PAUSE get a
-       fullscreen 1440p window with BIG_OPTIONS (100% render scale, effects, 120 fps, sound on)
+       fullscreen 1920x1200 window with BIG_OPTIONS (100% render scale, effects, 120 fps, sound on)
        while paused (back to 800x500 / Low / sound off on resume).
 Options: every account gets GAME_OPTIONS (mu_group_bot.py: W A S D, loot filter, FOV 60, 115%
        interface, sound off, hide "entered the game") and MU Helper on HELPER_KEY.
@@ -84,6 +86,8 @@ import mu_group_bot as G
 import mu_bc as B
 import mu_gi as GI
 import mu_chat as CH
+import mu_hub as HUB
+import roster as R
 from mu_bc import in_bc, dist
 
 # ───────────────────────────── CONFIG ─────────────────────────────
@@ -100,7 +104,13 @@ LEVEL_ACCEPT_STRANGERS = True   # leveling: accept party invites from other play
 LEVEL_AFK_TEXT      = "me quedo afk"   # said once after joining a stranger's party ("" = say nothing) ...
 LEVEL_AFK_EVERY     = 900       # ... and at most once per this many seconds per character (Juan 2026-10-12)
 LEVEL_AFK_PARTY_CHAT = True     # say it in party chat (~); False = normal chat
-LEVEL_AFK_DELAY     = (3, 8)    # seconds after joining before saying it (random, looks less instant)
+LEVEL_AFK_DELAY     = (7, 14)   # seconds after joining before saying it (random; after the thanks below)
+# thanks after accepting another player's party invite (leveling + Blood Castle; never for our own
+# characters' invites, never when we were the ones inviting) (Juan 2026-10-14)
+PARTY_THANKS_TEXTS  = ["thx", "gracias", "ty", "gracia"]   # one picked at random ([] = off)
+PARTY_THANKS_DELAY  = (2, 5)    # seconds after accepting (random)
+PARTY_THANKS_PARTY_CHAT = False # False = normal chat; True = party chat (~)
+PARTY_THANKS_MIN_GAP = 60       # at most once per this many seconds per character (kicked + re-invited...)
 
 # spot rules for a character on its own (the group bot's rules for the rest, see mu_group_bot.py)
 SOLO_DEATHS_TO_SWITCH = 3   # my deaths at one spot within DEATH_WINDOW_SEC -> switch (not on the best spot)
@@ -117,6 +127,11 @@ PAIRS               = {
     "mogulin": "invalido",
 }
 ASSIST_UNTIL_RESETS = 5
+CAP_FIGHT           = True  # (2026-10-14) since the server update the MU Helper turns off at the reset level and
+                            # can't be turned on again until /reset. A paired character holding at that level
+                            # (the leveler waiting for its levelee) fights on its own instead: the Blood Castle
+                            # no-helper loop (mu_bc.BC_GRAB_JS) in "guard" mode at the spot (hits anything in
+                            # skill range, potions on Q, buffs). False = old behaviour (helper, which now fails)
 PAIR_LEVELER_GRACE  = 30    # leveler offline (reload / map change) this long -> the levelee waits at the bar
 LEVELEE_VIT_MAX     = 1500  # every levelee in PAIRS puts its free points into VIT ("/add vit N") until it has
                             # this much (also after it graduates); above it nothing is added
@@ -129,6 +144,8 @@ BC_TOGGLE_KEY       = "b"
 BC_TIERS            = B.BC_TIERS        # (castle, min lvl, max lvl): BC1 15-80 ... BC7 331-400
 BC_PLAN_SEC         = 900   # make the plan this long before the entry window opens
 BC_FARM_UNTIL_SEC   = 180   # holders keep farming until this long before the window opens (:57) ...
+BC_DEVIAS_SEC       = 30    # wait at the Lorencia bar with the cloak, warp to the Spirit in Devias this long before
+                            # the door opens (was 75; Juan 2026-10-14: we stood outside the castle too long)
 BC_FARM_TOP_MARGIN  = 5     # ... or until they are this many levels below the top of the range (Juan 2026-10-11)
 BC_CLIMB_DEADLINE   = 120   # a climber not in its range this long before the window opens -> skips it
 BC_ENTER_MARGIN     = 3     # climbers stop this many levels inside the range (not right at its edge)
@@ -163,7 +180,7 @@ BIG_ON_PAUSE        = {"wizzardo"}  # these characters get a maximized, sharp wi
                                     # them with 1-5 (back to 800x500 / low graphics on resume)
 BIG_RENDER_SCALE    = 100   # Render scale (%) while big; None = leave it as the bot set it
 BIG_FULLSCREEN      = True  # True = fullscreen window while big (no browser bars); False = maximized
-BIG_RESOLUTION      = (2560, 1440)  # game size while big (1440p); capped to what the screen fits
+BIG_RESOLUTION      = (1920, 1200)  # game size while big; capped to what the screen fits
 # Game options while big (Juan 2026-10-14); index meanings are listed above GAME_OPTIONS in
 # mu_group_bot.py. On resume the Low preset + GAME_OPTIONS come back (sound off again).
 BIG_OPTIONS = {
@@ -292,7 +309,9 @@ class Hub:
 
     def __init__(self, names):
         self.lock = threading.RLock()   # re-entrant: a thread that already holds it can call snapshot() etc. without freezing everyone
-        self.names = names
+        self.names = names                       # characters THIS machine runs (accounts.json order)
+        self.friends = R.friends(names)          # + our characters on other machines (roster.json)
+        self.link = None                         # mu_hub.HubLink when hub.json exists (other machines)
         self.info = {}
         self.stats = SharedStats(G.BASE_DIR / G.STATS_FILE)
         self.reset_level = G.RESET_LEVEL
@@ -340,6 +359,9 @@ class Agent:
         self.invited = {}
         self.stranger_party = None   # leveling in a stranger's party: {"area", "joined", "say_at", "said"}
         self.afk_said_at = 0         # last time LEVEL_AFK_TEXT was said
+        self.thanks = None           # pending thanks after accepting a stranger's invite: {"at", "until", "who"}
+        self.thanks_said_at = 0
+        self.thanks_last = None      # last text used (not twice in a row)
         self.bcs = None              # Blood Castle state while this character is assigned to one
         self.plan_seen = None
         self.paused = False
@@ -353,6 +375,8 @@ class Agent:
         self.big = False             # window maximized for manual play (BIG_ON_PAUSE)
         self.msgwin_at = 0
         self.helper_press_at = 0     # last non-blocking MU Helper key press (helper_async)
+        self.cap_fight = {}          # in-page fight loop while holding at the reset level (CAP_FIGHT)
+        self.cap_armed = False       # armed it during this tick
         self.open_logged = None
         self.npc_talk_since = 0      # when the Archangel's dialog was first seen open
         self.boxes = 0               # Boxes of Kundun (+1..+5) in my bag (checked every 30 s)
@@ -530,6 +554,7 @@ class Agent:
         if self.step_key is not None and self.mode == "level":
             sp = G.ROUTE[self.step_key][4][self.spot_idx]
             target = (sp.map,) + tuple(sp)
+        bc_as = ((self.hub.plan or {}).get("assign") or {}).get(self.name) or (None, None)
         self.hub.put(self.name, {
             "name": self.name, "online": bool(c.online), "paused": self.paused, "mode": self.mode,
             "map": s.get("map"), "x": s.get("x"), "y": s.get("y"), "level": s.get("level"),
@@ -542,6 +567,7 @@ class Agent:
             "assisted": self.assisted(), "leveler": self.leveler_name if self.assisted() else None,
             "pair_lead": bool(self.my_levelees()), "parked": self.pair_parked,
             "gi_hunter": bool(self.gi and self.gi.is_hunter()),
+            "bc_tier": bc_as[0], "bc_role": bc_as[1],     # shared with the other machines (mu_hub)
         })
 
     def recent_rate(self):
@@ -557,6 +583,19 @@ class Agent:
 
     # ── main tick ──
     def tick(self):
+        self.cap_armed = False
+        try:
+            return self._tick()
+        finally:
+            # left the reset-level fight (reset, Blood Castle, Golden Invasion, pause, trade...) -> stop it
+            if self.cap_fight.get("grab_on") and not self.cap_armed:
+                try:
+                    bc_owns = bool((self.bcs or {}).get("grab_on"))   # BC re-armed the same loop: leave it
+                    self.cap_fight_off(f"now {self.mode}", send=not bc_owns)
+                except Exception as e:
+                    self.log(f"cap fight off: {e!r}")
+
+    def _tick(self):
         c, hub = self.c, self.hub
         if c.page.is_closed():
             raise RuntimeError("has been closed")
@@ -604,6 +643,7 @@ class Agent:
                 self.chat.tick()
             except Exception as e:
                 self.log(f"chat error: {e!r}")
+        self.thanks_tick()                  # any mode: leveling, Blood Castle, Golden Invasion...
         lvl = s.get("level") or 1
         if not self.history or now - self.history[-1][0] >= 10:
             self.history.append((now, lvl, s.get("resets")))
@@ -687,6 +727,8 @@ class Agent:
             bc += f" | carrying {', '.join(self.was_levelees)}"
         if self.name in PAIRS:
             bc += f" | VIT {s.get('vit')} ({s.get('points')} free pts)"
+        if self.cap_fight.get("grab_on"):
+            bc += " | fighting without helper (reset level)"
         if self.name == self.hub.trade_to and self.bag_free is not None:
             bc += f" | bag {self.bag_free} free" + (" (FULL for trades)" if self.hub.lead_full else "")
         self.log(f"lvl {s.get('level')} r{s.get('resets')} | {where} | "
@@ -852,8 +894,48 @@ class Agent:
         if anchor and anchor.get("map") == step[3] and (anchor.get("hp") or 0) > 0 and anchor.get("x") is not None \
                 and math.hypot(anchor["x"] - step[4], anchor["y"] - step[5]) <= G.LEASH_RADIUS:
             follow = (anchor["x"], anchor["y"])
-        c.move_tick(step, follow=follow)
+        if CAP_FIGHT and self.hub.reset_level and lvl >= self.hub.reset_level:
+            self.cap_fight_tick(step, lvl)       # holding for the pair's reset: no MU Helper any more
+        else:
+            if self.cap_fight.get("grab_on"):
+                self.cap_fight_off(f"lvl {lvl}")
+            c.move_tick(step, follow=follow)
         self.check_spot(step, spots, is_anchor=anchor is None and not levelee)
+
+    def cap_fight_tick(self, step, lvl):
+        """At the reset level the server keeps the MU Helper off until /reset (2026-10-14). A paired
+        character holding there (leveler waiting for its levelee) walks to the spot as usual (helper
+        off) and then fights with the in-page loop in guard mode: anything in skill range, back to the
+        spot if pushed off, potions, buffs."""
+        c, s = self.c, self.c.s
+        _, _, alias, map_idx, tx, ty = step
+        f = self.cap_fight
+        on = bool(f.get("grab_on"))
+        d = (math.hypot(s["x"] - tx, s["y"] - ty)
+             if s.get("map") == map_idx and s.get("x") is not None else 999)
+        if d > (G.LEASH_RADIUS if on else G.ARRIVE_RADIUS):
+            if on:
+                self.cap_fight_off(f"{d:.0f} tiles from the spot -> walking back")
+            c.move_tick(step)                    # warp / walk; never within ARRIVE_RADIUS here, so no helper ON
+            return
+        if s.get("helper"):
+            self.helper_async(False)
+        if not on:
+            self.log(f"lvl {lvl}: MU Helper stays off until the reset -> fighting myself at {alias} ({tx},{ty})")
+            c.walk_target, c.relocating = None, False
+        r = self.grab(f, True, goal=(tx, ty), goal_r=G.ARRIVE_RADIUS, mode="guard", weapon=False,
+                      statue=False, fight=True, zone=False, tag="CAP")
+        self.fight_log(f, r, tag="CAP fight")
+        self.cap_armed = True
+
+    def cap_fight_off(self, why, send=True):
+        f = self.cap_fight
+        if not f.get("grab_on"):
+            return
+        if send:
+            self.grab(f, False, fight=True, zone=False, tag="CAP")
+        f["grab_on"] = False
+        self.log(f"CAP: fight loop off ({why})")
 
     def new_spot(self):
         self.spot_since = time.time()
@@ -918,7 +1000,7 @@ class Agent:
             return
         if now - sc["arrived_at"] < G.SCOUT_LOOK_SEC:
             return
-        crowd = self.ev(G.CROWD_JS, [tx, ty, G.CROWD_RADIUS, self.hub.names]) or []
+        crowd = self.ev(G.CROWD_JS, [tx, ty, G.CROWD_RADIUS, self.hub.friends]) or []
         sc["seen"][si] = len(crowd)
         if not crowd:
             sc["seen"], sc["order"] = {}, [si]
@@ -957,7 +1039,12 @@ class Agent:
             return
         in_party = len(s.get("party") or []) > 1
         sa = stats_alias(alias, in_party)
-        if now - self.spot_since >= 60:
+        # at the reset level I gain no EXP: no rate samples (they'd save 0 lvl/min for the spot) and no
+        # rate-based switching (it would always look dead); deaths still count
+        capped = bool(self.hub.reset_level) and lvl >= self.hub.reset_level
+        if capped:
+            self.samples, self.stat_point = [], None
+        elif now - self.spot_since >= 60:
             if self.stat_point is None or self.stat_point[2] != in_party:
                 self.stat_point = (now, lvl, in_party)
             elif now - self.stat_point[0] >= 60:
@@ -972,6 +1059,8 @@ class Agent:
         self.deaths = [(t, n) for t, n in self.deaths if now - t < G.DEATH_WINDOW_SEC]
         if len(self.deaths) >= SOLO_DEATHS_TO_SWITCH and not (G.DEATH_KEEP_BEST and is_best):
             return self.switch_spot(f"died {len(self.deaths)}x in {G.DEATH_WINDOW_SEC // 60} min", alias, spots, sa)
+        if capped:
+            return
         self.samples.append((now, lvl))
         self.samples = [p for p in self.samples if now - p[0] <= G.RATE_WINDOW_SEC]
         if now - self.spot_since < G.SETTLE_SEC or now - self.samples[0][0] < G.RATE_WINDOW_SEC * 0.9:
@@ -1163,6 +1252,39 @@ class Agent:
             self.invited[n] = now
             self.log(f"pair: party invite {n}: {self.ev(G.INVITE_JS, n)}")
 
+    # ── thanks after accepting another player's invite ──
+    def invite_from_ours(self, text):
+        return any(f'"{n}"' in text for n in self.hub.friends if n != self.name)
+
+    def queue_thanks(self, text):
+        """Just accepted a party invite: if it came from another player, say thanks in a few seconds."""
+        if not PARTY_THANKS_TEXTS or self.invite_from_ours(text):
+            return
+        now = time.time()
+        if now - self.thanks_said_at < PARTY_THANKS_MIN_GAP:
+            return
+        at = now + random.uniform(*PARTY_THANKS_DELAY)
+        self.thanks = {"at": at, "until": at + 8, "who": text[:60]}
+
+    def thanks_tick(self):
+        t = self.thanks
+        if not t:
+            return
+        now = time.time()
+        if now < t["at"]:
+            return
+        if len(self.c.s.get("party") or []) <= 1:
+            if now > t["until"]:             # never got in (invite expired / party full / broke up)
+                self.thanks = None
+            return
+        self.thanks = None
+        self.thanks_said_at = now
+        opts = [x for x in PARTY_THANKS_TEXTS if x != self.thanks_last] or PARTY_THANKS_TEXTS
+        msg = random.choice(opts)
+        self.thanks_last = msg
+        self.log(f"joined a party ({t['who']}) -> saying '{msg}'")
+        self.c.chat(("~" if PARTY_THANKS_PARTY_CHAT else "") + msg)
+
     # ── parties while leveling ──
     def leave_party(self, why):
         party = self.c.s.get("party") or []
@@ -1193,7 +1315,7 @@ class Agent:
         c, s = self.c, self.c.s
         now = time.time()
         party = s.get("party") or []
-        ours = set(self.hub.names)
+        ours = set(self.hub.friends)
         snap = self.hub.snapshot()
         me = snap.get(self.name) or {}
         grp = self.pair_group(snap)
@@ -1207,6 +1329,7 @@ class Agent:
             if len(party) <= 1 and (from_ours or LEVEL_ACCEPT_STRANGERS):
                 self.log(f"accepting party invite{'' if from_ours else ' from a stranger'}: {text[:60]}")
                 self.ev("() => window.__social.partyRespond(true)")
+                self.queue_thanks(text)
                 if not from_ours:
                     self.stranger_party = {"area": (self.step_key, self.spot_idx), "joined": now,
                                            "said": False, "say_at": now + random.uniform(*LEVEL_AFK_DELAY)}
@@ -1525,7 +1648,7 @@ class Agent:
         c.walk_target = None
         st = self.ev(B.TRADE_STATE_JS) or {}
         if st.get("req") and not st.get("open"):
-            who = self.ev(TRADE_FROM_JS, [t["alt"], self.hub.names]) or {}
+            who = self.ev(TRADE_FROM_JS, [t["alt"], self.hub.friends]) or {}
             if who.get("from") == "other":
                 self.log(f"box trade: declining a trade request from someone else {who.get('raw', '')[:80]}")
                 self.ev("() => window.__eco.answerTradeRequest(false)")
@@ -1611,6 +1734,12 @@ class Agent:
             self.log(f"BC error: {e!r}")
             return True
 
+    def gi_left_for_bc(self, b):
+        """True when the Golden Invasion hunt just ended early for this castle (mu_gi GI_BC_LEAVE_SEC):
+        go straight to the cloak + bar instead of farming until BC_FARM_UNTIL_SEC."""
+        left = getattr(self.gi, "left_for_bc", None) if self.gi else None
+        return left is not None and abs(left - b["open_at"]) < 120
+
     def bc_done(self, why, late=False):
         self.log(f"BLOOD CASTLE {self.bcs['tier']}: {why} -> back to leveling")
         plan = self.hub.plan
@@ -1623,6 +1752,7 @@ class Agent:
                     plan["started"].discard(self.name)
                 else:
                     plan["out"].add(self.name)
+            release_bc_claim(self.hub, self.bcs.get("tier"), self.name)   # the other machine may take it
         self.grab(self.bcs, False)
         self.bcs = None
         self.step_key = None
@@ -1662,8 +1792,10 @@ class Agent:
             elif lvl > hi:
                 self.bc_done(f"level {lvl} went past the range ({lo}-{hi})")
                 return False
-            elif since_open >= -BC_FARM_UNTIL_SEC or lvl >= top:
-                why = f"level {lvl} (stop at {top})" if lvl >= top else f"{int(-since_open)}s before the door"
+            elif since_open >= -BC_FARM_UNTIL_SEC or lvl >= top or self.gi_left_for_bc(b):
+                why = (f"level {lvl} (stop at {top})" if lvl >= top
+                       else f"left the Golden Invasion, {int(-since_open)}s before the door" if since_open < -BC_FARM_UNTIL_SEC
+                       else f"{int(-since_open)}s before the door")
                 self.log(f"BC{tier}: {why} -> stop farming, cloak + bar")
                 b["phase"] = "prep"
             else:
@@ -1851,7 +1983,7 @@ class Agent:
             else:
                 self.bc_done(f"no cloak +{tier} and no time left to buy one")
             return
-        if since_open < -75:
+        if since_open < -BC_DEVIAS_SEC:
             self.park(*bar)          # wait at the bar (safe zone, no EXP)
             return
         m, x, y = B.SPIRIT_SPOT
@@ -1953,14 +2085,15 @@ class Agent:
         except Exception as e:
             self.log(f"helper {how}: {e!r}")
 
-    def grab(self, b, on, goal=None, goal_r=2, mode="advance", weapon=True, statue=True):
+    def grab(self, b, on, goal=None, goal_r=2, mode="advance", weapon=True, statue=True,
+             fight=None, zone=True, tag="BC"):
         """Arm/disarm the in-page loop (mu_bc.BC_GRAB_JS): weapon grab + statue attack, and without
         the helper (B.BC_USE_HELPER False) also walking to `goal` and fighting what is in the way
         (mode advance / rush / guard / hold). Logs its events. Returns its status, or None if the
         page didn't answer."""
         if not on and not b.get("grab_on"):
             return None
-        fight = not B.BC_USE_HELPER
+        fight = (not B.BC_USE_HELPER) if fight is None else fight
         cfg = {"version": B.GRAB_VERSION, "on": bool(on), "g": B.WEAPON[0], "n": B.WEAPON[1],
                "re": B.WEAPON_NAME_RE, "radius": B.GRAB_RADIUS, "loopMs": B.GRAB_LOOP_MS,
                "pickMs": B.GRAB_PICK_MS, "weapon": bool(weapon), "statue": bool(statue),
@@ -1978,7 +2111,7 @@ class Agent:
                "potHp": B.FIGHT_POT_HP, "potMs": B.FIGHT_POT_MS, "buffs": B.FIGHT_BUFFS,
                "buffEvery": B.FIGHT_BUFF_EVERY_MS, "buffTries": B.FIGHT_BUFF_TRIES,
                # v7: kill-phase zone at the bridge + self-start from the waiting spot
-               "zone": list(B.BRIDGE_EDGE), "zoneR": B.BRIDGE_ZONE_R, "killPhase": bool(b.get("kill_phase")),
+               "zone": list(B.BRIDGE_EDGE) if zone else None, "zoneR": B.BRIDGE_ZONE_R, "killPhase": bool(b.get("kill_phase")),
                "stateSince": int((b.get("open_at") or 0) * 1000 - 60_000),
                "startGoal": list(B.STATUE), "startMode": "advance", "startR": B.STATUE_RADIUS}
         if on and not fight and b.get("statue_solo_over"):
@@ -1987,14 +2120,15 @@ class Agent:
         if r is None:
             return None
         if on and not b.get("grab_on"):
-            self.log(f"BC: in-page loop armed (every {B.GRAB_LOOP_MS} ms: weapon grab"
-                     + (", walking + fighting, NO helper)" if fight else ", statue)"))
+            self.log(f"{tag}: in-page loop armed (every {B.GRAB_LOOP_MS} ms: "
+                     + ("weapon grab, " if weapon else "")
+                     + ("walking + fighting, NO helper)" if fight else "statue)"))
         b["grab_on"] = bool(on)
         for e in r.get("events") or []:
-            self.log(f"BC grab: {e}")
+            self.log(f"{tag} grab: {e}")
         if r.get("err") and r["err"] != b.get("grab_err"):
             b["grab_err"] = r["err"]
-            self.log(f"BC grab error: {r['err']}")
+            self.log(f"{tag} grab error: {r['err']}")
         return r
 
     def fight_to(self, b, x, y, radius, mode, at_goal=None, weapon=True, statue=False):
@@ -2010,7 +2144,7 @@ class Agent:
         self.fight_log(b, r)
         return arrived, r
 
-    def fight_log(self, b, r):
+    def fight_log(self, b, r, tag="BC fight"):
         """Status line every FIGHT_LOG_SEC: where we are, what we hit, casts sent vs seen, potions."""
         now = time.time()
         if not r or now - b.get("fight_log_at", 0) < B.FIGHT_LOG_SEC:
@@ -2018,7 +2152,7 @@ class Agent:
         b["fight_log_at"] = now
         f, s = r.get("fight") or {}, self.c.s
         d = f.get("dGoal")
-        self.log(f"BC fight: ({s.get('x')},{s.get('y')}) {f.get('mode')} | "
+        self.log(f"{tag}: ({s.get('x')},{s.get('y')}) {f.get('mode')} | "
                  f"{'%.0f' % d if d is not None else '?'} tiles to go | "
                  f"{f.get('target') or '-'} ({f.get('why')}) | {f.get('inRange')} in range "
                  f"({f.get('kind')}, {f.get('range')}t, skill {f.get('skill')}) | casts {f.get('casts')} sent / "
@@ -2159,6 +2293,7 @@ class Agent:
             if len(party) <= 1:
                 self.log(f"BC: accepting party invite {s.get('partyRequestText', '')[:60]}")
                 self.ev("() => window.__social.partyRespond(true)")
+                self.queue_thanks(s.get("partyRequestText", ""))
             else:
                 self.ev("() => window.__social.partyRespond(false)")
             return
@@ -2166,9 +2301,9 @@ class Agent:
             b["sys_primed"] = True
             self.ev(self.SYS_MSGS_JS, True)
         self.bc_party_replies(b)
-        players = (self.ev(B.SCAN_JS, [self.hub.names, B.CLEAR_RADIUS, 0, 0, None]) or {}).get("players", [])
+        players = (self.ev(B.SCAN_JS, [self.hub.friends, B.CLEAR_RADIUS, 0, 0, None]) or {}).get("players", [])
         if players and not Agent.player_dumped:
-            dump = self.ev(self.PLAYER_DUMP_JS, self.hub.names)
+            dump = self.ev(self.PLAYER_DUMP_JS, self.hub.friends)
             if dump:
                 Agent.player_dumped = True
                 self.log(f"BC diag: player entity {dump.get('name')}: party-ish fields {dump.get('hits')} | keys {dump.get('keys')}")
@@ -2499,7 +2634,7 @@ class Agent:
                 # still on the way back (far up the corridor when someone else delivered):
                 # keep walking - boxes are only in range near the Archangel
                 self.log_rush(b)
-                boxes = [it for it in (self.ev(B.SCAN_JS, [self.hub.names, 30] + list(B.BOX)) or {}).get("items", [])
+                boxes = [it for it in (self.ev(B.SCAN_JS, [self.hub.friends, 30] + list(B.BOX)) or {}).get("items", [])
                          if it["id"] not in b["tried"]]
                 if not boxes:
                     return True
@@ -2517,7 +2652,7 @@ class Agent:
                     return True
                 b["tried"].add(bid)
                 b["box_try"] = None
-            boxes = [it for it in (self.ev(B.SCAN_JS, [self.hub.names, 30] + list(B.BOX)) or {}).get("items", [])
+            boxes = [it for it in (self.ev(B.SCAN_JS, [self.hub.friends, 30] + list(B.BOX)) or {}).get("items", [])
                      if it["id"] not in b["tried"]]
             if boxes:
                 b["box_try"] = (boxes[0]["id"], now, self.inv(B.BOX))
@@ -2590,6 +2725,64 @@ def build_plan(hub, open_at, taken=None, skip=()):
     return assign, why
 
 
+# ── castles shared with the other machines (mu_hub claims "bc:<tier>") ──
+BC_CLAIM_AFTER_DOOR = 25 * 60   # a castle claim lasts until the door closes + this (castle + delivery)
+
+
+def remote_bc_taken(hub):
+    """Castles another machine already claimed for this event: {tier: "name@machine"}."""
+    link = hub.link
+    if not link or not link.connected():
+        return {}
+    out = {}
+    for k, c in link.claims().items():
+        if k.startswith("bc:") and c.get("machine") != link.machine:
+            try:
+                out[int(k[3:])] = f"{c.get('owner')}@{c.get('machine')}"
+            except ValueError:
+                pass
+    return out
+
+
+def plan_with_claims(hub, open_at, taken=None, skip=(), announce=False):
+    """build_plan(), then claim every castle at the hub. A castle another machine took first is
+    marked taken and the plan is redone for whoever lost it. Hub unreachable -> the plan stays as
+    it is (this machine plans among its own characters, Juan's call)."""
+    taken, skip = dict(taken or {}), set(skip)
+    assign, why = {}, {}
+    ttl = max(60, open_at - time.time() + B.BC_DOOR_CLOSE_SEC + BC_CLAIM_AFTER_DOOR)
+    for _ in range(4):
+        remote = remote_bc_taken(hub)
+        a, w = build_plan(hub, open_at, {**remote, **taken}, skip)
+        lost = False
+        for n, (t, r) in sorted(a.items(), key=lambda kv: kv[1][0]):
+            res = hub.link.claim(f"bc:{t}", n, ttl) if hub.link else None
+            if res is None or res.get("ok"):
+                if res is None and hub.link and not getattr(hub, "bc_claim_warned", False):
+                    hub.bc_claim_warned = True
+                    log("hub: can't claim castles (hub offline) -> planning only among this machine's characters")
+                elif res is not None:
+                    hub.bc_claim_warned = False
+                assign[n], why[n] = (t, r), w[n] + (" [claimed]" if res else "")
+                taken[t] = n
+                skip.add(n)
+            else:
+                log(f"hub: BC{t} already taken by {res.get('owner')}@{res.get('machine')} -> re-planning {n}")
+                taken[t] = f"{res.get('owner')}@{res.get('machine')}"
+                lost = True
+        if not lost:
+            break
+    remote = remote_bc_taken(hub) if announce else None
+    if remote:
+        log("hub: castles taken by the other machine: " + ", ".join(f"BC{t} {o}" for t, o in sorted(remote.items())))
+    return assign, why
+
+
+def release_bc_claim(hub, tier, name):
+    if hub.link and tier:
+        threading.Thread(target=hub.link.release, args=(f"bc:{tier}", name), daemon=True).start()
+
+
 BC_REPLAN_EVERY = 20   # seconds: re-check characters that had no castle (they may have levelled into one)
 
 
@@ -2614,7 +2807,7 @@ def coordinator(hub, agents):
             skip = set(plan["assign"]) | plan["started"] | plan["out"]
         if len(taken) >= len(BC_TIERS):
             return
-        assign, why = build_plan(hub, hub.open_at, taken, skip)
+        assign, why = plan_with_claims(hub, hub.open_at, taken, skip)
         if not assign:
             return
         with hub.lock:
@@ -2624,7 +2817,7 @@ def coordinator(hub, agents):
         return
     if any(a.bcs for a in agents):
         return       # still busy with the previous castle
-    assign, why = build_plan(hub, hub.open_at)
+    assign, why = plan_with_claims(hub, hub.open_at, announce=True)
     hub.plan = {"key": key, "open_at": hub.open_at, "assign": assign,
                 "started": set(), "out": set(), "checked": now}
     opens = datetime.fromtimestamp(hub.open_at).strftime("%H:%M")
@@ -2703,6 +2896,10 @@ def main():
     log("=== MU auto bot starting ===" + (" (under the supervisor)" if SUPERVISED else ""))
     names = [a["character"] for a in G.ACCOUNTS]
     hub = Hub(names)
+    log(R.startup_line(names))
+    hub.link = HUB.make_link(hub.snapshot, log)
+    if not hub.link:
+        log("hub: no hub.json -> this machine runs alone")
     if CH.CHAT_ENABLED:
         hub.chat = CH.ChatHub(names)
         log(hub.chat.startup_line())
@@ -2734,6 +2931,8 @@ def main():
                 snap = hub.snapshot()
                 log("summary: " + " | ".join(
                     f"{n} lvl {i.get('level')} {i.get('mode')}" for n, i in snap.items()))
+                if hub.link:
+                    log(hub.link.summary())
             time.sleep(0.3)
         else:
             log("every character stopped -> exiting")
@@ -2742,6 +2941,8 @@ def main():
         rc = EXIT_STOPPED
     finally:
         hub.stop = True
+        if hub.link:
+            hub.link.stop = True
         for t in threads:
             t.join(timeout=10)
     try:

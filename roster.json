@@ -1,0 +1,10 @@
+{
+  "_comment": "Every character of ours on any machine. Same file everywhere (committed). accounts.json lists only the logins each machine runs.",
+  "characters": [
+    {"name": "wizzardo",  "machine": "pc"},
+    {"name": "bruto",     "machine": "pc"},
+    {"name": "cucaracha", "machine": "pc"},
+    {"name": "invalido",  "machine": "mac"},
+    {"name": "mogulin",   "machine": "mac"}
+  ]
+}

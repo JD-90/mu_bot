@@ -25,6 +25,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright, Error as PWError
 from mu_bc import BloodCastle
 from mu_recorder import Recorder
+import roster as R
 
 # ───────────────────────────── CONFIG ─────────────────────────────
 URL    = "https://mu.mormon.garden/"
@@ -1119,7 +1120,7 @@ class Group:
             return
         if now - self.scout_arrived_at < SCOUT_LOOK_SEC:
             return
-        ours = [m.name for m in self.members]
+        ours = R.friends([m.name for m in self.members])
         try:
             crowd = c.page.evaluate(CROWD_JS, [tx, ty, CROWD_RADIUS, ours])
         except PWError:
@@ -1210,7 +1211,7 @@ class Group:
 
         # 2) other players standing at the spot (off by default: only the rate matters)
         if SWITCH_ON_CROWD:
-            ours = [c.name for c in self.members]
+            ours = R.friends([c.name for c in self.members])
             try:
                 crowd = self.leader.page.evaluate(CROWD_JS, [tx, ty, CROWD_RADIUS, ours])
             except PWError:
