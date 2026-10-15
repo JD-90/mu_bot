@@ -90,7 +90,16 @@ BB_MAPS = {
     "Atlans":   (7, ["Atlans", "Atlans2"], 70),
     "Tarkan":   (8, ["Tarkan", "Tarkan2"], 140),
 }
-BB_WARP_TRIES    = 4         # warps that did not land on the map -> skip this boss
+# Multiple /move aliases land at different points on these maps. Pick the
+# closest entry point to the boss coordinates so characters spend less time
+# crossing the map. These are the known landing tiles for this server.
+BB_MAP_ENTRIES = {
+    "Atlans": [("Atlans", (19, 22)), ("Atlans2", (227, 51)), ("Atlas3", (65, 162))],
+    "Devias": [("Devias", (212, 47)), ("Devias2", (24, 26)),
+                ("Devias3", (225, 229)), ("Devias4", (165, 177))],
+    "Tarkan": [("Tarkan", (200, 66)), ("Tarkan2", (192, 160))],
+}
+BB_WARP_TIMEOUT  = 15        # one /move that did not land on the map -> skip this boss
 BB_LINGER_SEC    = (6, 18)   # (Juan 2026-10-15) after the loot: idle this long (random per character) walking
 BB_LINGER_RADIUS = 3         # around the boss corpse (within this many tiles), so we don't all warp out at once ...
 BB_LINGER_STEP   = (1.5, 4)  # ... a small step every this many seconds (random)
@@ -466,8 +475,9 @@ class BigBoss:
         self.phase = "go"
         self.started = time.time()
         self.map_name = t["map"]
-        self.map_idx, self.aliases, _ = BB_MAPS[t["map"]]
         self.target = (t["x"], t["y"])
+        self.map_idx, self.aliases, _ = BB_MAPS[t["map"]]
+        self.aliases = self.entry_aliases(t["map"], self.target)
         self.warp_tries = 0
         self.last_warp = 0
         self.last_walk = 0
@@ -513,6 +523,19 @@ class BigBoss:
                 c.rec.start()
             except Exception:
                 pass
+
+    @staticmethod
+    def entry_aliases(map_name, target):
+        """Order map /move aliases by distance from their landing tile to target."""
+        entries = BB_MAP_ENTRIES.get(map_name)
+        if not entries:
+            return BB_MAPS[map_name][1]
+        x, y = target
+        ordered = [alias for alias, _ in sorted(
+            entries, key=lambda entry: math.hypot(entry[1][0] - x, entry[1][1] - y))]
+        # Keep any existing aliases without a known landing tile as fallbacks.
+        ordered.extend(alias for alias in BB_MAPS[map_name][1] if alias not in ordered)
+        return ordered
 
     def cfg(self):
         slots = max(len(BB_ORDER), 1)
@@ -573,6 +596,8 @@ class BigBoss:
                 self.map_name = t["map"]
                 self.map_idx, self.aliases, _ = BB_MAPS.get(t["map"], (self.map_idx, self.aliases, 0))
             self.target = (t["x"], t["y"])
+            if self.warp_tries == 0:
+                self.aliases = self.entry_aliases(self.map_name, self.target)
         elif t.get("secs") is not None:
             self.countdown_since = self.countdown_since or now
         if self.dead_at:
@@ -615,15 +640,13 @@ class BigBoss:
         far = here == self.map_idx and math.hypot((s.get("x") or 0) - x, (s.get("y") or 0) - y) > BB_WARP_IF_FARTHER \
             and self.warp_tries == 0
         if here != self.map_idx or far:
-            if now - self.last_warp < 8:
+            if self.warp_tries:
+                if here != self.map_idx and now - self.last_warp >= BB_WARP_TIMEOUT:
+                    return self.finish(f"single /move to {self.map_name} did not land")
                 return
-            if self.warp_tries >= BB_WARP_TRIES and here != self.map_idx:
-                return self.finish(f"could not /move to {self.map_name} after {self.warp_tries} tries")
-            if far and here == self.map_idx:
-                self.warp_tries = 1                    # one warp to the town only, then walk
-            alias = self.aliases[min(self.warp_tries, len(self.aliases) - 1)]
+            alias = self.aliases[0]
             self.warp_tries += 1
-            self.log(f"/move {alias} (try {self.warp_tries})")
+            self.log(f"/move {alias} (nearest entry to {self.target})")
             c.set_helper(False)
             c.close_windows()
             c.chat(f"/move {alias}")
