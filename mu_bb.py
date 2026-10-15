@@ -18,12 +18,11 @@ turns into "<Map> <x>,<y>":
          the drop tiles. No PvP: other players are never targeted.
   CLOSE  boss HP <= BB_CLOSE_HP (3 %) or ~BB_CLOSE_ETA s left -> walk to BB_CLOSE_DIST tile from it on
          my own side, then keep casting from there
-  LOOT   boss dead -> for BB_LOOT_SEC (5 s) spam pickups on its drops: rings / pendants first (Juan: the most
-         valuable), then Box of Kundun +5, then the rest; my side first. Direct pickup request (no walking,
-         like the Blood Castle weapon grab) the instant a drop appears, + the client's walk-in pickup, +
-         Space presses (BB_SPACE_SPAM)
-         BB_LIMIT_LOOT (on): only BB_LOOTERS (3) of the party loot, each ignores BB_SKIP_CHANCE of the items, only
-         rings / pendants / Box +5, no Space (Juan 2026-10-15: we took almost everything)
+  LOOT   boss dead -> every one of ours picks: a direct pickup request (no walking) for EVERY drop of the boss,
+         best first (rings / pendants, Box of Kundun +5, the rest; my side first), each again every
+         BB_PICK_REPEAT_MS, + the client's walk-in pickup + Space presses. At least BB_LOOT_SEC, then until the
+         ground has been empty BB_LOOT_EMPTY s (drops that are someone else's become free later), max BB_LOOT_MAX.
+         (Juan 2026-10-15 night: no delays, nobody skips picking -- the "limited loot" option is gone)
   LINGER after the loot, BB_LINGER_SEC (6-18 s, random per character) of small steps around the corpse,
          so our characters don't all leave at the same moment
   DONE   linger over, or the panel is back to a countdown (killed before we got there / kill not seen)
@@ -42,13 +41,11 @@ import mu_group_bot as G
 BB_ENABLED       = True      # code switch; whether it runs is hub.bb_on (BB_AUTO at startup, O key in the console)
 BB_ORDER         = ["wizzardo", "bruto", "cucaracha", "invalido", "mogulin"]   # each one's side of the boss
 BB_END_GRACE     = 10        # panel back to a countdown for this long (boss dead / gone) -> done (after the loot)
-BB_LOOT_SEC      = 5         # after the kill: spam pickups this long (Juan 2026-10-15: it's gone faster than that)
-BB_LIMIT_LOOT    = False     # (Juan 2026-10-15) take less of the pile (False = everyone grabs everything, as before):
-BB_LOOTERS       = 5         # ... only this many of our party loot each boss (picked from the boss's id + the party,
-                             #     so every machine agrees without talking); no party -> 3 in 5 chance
-BB_SKIP_CHANCE   = 0       # ... a looter ignores each item with this chance (decided once per item)
-BB_VALUABLE_ONLY = False      # ... only rings / pendants and Box of Kundun +5, nothing else
-                             # (Space is not pressed while this is on: it would grab whatever is nearest)
+BB_LOOT_SEC      = 3         # after the kill: loot at least this long ...
+BB_LOOT_MAX      = 30        # ... and keep looting while anything of the boss's is on the ground, up to this long
+BB_LOOT_EMPTY    = 2         # ... done once the ground around the corpse has been empty this long
+BB_PICK_REPEAT_MS = 80       # ask for the same item again after this long (every item, every loop turn)
+BB_PICK_PER_TURN = 2         # pickup requests per loop turn (BB_LOOP_MS) at most, best first
 BB_SPACE_SPAM    = True      # also press Space while looting (Juan 2026-10-15) ...
 BB_SPACE_EVERY   = 0.1       # ... this often (s)
 # rings and pendants (group 13): Ring of Ice 8, Poison 9, Pendant of Lightning 12, Fire 13, Ring of Fire 21,
@@ -77,7 +74,7 @@ BB_BUFFS         = [16, 48]  # Soul Barrier (mages) / Greater Fortitude (knights
 BB_SKILLS        = {}        # fixed skill per character (lower-case name -> skill number)
 BB_SHOW_WINDOW   = True      # restore the window during the boss (minimized windows cast much slower, see GI)
 BB_RECORD        = True      # record with mu_recorder while the boss runs (first runs: data for tuning)
-BB_LOOP_MS       = 20
+BB_LOOP_MS       = 50
 BB_BOSS_TYPE     = 694       # Balrog Colosal
 BB_WALK_EVERY    = 2.0       # seconds between walk orders toward the boss while travelling
 BB_WARP_IF_FARTHER = 70      # on the boss map but further than this -> /move to the town first
@@ -148,7 +145,7 @@ BB_INSTALL_JS = r"""
     casts: 0, myCasts: 0, lastMySkill: null, lastMySkillAt: 0, comboIdx: 0, comboAt: 0,
     buffQueue: null, buffAt: 0, buffTries: 0, buffsDone: [],
     closing: false, closeBest: 1e9, closeProg: 0, closeWalkAt: 0, closeFailed: false, walkAt: 0,
-    picks: 0, direct: 0, directErr: null, kind: null, looter: null, skip: new Map(), skipped: 0, lastPick: 0, pickFails: 0, picked: [], seenItems: new Map(), hitSeen: 0};
+    picks: 0, direct: 0, directErr: null, kind: null, asked: new Map(), lastPick: 0, pickFails: 0, picked: [], seenItems: new Map(), hitSeen: 0};
   const ev = s => { if (B.events.length < 200) B.events.push(s); };
   const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
   const P = e => ({x: e.transform.pos.x, y: e.transform.pos.z});
@@ -259,43 +256,22 @@ BB_INSTALL_JS = r"""
         let da = Math.abs(a - c.angle) % (2 * Math.PI); if (da > Math.PI) da = 2 * Math.PI - da;
         items.push({e, p, d: dist(p, me), prio, mySide: da <= Math.PI / Math.max(2, c.slots) ? 0 : 1});
       }
-      // limited loot (BB_LIMIT_LOOT): only some of us loot, each skips some items, valuable ones only
-      if (c.limit) {
-        if (B.looter === null) {
-          const hash = str => { let x = 2166136261; for (let i = 0; i < str.length; i++) { x ^= str.charCodeAt(i); x = Math.imul(x, 16777619) >>> 0; } return x; };
-          const myName = (pd.name || '').trim().toLowerCase();
-          const party = [...new Set(((W.__social && W.__social.partyMembers) || []).map(m => (m.name || '').trim().toLowerCase()).filter(Boolean))];
-          if (party.length > 1) {
-            const order = party.sort((a, b) => (hash(B.bossId + ':' + a) - hash(B.bossId + ':' + b)) || (a < b ? -1 : 1));
-            const chosen = order.slice(0, c.looters);
-            B.looter = chosen.includes(myName);
-            ev(`looters this boss: ${chosen.join(', ')} -> ${B.looter ? 'I loot' : 'I don\'t loot'}`);
-          } else {
-            B.looter = hash(B.bossId + ':' + myName) % 5 < 3;
-            ev(`no party -> ${B.looter ? 'I loot' : 'I don\'t loot'} (3 in 5 chance)`);
-          }
-        }
-        for (let i = items.length - 1; i >= 0; i--) {
-          const x = items[i];
-          if (!B.looter || (c.valuableOnly && x.prio > 1)) { items.splice(i, 1); continue; }
-          if (!B.skip.has(x.e.netId)) { const sk = Math.random() < c.skipChance; B.skip.set(x.e.netId, sk); if (sk) B.skipped++; }
-          if (B.skip.get(x.e.netId)) items.splice(i, 1);
-        }
-      }
       items.sort((a, b) => (a.prio - b.prio) || (a.mySide - b.mySide) || (a.d - b.d));
-      // spam: direct pickup request (no walking) every 50 ms, cycling over the best few (any of them may
-      // already be someone else's); the client's walk-in pickup on the best one as a fallback
-      if (items.length && now - B.lastPick >= 50) {
-        B.lastPick = now;
-        const top = items.filter(x => x.prio === items[0].prio).slice(0, 3);
-        const pick = top[B.picks % top.length];
-        B.picks++;
-        try { if (typeof s.pickupItemRequest === 'function') { s.pickupItemRequest(pick.e.netId); B.direct++; } } catch (x) {
-          if (!B.directErr) { B.directErr = String(x).slice(0, 100); ev('direct pickup error: ' + B.directErr); } }
-        w.pickupTarget = items[0].e;
-      } else if (!items.length && w.pickupTarget) w.pickupTarget = null;
+      // v4: a direct pickup request (no walking) for EVERY drop on the ground, best first, each one again every
+      // pickRepeat ms (one that is someone else's now becomes free later), up to pickPerTurn per loop turn;
+      // the client's walk-in pickup on the best one as the fallback
+      let sent = 0;
+      for (const x of items) {
+        if (sent >= c.pickPerTurn) break;
+        if (now - (B.asked.get(x.e.netId) || 0) < c.pickRepeat) continue;
+        B.asked.set(x.e.netId, now); sent++; B.picks++;
+        try { if (typeof s.pickupItemRequest === 'function') { s.pickupItemRequest(x.e.netId); B.direct++; } } catch (er) {
+          if (!B.directErr) { B.directErr = String(er).slice(0, 100); ev('direct pickup error: ' + B.directErr); } }
+      }
+      if (items.length) { if (w.pickupTarget !== items[0].e) w.pickupTarget = items[0].e; }
+      else if (w.pickupTarget) w.pickupTarget = null;
       B.status = {mode, boss: null, deadAgo: (now - B.deadAt) / 1000, items: items.length, hp, maxHp: pd.maxHP, pots: B.pots,
-        casts: B.casts, myCasts: B.myCasts, picks: B.picks, direct: B.direct, pickFails: B.pickFails, looter: B.looter, skipped: B.skipped, x: Math.round(me.x), y: Math.round(me.y), map: w.mapIndex};
+        casts: B.casts, myCasts: B.myCasts, picks: B.picks, direct: B.direct, pickFails: B.pickFails, x: Math.round(me.x), y: Math.round(me.y), map: w.mapIndex};
       return;
     }
     if (!boss) {
@@ -361,7 +337,7 @@ BB_SET_JS = """(on) => { const B = window.__bb; if (!B) return false; B.on = on;
   const w = window.__world;
   if (on) { B.deadAt = 0; B.deadPos = null; B.bossId = null; B.hp = []; B.closing = false; B.closeFailed = false;
             B.buffQueue = null; B.seenItems = new Map(); B.casts = 0; B.myCasts = 0; B.pots = 0; B.picks = 0; B.direct = 0; B.pickFails = 0;
-            B.looter = null; B.skip = new Map(); B.skipped = 0; }
+            B.asked = new Map(); }
   else if (w) { w.castRequest = null; w.attackTarget = null; w.pickupTarget = null; }
   return true; }"""
 
@@ -540,12 +516,11 @@ class BigBoss:
     def cfg(self):
         slots = max(len(BB_ORDER), 1)
         i = order_index(self.a.name) % slots
-        return {"version": 3, "bossType": BB_BOSS_TYPE, "loopMs": BB_LOOP_MS, "potHp": BB_POT_HP,
+        return {"version": 4, "bossType": BB_BOSS_TYPE, "loopMs": BB_LOOP_MS, "potHp": BB_POT_HP,
                 "potEvery": BB_POT_EVERY_MS, "potKey": BB_POTION_KEY, "range": BB_RANGE, "castRange": BB_CAST_RANGE,
                 "closeHp": BB_CLOSE_HP, "closeEta": BB_CLOSE_ETA, "closeDist": BB_CLOSE_DIST,
                 "closeStuckMs": BB_CLOSE_STUCK_MS, "lootRadius": BB_LOOT_RADIUS, "jewelry": BB_JEWELRY,
-                "limit": BB_LIMIT_LOOT, "looters": BB_LOOTERS, "skipChance": BB_SKIP_CHANCE,
-                "valuableOnly": BB_VALUABLE_ONLY,
+                "pickRepeat": BB_PICK_REPEAT_MS, "pickPerTurn": BB_PICK_PER_TURN,
                 "angle": 2 * math.pi * i / slots - math.pi / 2, "slots": slots,
                 "skill": BB_SKILLS.get(self.a.name.lower(), 0), "mageSkill": BB_MAGE_SKILL,
                 "combo": BB_KNIGHT_COMBO, "comboStep": BB_COMBO_STEP_MS, "buffs": BB_BUFFS}
@@ -767,26 +742,41 @@ class BigBoss:
         return True
 
     def loot_burst(self):
-        """The boss died: BB_LOOT_SEC of pickups (the in-page loop spams the pickup requests) + Space presses."""
+        """The boss died: the in-page loop asks for every drop non-stop (it started the instant the boss died).
+        Keep it going + press Space for at least BB_LOOT_SEC, then until the ground around the corpse has been
+        empty BB_LOOT_EMPTY s, at most BB_LOOT_MAX s from the kill."""
         c = self.c
-        end = (self.dead_at or time.time()) + BB_LOOT_SEC
-        presses = 0
-        while time.time() < end:
-            if BB_SPACE_SPAM and not BB_LIMIT_LOOT:
+        start = self.dead_at or time.time()
+        presses, check_at, empty_since, status = 0, 0, None, {}
+        while True:
+            now = time.time()
+            if now - start >= BB_LOOT_MAX:
+                break
+            if BB_SPACE_SPAM:
                 try:
                     c.page.keyboard.press("Space")
                     presses += 1
                 except Exception:
                     pass
+            if now - check_at >= 0.3:
+                check_at = now
+                st = self.ev(BB_STATUS_JS) or {}
+                for e in st.get("events") or []:
+                    self.log(e)
+                status = st.get("status") or status
+                if status.get("items"):
+                    empty_since = None
+                else:
+                    empty_since = empty_since or now
+                if now - start >= BB_LOOT_SEC and empty_since and now - empty_since >= BB_LOOT_EMPTY:
+                    break
             time.sleep(BB_SPACE_EVERY)
         st = self.ev(BB_STATUS_JS) or {}
         for e in st.get("events") or []:
             self.log(e)
-        status = st.get("status") or {}
-        self.log(f"loot: {status.get('picks')} pickup requests ({status.get('direct')} direct, "
-                 f"{status.get('pickFails')} refused), {presses} Space presses"
-                 + (f" | limited: {'looter' if status.get('looter') else 'not a looter'}, "
-                    f"{status.get('skipped')} item(s) skipped on purpose" if BB_LIMIT_LOOT else ""))
+        status = st.get("status") or status
+        self.log(f"loot: {time.time() - start:.0f} s, {status.get('picks')} pickup requests ({status.get('direct')} direct, "
+                 f"{status.get('pickFails')} refused), {presses} Space presses")
 
     # ── end ──
     def on_pause(self):
