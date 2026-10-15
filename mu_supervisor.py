@@ -79,8 +79,14 @@ def compile_all():
     return None
 
 
+TREASURE_UNSAFE = (37, 46)             # Treasure Hunt (every 3 h at :40: 01:40, 04:40, ...): no restart then either
+
+
 def safe_now():
-    return SAFE_MINUTES[0] <= datetime.now().minute < SAFE_MINUTES[1]
+    now = datetime.now()
+    if now.hour % 3 == 1 and TREASURE_UNSAFE[0] <= now.minute < TREASURE_UNSAFE[1]:
+        return False
+    return SAFE_MINUTES[0] <= now.minute < SAFE_MINUTES[1]
 
 
 def start_bot():

@@ -6,6 +6,7 @@ Bots for the MU Online browser client at https://mu.mormon.garden (Playwright + 
 - `mu_group_bot.py` / `run_group.bat` - party bot that levels several characters together
 - `mu_bc.py` - Blood Castle logic (used by both bots)
 - `mu_gi.py` - Golden Invasion hunter (used by the auto bot): every hour at :50 wizzardo tops up potions in Noria, hunts golden mobs for 3 minutes (players first at a Golden Dragon), then `/pkclear`
+- `mu_th.py` - Treasure Hunt hunter (used by the auto bot): every 3 hours at :40 every available character warps to the treasure map, patrols its own slice of it and breaks any Loot Chest it sees (3x Box of Kundun +5 + 1 item); every chest seen goes to `th_chests.jsonl`
 - `mu_recorder.py` - records what you do while a character is paused (`mu_record.log`)
 - `mu_bot.py` / `run.bat` - old single-character reset bot (not maintained)
 
@@ -29,6 +30,7 @@ Use `./restart_bot.sh` to restart the supervised auto bot, or create a `RESTART`
 - `P` in the console pauses / resumes everyone, `1`-`5` pause / resume one character (order of `accounts.json`) so you can play it.
 - `B` in the console switches Blood Castle on / off. It starts as `BC_AUTO` near the top of `mu_auto_bot.py` (currently off). Switching off drops anyone who hasn't entered a castle yet; anyone already inside finishes it.
 - `O` in the console switches the Big Boss (`mu_bb.py`) on / off. It starts as `BB_AUTO` near the top of `mu_auto_bot.py` (off). Switching off sends anyone at the boss back to normal and drops the reset hold before the boss.
+- `T` in the console switches the Treasure Hunt (`mu_th.py`) on / off. It starts as `TH_AUTO` near the top of `mu_auto_bot.py` (on). Switching off sends anyone hunting back to normal and drops the reset hold before :40.
 - Restart to load code changes, but not between :45 and :10 (Blood Castle time).
 
 ## Idle wiggle
@@ -67,6 +69,6 @@ With a `hub.json` (git-ignored, template `hub.example.json`) the bots also share
 `run_auto.bat` on Windows or `./run_auto.sh` on macOS starts `mu_supervisor.py`, which runs `mu_auto_bot.py` in the same window (P / B / 1-5 still work) and logs to `supervisor.log`.
 
 - `restart_bot.bat` (Windows) or `./restart_bot.sh` (macOS), or `R` in the console: restart right away. If the bot isn't running, the helper starts it.
-- Empty file named `RESTART` in this folder: restart at the next safe time (only between :10 and :45). `RESTART` containing `now`: right away.
+- Empty file named `RESTART` in this folder: restart at the next safe time (only between :10 and :45, and not :37-:46 on Treasure Hunt hours). `RESTART` containing `now`: right away.
 - File named `STOP_ALL`: stop the bot and the supervisor.
 - On its own: every `.py` is compiled before a (re)start (broken code -> the running bot is left alone), a crash restarts it after 30 s (4 crashes in 15 min -> it waits for a `RESTART` file), and a bot whose log is silent for 10 min is killed and restarted.

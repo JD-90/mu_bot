@@ -1,0 +1,181 @@
+diff --git a/.gitignore b/.gitignore
+index 4c22b3e..e39b3ba 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,3 +11,4 @@ STOP_BOT
+ 
+ .DS_Store
+ hub.json
++th_chests.jsonl
+diff --git a/README.md b/README.md
+index 1219f20..16359d2 100644
+--- a/README.md
++++ b/README.md
+@@ -6,6 +6,7 @@ Bots for the MU Online browser client at https://mu.mormon.garden (Playwright +
+ - `mu_group_bot.py` / `run_group.bat` - party bot that levels several characters together
+ - `mu_bc.py` - Blood Castle logic (used by both bots)
+ - `mu_gi.py` - Golden Invasion hunter (used by the auto bot): every hour at :50 wizzardo tops up potions in Noria, hunts golden mobs for 3 minutes (players first at a Golden Dragon), then `/pkclear`
++- `mu_th.py` - Treasure Hunt hunter (used by the auto bot): every 3 hours at :40 every available character warps to the treasure map, patrols its own slice of it and breaks any Loot Chest it sees (3x Box of Kundun +5 + 1 item); every chest seen goes to `th_chests.jsonl`
+ - `mu_recorder.py` - records what you do while a character is paused (`mu_record.log`)
+ - `mu_bot.py` / `run.bat` - old single-character reset bot (not maintained)
+ 
+@@ -29,6 +30,7 @@ Use `./restart_bot.sh` to restart the supervised auto bot, or create a `RESTART`
+ - `P` in the console pauses / resumes everyone, `1`-`5` pause / resume one character (order of `accounts.json`) so you can play it.
+ - `B` in the console switches Blood Castle on / off. It starts as `BC_AUTO` near the top of `mu_auto_bot.py` (currently off). Switching off drops anyone who hasn't entered a castle yet; anyone already inside finishes it.
+ - `O` in the console switches the Big Boss (`mu_bb.py`) on / off. It starts as `BB_AUTO` near the top of `mu_auto_bot.py` (off). Switching off sends anyone at the boss back to normal and drops the reset hold before the boss.
++- `T` in the console switches the Treasure Hunt (`mu_th.py`) on / off. It starts as `TH_AUTO` near the top of `mu_auto_bot.py` (on). Switching off sends anyone hunting back to normal and drops the reset hold before :40.
+ - Restart to load code changes, but not between :45 and :10 (Blood Castle time).
+ 
+ ## Idle wiggle
+@@ -67,6 +69,6 @@ With a `hub.json` (git-ignored, template `hub.example.json`) the bots also share
+ `run_auto.bat` on Windows or `./run_auto.sh` on macOS starts `mu_supervisor.py`, which runs `mu_auto_bot.py` in the same window (P / B / 1-5 still work) and logs to `supervisor.log`.
+ 
+ - `restart_bot.bat` (Windows) or `./restart_bot.sh` (macOS), or `R` in the console: restart right away. If the bot isn't running, the helper starts it.
+-- Empty file named `RESTART` in this folder: restart at the next safe time (only between :10 and :45). `RESTART` containing `now`: right away.
++- Empty file named `RESTART` in this folder: restart at the next safe time (only between :10 and :45, and not :37-:46 on Treasure Hunt hours). `RESTART` containing `now`: right away.
+ - File named `STOP_ALL`: stop the bot and the supervisor.
+ - On its own: every `.py` is compiled before a (re)start (broken code -> the running bot is left alone), a crash restarts it after 30 s (4 crashes in 15 min -> it waits for a `RESTART` file), and a bot whose log is silent for 10 min is killed and restarted.
+diff --git a/mu_auto_bot.py b/mu_auto_bot.py
+index 36a9401..6ff5c8b 100644
+--- a/mu_auto_bot.py
++++ b/mu_auto_bot.py
+@@ -89,6 +89,7 @@ import mu_group_bot as G
+ import mu_bc as B
+ import mu_gi as GI
+ import mu_bb as BB
++import mu_th as TH
+ import mu_chat as CH
+ import mu_hub as HUB
+ import roster as R
+@@ -152,6 +153,8 @@ BC_AUTO             = True    # (Juan 2026-10-14: on by default) Blood Castle on
+ BC_TOGGLE_KEY       = "b"
+ BB_AUTO             = False   # (Juan 2026-10-15: OFF by default) Big Boss on/off AT STARTUP (mu_bb.py) ...
+ BB_TOGGLE_KEY       = "o"     # ... press O in the console to switch it live
++TH_AUTO             = True    # (Juan 2026-10-15) Treasure Hunt on/off AT STARTUP (mu_th.py, every 3 h at :40) ...
++TH_TOGGLE_KEY       = "t"     # ... press T in the console to switch it live
+ BC_TIERS            = B.BC_TIERS        # (castle, min lvl, max lvl): BC1 15-80 ... BC7 331-400
+ BC_PLAN_SEC         = 900   # make the plan this long before the entry window opens
+ BC_FARM_UNTIL_SEC   = 180   # holders keep farming until this long before the window opens (:57) ...
+@@ -380,6 +383,7 @@ class Hub:
+         self.pause_all = False       # P / PAUSE file: everyone paused, windows stay minimized
+         self.bc_on = BC_AUTO         # B in the console switches Blood Castle on/off
+         self.bb_on = BB_AUTO         # O in the console switches the Big Boss on/off
++        self.th_on = TH_AUTO         # T in the console switches the Treasure Hunt on/off
+         self.stop = False
+ 
+     def put(self, name, d):
+@@ -464,6 +468,8 @@ class Agent:
+         self.gi = GI.GoldenInvasion(self) if GI.GI_ENABLED else None
+         # Big Boss (mu_bb.py): every available character goes, one party of ours, back to normal after
+         self.bb = BB.BigBoss(self) if BB.BB_ENABLED else None
++        # Treasure Hunt (mu_th.py): every available character patrols its slice of the map for the chest
++        self.th = TH.TreasureHunt(self) if TH.TH_ENABLED else None
+         # Chat replies to other players (mu_chat.py; dry run = log only, see CH.CHAT_SEND)
+         self.chat = CH.ChatAgent(self, hub.chat) if getattr(hub, "chat", None) else None
+ 
+@@ -494,7 +500,8 @@ class Agent:
+                             break
+                         self.log(f"error: {e!r}")
+                         time.sleep(5)
+-                    time.sleep((self.bb.sleep() if self.bb else None) or (self.gi.sleep() if self.gi else None)
++                    time.sleep((self.bb.sleep() if self.bb else None) or (self.th.sleep() if self.th else None)
++                               or (self.gi.sleep() if self.gi else None)
+                                or self.bc_sleep() or G.TICK)   # 4x/s during the invasion / inside BC
+                 try:
+                     ctx.close()
+@@ -729,6 +736,11 @@ class Agent:
+                     hub.pair_round.discard(self.name)    # my part of the pair's reset round is done
+         self.read_bc_timer()                    # always: so switching BC on mid-hour works at once
+         if self.bb and self.bb.tick():          # Big Boss: drops everything else (not inside a Blood Castle)
++            if self.th and self.th.active():
++                self.th.finish("Big Boss")
++            self.publish()
++            return
++        if self.th and self.th.tick():          # Treasure Hunt (:40, 5 min): every available character
+             self.publish()
+             return
+         if self.gi and self.gi.tick():          # Golden Invasion (:49 -> :53) comes first
+@@ -754,8 +766,14 @@ class Agent:
+                 self.bb_hold_logged = True
+                 self.log("reset level, but the Big Boss is close (or up) -> no /reset until it's over "
+                          "(a reset would put me below the Tarkan /move level)")
++        elif lvl >= hub.reset_level and self.th and self.th.hold_reset():
++            if not getattr(self, "th_hold_logged", False):
++                self.th_hold_logged = True
++                self.log("reset level, but the Treasure Hunt is close (or on) -> no /reset until it's over "
++                         "(a reset would put me below the treasure map's /move level)")
+         elif lvl >= hub.reset_level and self.pair_may_reset():
+             self.bb_hold_logged = False
++            self.th_hold_logged = False
+             self.mode = "reset"
+             self.publish()
+             return self.reset_tick()
+@@ -871,6 +889,8 @@ class Agent:
+             self.gi.on_pause()          # the in-page fight loop must not fight while you play
+         if self.bb:
+             self.bb.on_pause()          # same for the Big Boss loop (it switches back on when you resume)
++        if self.th:
++            self.th.on_pause()          # and the Treasure Hunt chest loop
+ 
+     def resume(self):
+         self.paused = False
+@@ -1444,6 +1464,8 @@ class Agent:
+             why = "is hunting the Golden Invasion"
+         elif L.get("mode") == "bb":
+             why = "is at the Big Boss"
++        elif L.get("mode") == "th":
++            why = "is at the Treasure Hunt"
+         elif not L.get("online"):
+             self.leveler_off_since = self.leveler_off_since or now
+             if now - self.leveler_off_since > PAIR_LEVELER_GRACE:
+@@ -1688,6 +1710,8 @@ class Agent:
+             until = o - time.time()
+             if -B.BC_DOOR_CLOSE_SEC - 60 <= until <= BC_PLAN_SEC + TRADE_BC_QUIET:
+                 return True
++        if self.th and self.th.quiet():             # Treasure Hunt (:40): from TH_QUIET_SEC before until it's over
++            return True
+         return GI.GI_ENABLED and 47 <= time.localtime().tm_min <= 54     # Golden Invasion (:50)
+ 
+     def maybe_start_trade(self):
+@@ -3347,6 +3371,10 @@ def read_keys(hub, agents):
+                 hub.bb_on = not hub.bb_on
+                 log("=== BIG BOSS " + ("ON" if hub.bb_on else
+                     "OFF (anyone at the boss stops and goes back to normal; no reset hold)") + " ===")
++            elif k == TH_TOGGLE_KEY:
++                hub.th_on = not hub.th_on
++                log("=== TREASURE HUNT " + ("ON" if hub.th_on else
++                    "OFF (anyone hunting stops and goes back to normal; no reset hold)") + " ===")
+             elif k == G.PAUSE_KEY:
+                 if all(a.name in hub.paused for a in agents):
+                     hub.paused.clear()
+@@ -3416,7 +3444,9 @@ def main():
+         time.sleep(3)    # stagger the browser launches
+     log(f"Blood Castle is {'ON' if hub.bc_on else 'OFF'} (B in this window switches it)")
+     log(f"Big Boss is {'ON' if hub.bb_on else 'OFF'} (O in this window switches it)")
+-    log("Keys in this window: P = pause/resume everyone, B = Blood Castle on/off, O = Big Boss on/off, R = restart now, "
++    log(f"Treasure Hunt is {'ON' if hub.th_on else 'OFF'} (T in this window switches it)")
++    log("Keys in this window: P = pause/resume everyone, B = Blood Castle on/off, O = Big Boss on/off, "
++        "T = Treasure Hunt on/off, R = restart now, "
+         + ", ".join(f"{i + 1} = {a.name}" for i, a in enumerate(agents)) + " (pause/resume one)")
+     last_summary = 0
+     rc = EXIT_ALL_DEAD             # the loop ends by itself only when every character thread stopped
+diff --git a/mu_supervisor.py b/mu_supervisor.py
+index a921ae5..acdddb3 100644
+--- a/mu_supervisor.py
++++ b/mu_supervisor.py
+@@ -79,8 +79,14 @@ def compile_all():
+     return None
+ 
+ 
++TREASURE_UNSAFE = (37, 46)             # Treasure Hunt (every 3 h at :40: 01:40, 04:40, ...): no restart then either
++
++
+ def safe_now():
+-    return SAFE_MINUTES[0] <= datetime.now().minute < SAFE_MINUTES[1]
++    now = datetime.now()
++    if now.hour % 3 == 1 and TREASURE_UNSAFE[0] <= now.minute < TREASURE_UNSAFE[1]:
++        return False
++    return SAFE_MINUTES[0] <= now.minute < SAFE_MINUTES[1]
+ 
+ 
+ def start_bot():

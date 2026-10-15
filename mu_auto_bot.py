@@ -89,6 +89,7 @@ import mu_group_bot as G
 import mu_bc as B
 import mu_gi as GI
 import mu_bb as BB
+import mu_th as TH
 import mu_chat as CH
 import mu_hub as HUB
 import roster as R
@@ -152,6 +153,8 @@ BC_AUTO             = True    # (Juan 2026-10-14: on by default) Blood Castle on
 BC_TOGGLE_KEY       = "b"
 BB_AUTO             = False   # (Juan 2026-10-15: OFF by default) Big Boss on/off AT STARTUP (mu_bb.py) ...
 BB_TOGGLE_KEY       = "o"     # ... press O in the console to switch it live
+TH_AUTO             = True    # (Juan 2026-10-15) Treasure Hunt on/off AT STARTUP (mu_th.py, every 3 h at :40) ...
+TH_TOGGLE_KEY       = "t"     # ... press T in the console to switch it live
 BC_TIERS            = B.BC_TIERS        # (castle, min lvl, max lvl): BC1 15-80 ... BC7 331-400
 BC_PLAN_SEC         = 900   # make the plan this long before the entry window opens
 BC_FARM_UNTIL_SEC   = 180   # holders keep farming until this long before the window opens (:57) ...
@@ -226,8 +229,7 @@ TRADE_FROM_JS = """
 VAULT_STATE_JS = """
 () => { const e = window.__eco, s = window.__store; if (!e) return null;
   return {open: !!e.vaultOpen, locked: !!(e.vaultLocked && !e.vaultUnlocked),
-          items: (e.vaultItems || []).slice(0, 120).filter(Boolean).length, page: e.vaultPage || 0,
-          pending: !!(s && s.pendingItemMove)}; }
+          items: (e.vaultItems || []).filter(Boolean).length, pending: !!(s && s.pendingItemMove)}; }
 """
 
 TRADE_YOURS_JS = """
@@ -265,7 +267,6 @@ VAULT_NPC_TYPE      = 240   # "Baz, Storage Guard", Lorencia (147,145) and (146,
 VAULT_SPOT          = (145, 140)   # where Juan stood to open it (south Baz)
 VAULT_TIMEOUT       = 300   # whole vault trip
 VAULT_RETRY_SEC     = 600   # failed trip -> next try
-VAULT_FULL_RETRY_SEC = 6 * 3600   # vault full (non-VIP = 1 page, 120 cells): don't walk there again for this long
 TRADE_BC_QUIET      = 180   # no new trades from BC_PLAN_SEC + this before a castle opens until the door closes
 
 # restarts (mu_supervisor.py)
@@ -382,6 +383,7 @@ class Hub:
         self.pause_all = False       # P / PAUSE file: everyone paused, windows stay minimized
         self.bc_on = BC_AUTO         # B in the console switches Blood Castle on/off
         self.bb_on = BB_AUTO         # O in the console switches the Big Boss on/off
+        self.th_on = TH_AUTO         # T in the console switches the Treasure Hunt on/off
         self.stop = False
 
     def put(self, name, d):
@@ -466,6 +468,8 @@ class Agent:
         self.gi = GI.GoldenInvasion(self) if GI.GI_ENABLED else None
         # Big Boss (mu_bb.py): every available character goes, one party of ours, back to normal after
         self.bb = BB.BigBoss(self) if BB.BB_ENABLED else None
+        # Treasure Hunt (mu_th.py): every available character patrols its slice of the map for the chest
+        self.th = TH.TreasureHunt(self) if TH.TH_ENABLED else None
         # Chat replies to other players (mu_chat.py; dry run = log only, see CH.CHAT_SEND)
         self.chat = CH.ChatAgent(self, hub.chat) if getattr(hub, "chat", None) else None
 
@@ -496,7 +500,8 @@ class Agent:
                             break
                         self.log(f"error: {e!r}")
                         time.sleep(5)
-                    time.sleep((self.bb.sleep() if self.bb else None) or (self.gi.sleep() if self.gi else None)
+                    time.sleep((self.bb.sleep() if self.bb else None) or (self.th.sleep() if self.th else None)
+                               or (self.gi.sleep() if self.gi else None)
                                or self.bc_sleep() or G.TICK)   # 4x/s during the invasion / inside BC
                 try:
                     ctx.close()
@@ -731,6 +736,11 @@ class Agent:
                     hub.pair_round.discard(self.name)    # my part of the pair's reset round is done
         self.read_bc_timer()                    # always: so switching BC on mid-hour works at once
         if self.bb and self.bb.tick():          # Big Boss: drops everything else (not inside a Blood Castle)
+            if self.th and self.th.active():
+                self.th.finish("Big Boss")
+            self.publish()
+            return
+        if self.th and self.th.tick():          # Treasure Hunt (:40, 5 min): every available character
             self.publish()
             return
         if self.gi and self.gi.tick():          # Golden Invasion (:49 -> :53) comes first
@@ -756,8 +766,14 @@ class Agent:
                 self.bb_hold_logged = True
                 self.log("reset level, but the Big Boss is close (or up) -> no /reset until it's over "
                          "(a reset would put me below the Tarkan /move level)")
+        elif lvl >= hub.reset_level and self.th and self.th.hold_reset():
+            if not getattr(self, "th_hold_logged", False):
+                self.th_hold_logged = True
+                self.log("reset level, but the Treasure Hunt is close (or on) -> no /reset until it's over "
+                         "(a reset would put me below the treasure map's /move level)")
         elif lvl >= hub.reset_level and self.pair_may_reset():
             self.bb_hold_logged = False
+            self.th_hold_logged = False
             self.mode = "reset"
             self.publish()
             return self.reset_tick()
@@ -873,6 +889,8 @@ class Agent:
             self.gi.on_pause()          # the in-page fight loop must not fight while you play
         if self.bb:
             self.bb.on_pause()          # same for the Big Boss loop (it switches back on when you resume)
+        if self.th:
+            self.th.on_pause()          # and the Treasure Hunt chest loop
 
     def resume(self):
         self.paused = False
@@ -1446,6 +1464,8 @@ class Agent:
             why = "is hunting the Golden Invasion"
         elif L.get("mode") == "bb":
             why = "is at the Big Boss"
+        elif L.get("mode") == "th":
+            why = "is at the Treasure Hunt"
         elif not L.get("online"):
             self.leveler_off_since = self.leveler_off_since or now
             if now - self.leveler_off_since > PAIR_LEVELER_GRACE:
@@ -1690,6 +1710,8 @@ class Agent:
             until = o - time.time()
             if -B.BC_DOOR_CLOSE_SEC - 60 <= until <= BC_PLAN_SEC + TRADE_BC_QUIET:
                 return True
+        if self.th and self.th.quiet():             # Treasure Hunt (:40): from TH_QUIET_SEC before until it's over
+            return True
         return GI.GI_ENABLED and 47 <= time.localtime().tm_min <= 54     # Golden Invasion (:50)
 
     def maybe_start_trade(self):
@@ -1873,16 +1895,6 @@ class Agent:
                     self.ev("() => window.__eco.closeVault()")
                     return self.vault_end(f"stored {v['moved']} box(es), vault now holds "
                                           f"{(self.ev(VAULT_STATE_JS) or {}).get('items', '?')} item(s)", ok=True)
-                if st.get("page"):
-                    self.ev("() => window.__eco.setVaultPage(0)")   # page 2 is VIP only: never move there
-                    return True
-                room = self.ev("(i) => { const s = window.__store, it = s.playerData.items[i];"
-                               " return it ? s.findFreeSquare(2, it) : -1; }", slots[0])
-                if room is None or room < 0 or room >= 120:
-                    self.ev("() => window.__eco.closeVault()")
-                    return self.vault_end(f"vault page 1 is FULL ({st.get('items')} item(s)) -> keeping "
-                                          f"{len(slots)} box(es); stored {v['moved']} this trip",
-                                          ok=v["moved"] > 0, retry=VAULT_FULL_RETRY_SEC)
                 v["last"], v["move_at"] = slots[0], now
                 self.ev("(i) => window.__store.autoMoveItem(0, i, 2)", slots[0])   # Inventory (0) -> Vault (2)
                 return True
@@ -3359,6 +3371,10 @@ def read_keys(hub, agents):
                 hub.bb_on = not hub.bb_on
                 log("=== BIG BOSS " + ("ON" if hub.bb_on else
                     "OFF (anyone at the boss stops and goes back to normal; no reset hold)") + " ===")
+            elif k == TH_TOGGLE_KEY:
+                hub.th_on = not hub.th_on
+                log("=== TREASURE HUNT " + ("ON" if hub.th_on else
+                    "OFF (anyone hunting stops and goes back to normal; no reset hold)") + " ===")
             elif k == G.PAUSE_KEY:
                 if all(a.name in hub.paused for a in agents):
                     hub.paused.clear()
@@ -3428,7 +3444,9 @@ def main():
         time.sleep(3)    # stagger the browser launches
     log(f"Blood Castle is {'ON' if hub.bc_on else 'OFF'} (B in this window switches it)")
     log(f"Big Boss is {'ON' if hub.bb_on else 'OFF'} (O in this window switches it)")
-    log("Keys in this window: P = pause/resume everyone, B = Blood Castle on/off, O = Big Boss on/off, R = restart now, "
+    log(f"Treasure Hunt is {'ON' if hub.th_on else 'OFF'} (T in this window switches it)")
+    log("Keys in this window: P = pause/resume everyone, B = Blood Castle on/off, O = Big Boss on/off, "
+        "T = Treasure Hunt on/off, R = restart now, "
         + ", ".join(f"{i + 1} = {a.name}" for i, a in enumerate(agents)) + " (pause/resume one)")
     last_summary = 0
     rc = EXIT_ALL_DEAD             # the loop ends by itself only when every character thread stopped
