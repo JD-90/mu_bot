@@ -347,7 +347,7 @@ def _status_html(v, key=""):
         who = f"{e(meta.get('by'))}, {_ago(meta.get('ago'))}" if meta.get("by") else ""
         btn = (f"<form method=post action='/toggle{q}{'&' if q else '?'}f={k}'>"
                f"<button>{'switch OFF' if on else 'switch ON'}</button></form>")
-        sw.append(f"<tr><td>{e(label)}</td><td>{state}</td><td>{who}</td>{''.join(local)}<td>{btn}</td></tr>")
+        sw.append(f"<tr><td class=m-{k}>{e(label)}</td><td>{state}</td><td>{who}</td>{''.join(local)}<td>{btn}</td></tr>")
     sw_head = "".join(f"<th>{e(m)} sees" for m, _ in machines)
     # summons (commands to our characters, to help the main)
     main = v.get("main")
@@ -417,7 +417,8 @@ def _status_html(v, key=""):
 td,th{{border:1px solid #444;padding:4px 8px;text-align:left}}th{{background:#222}}
 .on{{color:#4c4}}.off{{color:#e55}}.bad{{color:#fa3}}.ok{{color:#999}}form{{margin:0}}
 button{{font:inherit;padding:3px 10px;cursor:pointer}}
-.m-bc,.m-gi,.m-th,.m-bb,.m-summoned{{color:#fc5;font-weight:bold}}.m-paused,.m-offline{{color:#888}}.m-level{{color:#8cf}}
+.m-bc,.m-gi,.m-th,.m-bb,.m-summoned{{color:#fc5;font-weight:bold}}
+.m-bc{{color:#b57cff}}.m-bb{{color:#ff3b3b}}.m-th{{color:#c97a7a}}.m-paused,.m-offline{{color:#888}}.m-level{{color:#8cf}}
 .wrap{{overflow-x:auto}}</style>
 <p><a href="/logs{q}" style="color:#8cf">Logs (every machine) &rarr;</a></p>
 <h3>Events (shared by every machine)</h3>
