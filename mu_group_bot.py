@@ -296,6 +296,7 @@ STATE_JS = """
     inGame: !!hero && !s.sceneLoading,
     sceneLoading: !!s.sceneLoading,
     connectionLost: !!s.connectionLost,
+    uiState: s.uiState,
     chars: (s.charactersList || []).map(c => c.Name),
     name: p.name, level: p.level, resets: p.resets, exp: Number(p.exp) || 0,
     x: hero ? Math.floor(hero.transform.pos.x) : p.x,

@@ -2484,7 +2484,7 @@ class Agent:
         if s.get("connectionLost") or s.get("loginVisible"):
             return self.valt_end("disconnected / login screen -> normal reconnect as the keeper")
         if now - a["since"] > VAULT_ALT_TIMEOUT and a["phase"] not in ("back", "select-back"):
-            a["back_why"] = f"took more than {VAULT_ALT_TIMEOUT}s (phase {a['phase']})"
+            a["back_why"] = f"timed out after {VAULT_ALT_TIMEOUT}s (phase {a['phase']})"   # not "took": valt_end reads "took" as success
             self.valt_phase(a, "back")
         if now - a["since"] > VAULT_ALT_TIMEOUT + 120:
             return self.valt_end("could not get back -> normal reconnect as the keeper")
