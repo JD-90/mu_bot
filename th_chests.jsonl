@@ -12,3 +12,16 @@
 {"t": "2026-10-15T19:41:27", "map": "Tarkan", "map_idx": 8, "by": "wizzardo", "id": 891, "x": 149, "y": 97, "event": "broken", "mine": false, "killer": 883}
 {"t": "2026-10-15T19:44:56", "map": "Tarkan", "map_idx": 8, "by": "bruto", "id": 964, "x": 110, "y": 155, "d": 13, "event": "seen"}
 {"t": "2026-10-15T19:44:59", "map": "Tarkan", "map_idx": 8, "by": "bruto", "id": 964, "x": 110, "y": 155, "event": "broken", "mine": true}
+{"t": "2026-10-15T22:40:33", "map": "Devias", "map_idx": 2, "by": "wizzardo", "id": 1341, "x": 65, "y": 35, "d": 16, "event": "seen"}
+{"t": "2026-10-15T22:40:35", "map": "Devias", "map_idx": 2, "by": "wizzardo", "id": 1341, "x": 65, "y": 35, "event": "broken", "mine": true}
+{"t": "2026-10-15T22:40:56", "map": "Devias", "map_idx": 2, "by": "bruto", "id": 1332, "x": 193, "y": 139, "d": 28, "event": "seen"}
+{"t": "2026-10-15T22:41:31", "map": "Devias", "map_idx": 2, "by": "cucaracha", "id": 1285, "x": 134, "y": 134, "d": 31, "event": "seen"}
+{"t": "2026-10-15T22:41:32", "map": "Devias", "map_idx": 2, "by": "cucaracha", "id": 1285, "x": 134, "y": 134, "event": "broken", "mine": false, "killer": 1360}
+{"t": "2026-10-15T22:43:04", "map": "Devias", "map_idx": 2, "by": "cucaracha", "id": 1362, "x": 166, "y": 200, "d": 36, "event": "seen"}
+{"t": "2026-10-15T22:43:10", "map": "Devias", "map_idx": 2, "by": "cucaracha", "id": 1362, "x": 166, "y": 200, "event": "broken", "mine": false, "killer": 1244}
+{"t": "2026-10-15T22:44:05", "map": "Devias", "map_idx": 2, "by": "bruto", "id": 1361, "x": 161, "y": 198, "d": 23, "event": "seen"}
+{"t": "2026-10-15T22:44:11", "map": "Devias", "map_idx": 2, "by": "bruto", "id": 1361, "x": 161, "y": 198, "event": "broken", "mine": true}
+{"t": "2026-10-15T22:44:36", "map": "Devias", "map_idx": 2, "by": "bruto", "id": 1299, "x": 160, "y": 134, "d": 27, "event": "seen"}
+{"t": "2026-10-15T22:44:40", "map": "Devias", "map_idx": 2, "by": "bruto", "id": 1299, "x": 160, "y": 134, "event": "broken", "mine": false, "killer": 1251}
+{"t": "2026-10-15T22:44:40", "map": "Devias", "map_idx": 2, "by": "cucaracha", "id": 1295, "x": 124, "y": 221, "d": 23, "event": "seen"}
+{"t": "2026-10-15T22:44:45", "map": "Devias", "map_idx": 2, "by": "cucaracha", "id": 1295, "x": 124, "y": 221, "event": "broken", "mine": true}

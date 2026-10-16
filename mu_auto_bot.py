@@ -227,7 +227,7 @@ BIG_RESOLUTION      = (1920, 1200)  # game size while big; capped to what the sc
 BIG_OPTIONS = {
     "otherPlayerItemEffects": True,   # World and effects: other players' gear effects ON
     "otherPlayerSkillEffects": True,  # World and effects: other players' skill effects ON
-    "renderDistance": 1,              # World and effects: render distance 80
+    "renderDistance": 0,              # World and effects: render distance 80
     "fpsLimit": 4,                    # FPS limit 120
     "volume": 5,                      # Sound: master volume 5
     "musicVolume": 1,                 # Sound: music 1
