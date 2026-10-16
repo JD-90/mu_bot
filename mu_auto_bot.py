@@ -259,6 +259,65 @@ VAULT_STATE_JS = """
           items: (e.vaultItems || []).filter(Boolean).length, pending: !!(s && s.pendingItemMove)}; }
 """
 
+# first empty bag cell (8x8 bag = slots 12..75; item sizes read like B.BAG_FREE_JS)
+FREE_BAG_SLOT_JS = """
+() => { const items = window.__store.playerData.items || [], used = new Array(64).fill(false);
+  const num = v => (typeof v === 'number' && v >= 1 && v <= 4) ? v : null;
+  for (let i = 12; i < 76; i++) { const it = items[i]; if (!it) continue;
+    const d = it.def || it.info || it.attr || {};
+    const w = num(it.width) || num(it.w) || num(d.width) || num(d.w) || 1;
+    const h = num(it.height) || num(it.h) || num(d.height) || num(d.h) || 1;
+    const c0 = (i - 12) % 8, r0 = Math.floor((i - 12) / 8);
+    for (let r = r0; r < Math.min(8, r0 + h); r++) for (let c = c0; c < Math.min(8, c0 + w); c++) used[r * 8 + c] = true; }
+  const k = used.indexOf(false); return k < 0 ? -1 : 12 + k; }
+"""
+
+# room in the vault for bag slot `i` (findFreeSquare searches only the page shown) + page info
+VAULT_ROOM_JS = """
+(i) => { const e = window.__eco, s = window.__store; const it = (s.playerData.items || [])[i];
+  let free = -2; try { free = it ? s.findFreeSquare(2, it) : -2; } catch (x) {}
+  let two = false; try { two = !!e.vaultHasSecondPage(); } catch (x) {}
+  return {free, page: e.vaultPage || 0, two}; }
+"""
+
+# Kundun boxes in the vault (any page): [{slot, lvl}] + free bag room for the first one
+VAULT_BOXES_JS = """
+(minLvl) => { const e = window.__eco, s = window.__store; const g = i => (i && (i.item || i)) || null;
+  const out = []; (e.vaultItems || []).forEach((it, i) => { const x = g(it);
+    if (x && x.group === 14 && x.num === 11 && (x.lvl || 0) >= minLvl) out.push({slot: i, lvl: x.lvl}); });
+  let room = -2; try { if (out.length) room = s.findFreeSquare(0, g(e.vaultItems[out[0].slot])); } catch (x) {}
+  return {boxes: out, room, page: e.vaultPage || 0, pending: !!s.pendingItemMove}; }
+"""
+
+# "Switch Character" without the menu: the client's own LogOut packet (C3 05 F1 02, Type 1 = back to
+# character selection; Juan's recording 2026-10-16 sent exactly c3 05 f1 02 01). The server's
+# LogoutResponse makes the client go to the character list by itself.
+SWITCH_CHAR_JS = """
+() => { const s = window.__store; if (!s || typeof s.sendToGS !== 'function') return 'no sendToGS';
+  const dv = new DataView(new Uint8Array([0xc3, 0x05, 0xf1, 0x02, 0x01]).buffer);
+  s.sendToGS(dv); return 'sent'; }
+"""
+# fallback: the options menu's "Switch Character" + Enter on its confirm dialog
+SWITCH_CHAR_UI_JS = """
+() => { const s = window.__store; s.optionsEnabled = true;
+  const el = [...document.querySelectorAll('body *')].find(e => e.childElementCount === 0
+      && (e.textContent || '').trim() === 'Switch Character' && e.getBoundingClientRect().width > 0);
+  if (!el) return 'no button';
+  for (const ev of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'])
+    el.dispatchEvent(new MouseEvent(ev, {bubbles: true, cancelable: true, view: window}));
+  setTimeout(() => document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})), 700);
+  return 'clicked'; }
+"""
+
+# nearest "Baz, Storage Guard" in view: {x, y} or null
+NPC_POS_JS = """
+(t) => { const w = window.__world, h = w && w.playerEntity; if (!h) return null; const p = h.transform.pos;
+  const e = w.netObjsQuery.entities.filter(e => e.npcType === t)
+      .sort((a, b) => Math.hypot(a.transform.pos.x - p.x, a.transform.pos.z - p.z)
+                    - Math.hypot(b.transform.pos.x - p.x, b.transform.pos.z - p.z))[0];
+  return e ? {x: Math.round(e.transform.pos.x), y: Math.round(e.transform.pos.z)} : null; }
+"""
+
 TRADE_YOURS_JS = """
 ([minLvl, cristal]) => { const it = Object.values(window.__eco.yourTradeItems || {}).filter(Boolean);
   const g = i => i.item || i;   // an item whose fields we can't read counts as a box (not as "other")
@@ -305,6 +364,18 @@ VAULT_NPC_TYPE      = 240   # "Baz, Storage Guard", Lorencia (147,145) and (146,
 VAULT_SPOT          = (145, 140)   # where Juan stood to open it (south Baz)
 VAULT_TIMEOUT       = 300   # whole vault trip
 VAULT_RETRY_SEC     = 600   # failed trip -> next try
+VAULT_ALTS          = ["mogubaul1", "mogubaul2", "mogubaul3", "mogubaul4"]
+                            # Juan 2026-10-16: level-1 characters on the keeper's account. When the keeper's
+                            # vault is full he switches to one of them ("Switch Character"), it empties the
+                            # vault's Kundun boxes into its bag (until the bag is full), and he switches back.
+VAULT_ALTS_FILE     = G.BASE_DIR / "vault_alts.json"   # alts whose bag is full
+VAULT_ALT_TIMEOUT   = 240   # whole switch -> empty -> switch back
+VAULT_ALT_RETRY     = 21600 # every alt full -> look again after this long
+MAIN_CRYSTALS_KEEP  = 500   # Juan 2026-10-16: the main keeps this many Cristales; above it he opens his vault
+                            # with /baul (VIP, from anywhere) and deposits the rest
+CRYSTAL_BANK_CHECK  = 120   # seconds between Cristal counts on the main
+CRYSTAL_BANK_TIMEOUT = 90   # the whole /baul deposit
+CRYSTAL_BANK_RETRY  = 1800  # failed deposit -> next try
 TRADE_BC_QUIET      = 180   # no new trades from BC_PLAN_SEC + this before a castle opens until the door closes
 
 # restarts (mu_supervisor.py)
@@ -541,6 +612,11 @@ class Agent:
         self.trade_dest = TRADE_TO   # who I'm taking my boxes to (main or vault keeper)
         self.vault = None            # vault keeper: trip to the vault in progress
         self.vault_next = 0
+        self.cbank = None            # main: /baul Cristal deposit in progress
+        self.valt = None             # keeper: switched to a vault alt to empty the vault
+        self.valt_next = 0
+        self.valt_stray_at = 0
+        self.cbank_next = 0
         self.my_trade = None
         self.trade_next = 0
         self.trade_fails = 0
@@ -777,6 +853,10 @@ class Agent:
             self.keep_minimized()
             self.publish()
             return
+        if self.valt is not None or (VAULT_KEEPER == self.name and VAULT_ALTS
+                                     and time.time() - self.valt_stray_at > 30 and self.valt_stray_check()):
+            self.valt_tick()                # on a vault alt: no leveling / reset tracking / publishing
+            return
         c.refresh()
         if c.online:
             c.last_ingame = time.time()
@@ -850,6 +930,9 @@ class Agent:
         if self.vault_tick():
             self.publish()
             return
+        if self.crystal_bank_tick():
+            self.publish()
+            return
         if self.trade_tick():
             if self.stranger_party and self.my_trade and self.name == self.my_trade["alt"]:
                 self.leave_party("walking over to trade boxes")
@@ -893,6 +976,7 @@ class Agent:
         if self.junk:
             try:
                 self.junk.drop_tick()               # drop non-excellent / non-ancient gear at my feet
+                self.junk.join_tick()               # join small Cristal stacks
             except Exception as e:
                 self.log(f"JUNK drop error: {e!r}")
         self.level_tick()
@@ -2034,20 +2118,371 @@ class Agent:
                     if last in slots:
                         if now - v["move_at"] < 3:
                             return True              # the server hasn't answered yet
-                        return self.vault_end(f"a box did not move (slot {last}) -> vault full? "
-                                              f"({st.get('items')} item(s) inside)", ok=v["moved"] > 0, retry=3600)
+                        return self.vault_full(v, st, f"a box did not move (slot {last})")
                     v["moved"] += 1
                     v["last"] = None
                 if not slots:
                     self.ev("() => window.__eco.closeVault()")
                     return self.vault_end(f"stored {v['moved']} box(es), vault now holds "
                                           f"{(self.ev(VAULT_STATE_JS) or {}).get('items', '?')} item(s)", ok=True)
+                room = self.ev(VAULT_ROOM_JS, slots[0]) or {}
+                if room.get("free", 0) < 0:
+                    return self.vault_full(v, st)
                 v["last"], v["move_at"] = slots[0], now
                 self.ev("(i) => window.__store.autoMoveItem(0, i, 2)", slots[0])   # Inventory (0) -> Vault (2)
                 return True
         except Exception as e:
             self.log(f"VAULT error: {e!r}")
         return True
+
+    # ── the main (wizzardo) keeps MAIN_CRYSTALS_KEEP Cristales, the rest goes to his vault via /baul ──
+    def crystal_bank_plan(self, stacks):
+        """Which stacks to deposit so exactly MAIN_CRYSTALS_KEEP stay: whole stacks first (biggest that
+        still fits in the excess), then a split-off of what's left over. -> (slots, split_n)"""
+        excess = sum(x["n"] for x in stacks) - MAIN_CRYSTALS_KEEP
+        out = []
+        for x in sorted(stacks, key=lambda x: -x["n"]):
+            if 0 < x["n"] <= excess:
+                out.append(x["slot"])
+                excess -= x["n"]
+        return out, max(excess, 0)
+
+    def crystal_bank_tick(self):
+        """Juan 2026-10-16: wizzardo with more than MAIN_CRYSTALS_KEEP Cristales -> /baul (VIP vault from
+        anywhere), deposit the rest (whole stacks; the last few split off with /dividir into a free bag
+        cell), close it. Only while leveling, never during trades/events. True while busy."""
+        if not MAIN_CRYSTALS_KEEP or self.name != self.hub.trade_to:
+            return False
+        c, s = self.c, self.c.s
+        now = time.time()
+        k = self.cbank
+        if k is None:
+            if now < self.cbank_next or self.bcs or self.my_trade or (s.get("hp") or 0) <= 0 or c.shop_pending \
+                    or (s.get("level") or 0) >= (self.hub.reset_level or 10 ** 6) or self.trade_quiet():
+                return False
+            t = self.hub.trade
+            if t and self.name in (t.get("alt"), t.get("lead")):
+                return False
+            self.cbank_next = now + CRYSTAL_BANK_CHECK
+            b = self.ev(JK.CRYSTALS_JS, list(CRYSTAL_ITEM)) or {}
+            stacks = b.get("stacks") or []
+            total = sum(x["n"] for x in stacks)
+            if total <= MAIN_CRYSTALS_KEEP:
+                return False
+            k = self.cbank = {"since": now, "phase": "open", "phase_at": now, "tries": 0, "moved": 0,
+                              "start": total, "split_tried": False}
+            self.log(f"CRYSTALS: {total} Cristales in {len(stacks)} stack(s) -> /baul, depositing "
+                     f"{total - MAIN_CRYSTALS_KEEP} (keeping {MAIN_CRYSTALS_KEEP})")
+        self.mode = "crystal-bank"
+        if self.bcs or self.trade_quiet() or (s.get("hp") or 0) <= 0:
+            return self.cbank_end("an event is coming / died", ok=False, retry=120)
+        if now - k["since"] > CRYSTAL_BANK_TIMEOUT:
+            return self.cbank_end(f"took more than {CRYSTAL_BANK_TIMEOUT}s (phase {k['phase']})", ok=False)
+        try:
+            st = self.ev(VAULT_STATE_JS) or {}
+            if k["phase"] == "open":
+                if st.get("open"):
+                    if st.get("locked"):
+                        return self.cbank_end("the vault has a PIN -> unlock it by hand", ok=False, retry=3600)
+                    self.log(f"CRYSTALS: vault open ({st.get('items')} item(s) inside)")
+                    k["phase"], k["phase_at"] = "move", now
+                    return True
+                if k["tries"] and now - k["phase_at"] < 4:
+                    return True
+                if k["tries"] >= 3:
+                    return self.cbank_end("/baul did not open the vault", ok=False)
+                c.set_helper(False)
+                c.close_windows()
+                c.chat("/baul")
+                k["tries"] += 1
+                k["phase_at"] = now
+                return True
+            if k["phase"] == "move":
+                if not st.get("open"):
+                    return self.cbank_end("the vault window closed", ok=k["moved"] > 0)
+                b = self.ev(JK.CRYSTALS_JS, list(CRYSTAL_ITEM)) or {}
+                if st.get("pending") or b.get("pending") or b.get("picked"):
+                    return True
+                stacks = b.get("stacks") or []
+                last = k.get("last")
+                if last is not None:
+                    if any(x["slot"] == last for x in stacks):
+                        if now - k["move_at"] < 3:
+                            return True
+                        return self.cbank_end(f"a Cristal stack did not move (slot {last}) -> vault full?",
+                                              ok=k["moved"] > 0, retry=3600)
+                    k["moved"] += 1
+                    k["last"] = None
+                if k.get("split_at"):                       # waiting for the /dividir to show up in the bag
+                    if len(stacks) == k["split_len"] and now - k["split_at"] < 4:
+                        return True
+                    k["split_at"] = None
+                slots, split_n = self.crystal_bank_plan(stacks)
+                if not slots and split_n:
+                    if k["split_tried"]:
+                        slots = []                          # the split didn't work: keep the extra few
+                    else:
+                        free = self.ev(FREE_BAG_SLOT_JS)
+                        src = max(stacks, key=lambda x: x["n"])
+                        k["split_tried"] = True
+                        if free is not None and free >= 0:
+                            r = self.ev(JK.SPLIT_JS, [src["slot"], free, split_n])
+                            self.log(f"CRYSTALS: /dividir {src['slot']} {free} {split_n} (splitting off the last "
+                                     f"{split_n} to deposit): {r}")
+                            k["split_at"], k["split_len"] = now, len(stacks)
+                            return True
+                if not slots:
+                    left = sum(x["n"] for x in stacks)
+                    self.ev("() => window.__eco.closeVault()")
+                    return self.cbank_end(f"deposited {k['start'] - left} Cristales in {k['moved']} stack(s); "
+                                          f"{left} left in the bag", ok=True)
+                slot = slots[0]
+                room = self.ev(VAULT_ROOM_JS, slot) or {}
+                if room.get("free", -1) < 0:
+                    if room.get("two") and room.get("page", 0) == 0:
+                        self.ev("() => window.__eco.setVaultPage(1)")
+                        self.log("CRYSTALS: vault page 1 full -> page 2")
+                        return True
+                    return self.cbank_end("no room in the vault", ok=k["moved"] > 0, retry=3600)
+                k["last"], k["move_at"] = slot, now
+                self.ev("(i) => window.__store.autoMoveItem(0, i, 2)", slot)
+                return True
+        except Exception as e:
+            self.log(f"CRYSTALS error: {e!r}")
+        return True
+
+    def cbank_end(self, why, ok, retry=None):
+        self.log(f"CRYSTALS: {why}")
+        try:
+            self.ev("() => { const e = window.__eco; if (e && e.vaultOpen) e.closeVault(); }")
+        except Exception:
+            pass
+        self.cbank = None
+        self.cbank_next = time.time() + (CRYSTAL_BANK_CHECK if ok else (retry or CRYSTAL_BANK_RETRY))
+        self.c.walk_target = None
+        return False
+
+    # ── vault alts (VAULT_ALTS): level-1 characters of the keeper's account that hold the boxes ──
+    def valt_full_set(self):
+        try:
+            return set(json.loads(VAULT_ALTS_FILE.read_text(encoding="utf-8")).get("full") or [])
+        except Exception:
+            return set()
+
+    def valt_mark_full(self, alt):
+        full = self.valt_full_set() | {alt}
+        try:
+            VAULT_ALTS_FILE.write_text(json.dumps({"full": sorted(full)}, indent=1), encoding="utf-8")
+        except Exception as e:
+            self.log(f"VAULT ALT: could not save {VAULT_ALTS_FILE.name}: {e!r}")
+
+    def valt_pick(self):
+        full = self.valt_full_set()
+        return next((a for a in VAULT_ALTS if a not in full), None)
+
+    def vault_full(self, v, st, why="no room for the next box"):
+        """The keeper's vault is full: hand over to a vault alt (if one has room), else stop."""
+        alt = self.valt_pick()
+        self.log(f"VAULT: full ({why}; {st.get('items')} item(s) inside, stored {v['moved']} this trip)")
+        if alt and time.time() < self.valt_next:
+            return self.vault_end(f"last vault-alt switch failed -> trying again in "
+                                  f"{int(self.valt_next - time.time())}s", ok=False,
+                                  retry=max(60, self.valt_next - time.time()))
+        if not alt:
+            return self.vault_end("no vault alt with room left -> boxes stay in my bag", ok=v["moved"] > 0,
+                                  retry=VAULT_ALT_RETRY)
+        self.vault_end(f"switching to {alt} to empty the vault", ok=True, retry=5)
+        self.vault_next = time.time() + 5          # back as the keeper -> next trip deposits the rest
+        self.valt = {"alt": alt, "phase": "out", "phase_at": time.time(), "since": time.time(), "tries": 0,
+                     "moved": 0, "back_why": None}
+        self.mode = "vault-alt"
+        self.publish()
+        return True
+
+    def valt_stray_check(self):
+        """In game as one of the vault alts without a session (bot restarted mid-switch) -> go back."""
+        self.valt_stray_at = time.time()
+        try:
+            nm = (self.c.page.evaluate(G.STATE_JS) or {}).get("name")
+        except Exception:
+            return False
+        if nm and nm != self.name and nm in VAULT_ALTS:
+            self.log(f"VAULT ALT: in game as {nm} -> switching back to {self.name}")
+            self.valt = {"alt": nm, "phase": "back", "phase_at": time.time(), "since": time.time(),
+                         "tries": 0, "moved": 0, "back_why": "stray"}
+            return True
+        return False
+
+    def valt_phase(self, a, phase):
+        a["phase"], a["phase_at"], a["tries"] = phase, time.time(), 0
+        self.log(f"VAULT ALT: {a['alt']} -> {phase}")
+
+    def valt_tick(self):
+        """Switch Character -> the alt -> Baz -> vault -> bag (Kundun boxes, until the bag is full) ->
+        Switch Character -> the keeper. Runs instead of the whole tick while it lasts."""
+        a, c = self.valt, self.c
+        now = time.time()
+        try:
+            s = c.s = c.page.evaluate(G.STATE_JS) or {"ready": False}
+        except Exception:
+            s = c.s = {"ready": False}
+        c.last_ingame = now                       # no "out of game too long" reload in the middle
+        info = dict((self.hub.snapshot().get(self.name)) or {})
+        if info:
+            info["mode"] = f"vault-alt {a['alt']}"
+            self.hub.put(self.name, info)
+        ingame = s.get("ready") and s.get("inGame") and not s.get("connectionLost")
+        me = s.get("name")
+        if s.get("connectionLost") or s.get("loginVisible"):
+            return self.valt_end("disconnected / login screen -> normal reconnect as the keeper")
+        if now - a["since"] > VAULT_ALT_TIMEOUT and a["phase"] not in ("back", "select-back"):
+            a["back_why"] = f"took more than {VAULT_ALT_TIMEOUT}s (phase {a['phase']})"
+            self.valt_phase(a, "back")
+        if now - a["since"] > VAULT_ALT_TIMEOUT + 120:
+            return self.valt_end("could not get back -> normal reconnect as the keeper")
+        ph = a["phase"]
+        # 1. leave the world (keeper or alt) for the character list
+        if ph in ("out", "back"):
+            if not ingame and s.get("uiState") == 3 and s.get("chars"):
+                self.valt_phase(a, "select" if ph == "out" else "select-back")
+                return
+            if not ingame:
+                return                                # loading / waiting for the list
+            if a["tries"] and now - a["phase_at"] < 8:
+                return
+            if a["tries"] >= 3:
+                if ph == "out":
+                    return self.valt_end("Switch Character did not work")
+                return self.valt_end("Switch Character (back) did not work -> restart the bot if it stays on the alt")
+            if ph == "back" and me == self.name:
+                return self.valt_end(a.get("back_why") or "back")
+            try:
+                if (self.ev("() => !!(window.__eco && window.__eco.vaultOpen)")):
+                    self.ev("() => window.__eco.closeVault()")
+                c.set_helper(False) if ph == "out" else None
+            except Exception:
+                pass
+            r = self.ev(SWITCH_CHAR_JS) if a["tries"] < 2 else self.ev(SWITCH_CHAR_UI_JS)
+            self.log(f"VAULT ALT: Switch Character ({'packet' if a['tries'] < 2 else 'menu'}): {r}")
+            a["tries"] += 1
+            a["phase_at"] = now
+            return
+        # 2. pick the alt / the keeper on the character list
+        if ph in ("select", "select-back"):
+            want = a["alt"] if ph == "select" else self.name
+            if ingame:
+                if me == want:
+                    self.valt_phase(a, "talk" if ph == "select" else "done")
+                    if ph == "select-back":
+                        return self.valt_end(a.get("back_why") or f"took {a['moved']} box(es) out of the vault")
+                    return
+                if a["tries"] >= 1:                   # in game as someone else -> leave again
+                    self.valt_phase(a, "out" if ph == "select" else "back")
+                return
+            if a["tries"] and now - a["phase_at"] < 8:
+                return
+            chars = s.get("chars") or []
+            if want not in chars:
+                if ph == "select":
+                    self.log(f"VAULT ALT: {want} is not on the character list {chars} -> marking it unusable")
+                    self.valt_mark_full(want)
+                    a["back_why"] = f"{want} not found"
+                    self.valt_phase(a, "select-back")
+                    return
+                if a["tries"] >= 3:
+                    return self.valt_end(f"{want} not on the character list {chars}")
+            if a["tries"] >= 4:
+                return self.valt_end(f"could not enter the game as {want}")
+            self.ev("(n) => window.__store.selectCharacterRequest(n)", want)
+            self.log(f"VAULT ALT: selecting {want}")
+            a["tries"] += 1
+            a["phase_at"] = now
+            return
+        if not ingame:
+            return
+        if me != a["alt"]:
+            self.valt_phase(a, "back")
+            return
+        st = self.ev(VAULT_STATE_JS) or {}
+        # 3. open the vault (Baz is next to where the alt stands: Noria (172,96) for an Elf)
+        if ph == "talk":
+            if st.get("open"):
+                if st.get("locked"):
+                    a["back_why"] = "the vault has a PIN"
+                    self.valt_phase(a, "back")
+                    return
+                self.log(f"VAULT ALT: {a['alt']} opened the vault ({st.get('items')} item(s) inside)")
+                self.valt_phase(a, "take")
+                return
+            if a["tries"] and now - a["phase_at"] < 4:
+                return
+            if a["tries"] >= 5:
+                a["back_why"] = "could not open the vault"
+                self.valt_phase(a, "back")
+                return
+            pos = self.ev(NPC_POS_JS, VAULT_NPC_TYPE)
+            if not pos:
+                a["back_why"] = f"no Baz, Storage Guard in view (map {s.get('map')} at {s.get('x')},{s.get('y')})"
+                self.valt_phase(a, "back")
+                return
+            if dist(s, pos["x"], pos["y"]) > 3:
+                self.ev(B.WALK_JS, [pos["x"] + 1, pos["y"]])
+            c.close_windows()
+            self.ev(B.TALK_NPC_JS, VAULT_NPC_TYPE)
+            a["tries"] += 1
+            a["phase_at"] = now
+            return
+        # 4. vault -> bag, one box per tick
+        if ph == "take":
+            if not st.get("open"):
+                a["back_why"] = f"vault window closed after {a['moved']} box(es)"
+                self.valt_phase(a, "back")
+                return
+            vb = self.ev(VAULT_BOXES_JS, B.KUNDUN_MIN_LVL) or {}
+            if vb.get("pending") or st.get("pending"):
+                return
+            boxes = vb.get("boxes") or []
+            last = a.get("last")
+            if last is not None:
+                if any(b["slot"] == last for b in boxes):
+                    if now - a["move_at"] < 3:
+                        return
+                    self.log(f"VAULT ALT: box in vault slot {last} did not move -> {a['alt']}'s bag is full")
+                    self.valt_mark_full(a["alt"])
+                    boxes = []
+                else:
+                    a["moved"] += 1
+                a["last"] = None
+            if boxes and vb.get("room", -1) < 0:
+                self.log(f"VAULT ALT: {a['alt']}'s bag is full ({a['moved']} taken this time) -> next alt next time")
+                self.valt_mark_full(a["alt"])
+                boxes = []
+            if not boxes:
+                self.ev("() => window.__eco.closeVault()")
+                a["back_why"] = (f"{a['alt']} took {a['moved']} box(es); vault now holds "
+                                 f"{(self.ev(VAULT_STATE_JS) or {}).get('items', '?')} item(s)")
+                self.log(f"VAULT ALT: {a['back_why']}")
+                self.valt_phase(a, "back")
+                return
+            a["last"], a["move_at"] = boxes[0]["slot"], now
+            self.ev("(i) => window.__store.autoMoveItem(2, i, 0)", boxes[0]["slot"])   # Vault (2) -> Inventory (0)
+            return
+
+    def valt_end(self, why, failed=None):
+        self.log(f"VAULT ALT: {why}")
+        a = self.valt or {}
+        self.valt = None
+        if failed is None:
+            failed = not a.get("moved") and a.get("back_why") != "stray" and "full" not in (a.get("back_why") or "") \
+                and "took" not in (a.get("back_why") or "")
+        if failed:
+            self.valt_next = time.time() + VAULT_RETRY_SEC
+        else:
+            self.vault_next = time.time() + 5       # deposit the rest right away
+        self.c.select_tries = 0
+        self.c.walk_target = None
+        self.c.last_ingame = time.time()            # handle_offline picks the keeper if we're not in game
+        return False
 
     def vault_phase(self, v, phase):
         v["phase"], v["phase_at"], v["tries"] = phase, time.time(), 0

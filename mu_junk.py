@@ -21,6 +21,9 @@ Getting rid of junk (Juan 2026-10-15). Two parts, both per character, only while
          (v1 put 8 at once without checking the room -> "There is no room for that item", bruto stuck.) At the end the Cristales are joined into stacks in the bag (they
          don't stack by themselves). Zen is no problem (no zen check).
          Items at +CRYST_MAX_LVL+1 or higher are kept too (fusion material, see the guide).
+         Juan 2026-10-16: the end-game exception only holds from +CRYST_KEEP_FROM (7) up; excellent
+         end-game gear below +7 is crystallized too. Excellent rings / pendants are always kept.
+1b. JOIN  every JOIN_EVERY s while leveling, small Cristal stacks in the bag are joined (/dividir).
          The trip waits while an event / trade / Blood Castle is on (mu_auto_bot.trade_quiet) and
          is forgotten CRYST_DUE_SEC after the hunt.
 
@@ -67,6 +70,11 @@ CRYST_ITEM_SEC   = 10        # extra trip time allowed per item to crystallize
 CRYST_BATCH      = 8         # items per Cristalizar (the Alquimista's maxBatch)
 CRYST_STACK_MAX  = 255       # Cristales per stack (the stack size is the item's durability byte)
 CRYST_MAX_LVL    = 12        # +13 and up are kept (fusion material)
+CRYST_KEEP_FROM  = 7         # (Juan 2026-10-16) CRYST_KEEP (end-game gear) is only kept from +7 up: an excellent
+                             # below +7 ("-7") is crystallized even if it's top gear. Excellent rings / pendants
+                             # are always kept (only gear groups 0-11 ever go to the Alquimista).
+JOIN_ENABLED     = True      # (Juan 2026-10-16) join small Cristal stacks in the bag while leveling
+JOIN_EVERY       = 300       # seconds between looks at the Cristal stacks (one /dividir per tick when joining)
 ALCHEMIST_NPC    = 693       # npcType of the Alquimista
 ALCHEMIST_MAP    = (3, "Noria")
 ALCHEMIST_NEAR   = (180, 102)    # the Chaos Goblin's Chaos Machine (guide); the Alquimista stands next to it
@@ -87,7 +95,7 @@ CRYST_KEEP = (
 
 # bag slots by kind: junk to drop / excellent gear to crystallize
 BAG_JS = """
-([never, jewelry, keep, maxLvl, skip]) => {
+([never, jewelry, keep, maxLvl, skip, keepFrom]) => {
   const s = window.__store; if (!s || !s.playerData) return null;
   const items = s.playerData.items || [], has = (l, it) => l.some(p => p[0] === it.group && p[1] === it.num);
   const junk = [], cryst = [];
@@ -99,7 +107,8 @@ BAG_JS = """
     const gear = it.group >= 0 && it.group <= 11, jew = has(jewelry, it);
     if (!gear && !jew) continue;
     if (!it.isExcellent && !it.isAncient) { if (!skip.includes(i + ':' + key)) junk.push(d); continue; }
-    if (gear && it.isExcellent && !it.isAncient && !has(keep, it) && (it.lvl || 0) <= maxLvl) cryst.push(d);
+    if (gear && it.isExcellent && !it.isAncient && !(has(keep, it) && (it.lvl || 0) >= keepFrom)
+        && (it.lvl || 0) <= maxLvl) cryst.push(d);
   }
   return {junk, cryst, money: Number(s.playerData.money) || 0, picked: !!s.pickedItem, pending: !!s.pendingItemMove};
 }
@@ -217,6 +226,8 @@ class Junk:
         self.resets_seen = None      # reset counter last seen (a change = a reset happened)
         self.next_try = 0
         self.trip = None
+        self.join_at = 0             # Cristal stack joining while leveling
+        self.join = None             # {"sig", "at", "stuck", "n"} while joining
 
     def log(self, msg):
         self.a.log("JUNK: " + msg)
@@ -232,7 +243,7 @@ class Junk:
         now = time.time()
         self.skip = {k: t for k, t in self.skip.items() if t > now}
         return self.ev(BAG_JS, [sorted(JUNK_NEVER), sorted(JUNK_JEWELRY), sorted(CRYST_KEEP),
-                                CRYST_MAX_LVL, list(self.skip)])
+                                CRYST_MAX_LVL, list(self.skip), CRYST_KEEP_FROM])
 
     # called by mu_th when a Treasure Hunt ends
     def hunt_over(self):
@@ -278,6 +289,45 @@ class Junk:
         elif r not in ("busy", None):
             self.skip[f"{j['slot']}:{j['key']}"] = now + JUNK_DROP_RETRY
             self.log(f"couldn't drop {j['key']} (slot {j['slot']}): {r}")
+
+    # ── part 1b: join small Cristal stacks while leveling (doesn't block leveling) ──
+    def join_tick(self):
+        """Juan 2026-10-16: characters carry several small Cristal stacks (trades, crystallizing) that waste
+        bag cells. Every JOIN_EVERY s: while 2+ stacks aren't full, one /dividir per tick (biggest open
+        stack filled from the smallest), waiting for the server between moves."""
+        if not (JUNK_ENABLED and JOIN_ENABLED):
+            return
+        now = time.time()
+        j = self.join
+        if j is None and now - self.join_at < JOIN_EVERY:
+            return
+        if self.last_drop:
+            return                                   # a drop is waiting for its answer
+        b = self.ev(CRYSTALS_JS, list(CRYST_ITEM)) or {}
+        if b.get("pending") or b.get("picked"):
+            return
+        stacks = b.get("stacks") or []
+        sig = tuple(sorted((x["slot"], x["n"]) for x in stacks))
+        if j is not None:
+            if j["sig"] == sig and now - j["at"] < 3:
+                return                               # the server hasn't answered the last move yet
+            if j["sig"] == sig:
+                j["stuck"] += 1
+        open_ = sorted([x for x in stacks if x["n"] < CRYST_STACK_MAX], key=lambda x: (-x["n"], x["slot"]))
+        if len(open_) < 2 or (j and (j["stuck"] >= 3 or j["n"] >= 40)):
+            if j is not None:
+                full = sum(1 for x in stacks if x["n"] >= CRYST_STACK_MAX)
+                self.log(f"Cristales joined: {sum(x['n'] for x in stacks)} in {len(stacks)} stack(s), {full} full"
+                         + (" (stopped: no change from the server)" if j["stuck"] >= 3 else ""))
+            self.join, self.join_at = None, now
+            return
+        if j is None:
+            j = self.join = {"sig": None, "at": 0, "stuck": 0, "n": 0}
+            self.log(f"joining Cristales: {len(open_)} stacks not full ({', '.join(str(x['n']) for x in open_)})")
+        dst, src = open_[0], open_[-1]
+        k = min(src["n"], CRYST_STACK_MAX - dst["n"])
+        self.ev(SPLIT_JS, [src["slot"], dst["slot"], k])
+        j["sig"], j["at"], j["n"] = sig, now, j["n"] + 1
 
     # ── part 2: crystallize at the Alquimista ──
     def tick(self):

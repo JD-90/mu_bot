@@ -96,7 +96,8 @@ GI_CALL          = True             # (Juan 2026-10-12) a hunter that sees a Gol
 GI_CALL_DIST     = 50               # hunters on the same map within this many tiles of it (and no dragon of its own)
 GI_CALL_FRESH    = 5                # walks over to help (more chances at the last hit + backup vs players);
                                     # a sighting older than this (s) no longer counts
-GI_POT_EVERY_MS  = 200              # potion every 0.2 s ...
+GI_POT_EVERY_MS  = 400              # potion every 0.4 s (was 0.2: the server refused every 2nd one, "That item
+                                    # cannot be used like that" - same healing, half the requests) ...
 GI_HIT_WINDOW_MS = 2000             # ... while a player has hit us in the last 2 s
 GI_PVP_MODE      = "defense"        # how we treat other players (Juan, 2026-10-12):
                                     #   "defense" = only fight back players who hit us; never attack anyone on sight
@@ -139,8 +140,21 @@ GI_RECORD        = True             # record the hunt with mu_recorder
 GI_SELL_CHEST_FOR_PK = True         # /pkclear short of zen -> sell ONE Zen Chest at the Lorencia bar
 GI_PKCLEAR_ON_KILL = True           # /pkclear right after every kill during the hunt, not just at the end
                                     # (Juan 2026-10-13: new server rule, outlaws can drop gear)
-GI_PKCLEAR_RETRY_SEC = 2            # outlaw again / still outlaw: next /pkclear no sooner than this
-GI_PKCLEAR_MAX_TRIES = 3            # failed tries per kill before leaving it to the end of the hunt
+GI_PKCLEAR_WAIT_SEC = 61            # server rule (14/10): /pkclear only works 60 s after your last kill -> wait this
+                                    # long after the last kill (or what the server's "podés limpiar el PK en N
+                                    # segundos" says) before sending it (2026-10-16: every try came 0-6 s after a kill)
+GI_PKCLEAR_RETRY_SEC = 8            # a /pkclear that didn't work: next one no sooner than this
+GI_PKCLEAR_MAX_TRIES = 3            # failed tries (after the wait) per kill before leaving it to the end of the hunt
+GI_SELF_DEF_ONLY = True             # (2026-10-16) a player only counts as "hit me" when the SERVER says so ("Self
+                                    # defense is initiated by X's attack to <me>"). Our own guesses (an area spell
+                                    # near us + damage) flagged Axwjere / ayudanteBK / DkPegasus, who never hit
+                                    # wizzardo -> we attacked first -> 3 kills = 2nd Stage Outlaw. Killing a player
+                                    # we have self-defense against gives NO PK (CocoLoco, same fight).
+GI_SELF_DEF_SEC  = 60               # our self-defense right lasts about this long (server ends it with "Self defense
+                                    # of <me> against X")
+GI_OUTLAW_CAUTION = True            # (Juan 2026-10-16) while we're outlaw and /pkclear hasn't gone through: never
+                                    # start a fight with anyone (no dragon clearing, no attack mode, no box guarding);
+                                    # only fight back players the server gave us self-defense against
 MAP_LORENCIA, MAP_DEVIAS, MAP_NORIA = 0, 2, 3
 DEVIAS_WARPS     = ["Devias3", "Devias"]   # /move aliases to try (Devias 3 landed at (225,229) for 2500 zen)
 DEVIAS_OUT_WARPS = ["Devias4", "Devias2", "Devias3"]  # stuck in the Devias safe zone (respawn): warp out, next one if it fails
@@ -195,6 +209,7 @@ GI_INSTALL_JS = r"""
     barrier: false, wasSafe: null, bQueue: [], bTries: 0, bAt: 0, bDone: 0, bEvents: [], buffAt: {},
     comboIdx: 0, comboAt: 0, attackSkill: null, ignored: new Map(), tStats: new Map(), tPrev: null, safeSkipped: 0,
     areaCasts: new Map(), hitMatch: new Map(),
+    selfDef: new Map(), aggro: new Map(), pk: {kills: 0, stage: null, clearAt: 0, killAt: 0, cleanedAt: 0, failAt: 0, failMsg: ''},
     dHp: [], dHpId: null, dragonId: null, dragonPos: null, dHitters: new Map(), clr: null, clrFailed: new Set(), clrDragon: null, clrNote: ''};
   const SKILL_NAMES = {16: 'Soul Barrier', 48: 'Greater Fortitude'};
   const sname = n => SKILL_NAMES[n] || ('skill ' + n);
@@ -397,9 +412,79 @@ GI_INSTALL_JS = r"""
     }
     return combo[G.comboIdx];
   };
+  // Server chat (system lines), read every tick even when the hunt is off. The client WRAPS long lines into
+  // separate chatLines entries ("Self defense is initiated by CocoLoco's attack to" + "wizzardo!"), so each
+  // new line is also tried joined with the next one. Feeds:
+  //   G.selfDef  name -> until : players the server gave ME self-defense against (legal to fight back)
+  //   G.pk       my PK state   : kills, stage, when /pkclear becomes possible, cleaned
+  const lc = x => String(x || '').trim().toLowerCase();
+  const lineTxt = l => (typeof l === 'string' ? l : [l.text, l.message, l.msg, l.content].filter(Boolean).join(' ')).trim();
+  G.scanChat = (now, soc, myName) => {
+    const lines = ((soc && soc.chatLines) || []).slice(-14), me = lc(myName);
+    if (!me) return;
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i];
+      if (!l || typeof l !== 'object' || G.chatSeen.has(l)) continue;
+      const t1 = lineTxt(l), nx = lines[i + 1];
+      const last = i === lines.length - 1;
+      // the last line may be the first half of a wrapped message: wait for its second half (max 2 s)
+      if (last && !/[.!]$/.test(t1) && /(attack to|against|limpiar el PK en \d+|have been|kills,?)$/i.test(t1)) {
+        if (!l.__giWait) l.__giWait = now;
+        if (now - l.__giWait < 2000) continue;
+      }
+      G.chatSeen.add(l);
+      const t2 = nx && typeof nx === 'object' ? t1 + ' ' + lineTxt(nx) : t1;
+      let m;
+      if ((m = t2.match(/Self defense is initiated by ([^\s']+)'s attack to ([^\s!.]+)/i)) ||
+          (m = t1.match(/Self defense is initiated by ([^\s']+)'s attack to ([^\s!.]+)/i))) {
+        const by = lc(m[1]), to = lc(m[2]);
+        if (to === me && !G.selfDef.has(by)) {
+          G.selfDef.set(by, now + G.cfg.selfDefMs); G.potUntil = now + G.cfg.hitWindow;
+          const e = w0().netObjsQuery.entities.find(x => lc(x.objectNameInWorld) === by);
+          if (e) G.hostile.set(e.netId, now);
+          ev(`attacked by ${m[1]} (server: self-defense, ${G.cfg.selfDefMs / 1000} s)`);
+        } else if (to === me) G.selfDef.set(by, now + G.cfg.selfDefMs);
+        else if (by === me && !G.aggro.has(to)) {
+          G.aggro.set(to, now);
+          ev(`WARNING: I hit ${m[2]} first (server gave HIM self-defense) -> killing him = PK`);
+        }
+        continue;
+      }
+      if ((m = t2.match(/Self defense of ([^\s]+) against ([^\s.!]+)/i)) || (m = t1.match(/Self defense of ([^\s]+) against ([^\s.!]+)/i))) {
+        if (lc(m[1]) === me) G.selfDef.delete(lc(m[2]));
+        else if (lc(m[2]) === me) G.aggro.delete(lc(m[1]));
+        continue;
+      }
+      if ((m = t1.match(/^(\S+)\s*:\s*(Outlaw Warning|\S+ Stage Outlaw|Commoner|Murderer|Hero.*)$/i)) && lc(m[1]) === me) {
+        G.pk.stage = m[2];
+        if (/commoner|hero/i.test(m[2])) { G.pk.kills = 0; G.pk.clearAt = 0; }
+        continue;
+      }
+      if ((m = t1.match(/^PK:\s*(\d+)\s*kills/i))) {
+        const k = Number(m[1]);
+        if (k > G.pk.kills) { G.pk.killAt = now; G.pk.clearAt = Math.max(G.pk.clearAt, now + 60000); }
+        G.pk.kills = k; continue;
+      }
+      if ((m = t2.match(/limpiar el PK en (\d+)\s*segundos/i))) {
+        G.pk.clearAt = now + Number(m[1]) * 1000; G.pk.failAt = now; G.pk.failMsg = 'wait ' + m[1] + ' s'; continue;
+      }
+      if ((m = t2.match(/\[\/pkclear\]\s*(\S+) kills have been cleaned/i)) && lc(m[1]) === me) {
+        G.pk.kills = 0; G.pk.clearAt = 0; G.pk.cleanedAt = now; G.pk.stage = 'Commoner'; continue;
+      }
+      if (/\/pkclear|pkclear/i.test(t1) && !/^\S+\s*:\s*\/pkclear/i.test(t1)) { G.pk.failAt = now; G.pk.failMsg = t2.slice(0, 120); }
+    }
+    for (const [n, t] of G.selfDef) if (now > t) G.selfDef.delete(n);
+    for (const [n, t] of G.aggro) if (now - t > 120000) G.aggro.delete(n);
+  };
+  const w0 = () => W.__world;
+  // legal to fight back: the server gave me self-defense against him
+  G.legal = (name, now) => (G.selfDef.get(lc(name)) || 0) > now;
+  // outlaw = hero state above 3 (Commoner) or kills the server told us about and not cleaned yet
+  G.outlaw = h => !!((h && h.heroState > 3) || G.pk.kills > 0);
   G.tick = () => {
     const now = Date.now(), cfg = G.cfg, w = W.__world, s = W.__store, soc = W.__social;
     if (!w || !s) return;
+    try { G.scanChat(now, soc, (s.playerData || {}).name); } catch (e) { G.err = 'chat: ' + String(e).slice(0, 150); }
     if (G.barrierTick(now, w, s)) return;
     if (!G.on) return;
     const h = w.playerEntity, pd = s.playerData || {};
@@ -410,19 +495,6 @@ GI_INSTALL_JS = r"""
     const me = P(h);
     const ours = new Set(cfg.ours.map(n => n.toLowerCase()));
     const party = new Set(((soc && soc.partyMembers) || []).map(m => (m.name || '').trim().toLowerCase()));
-    // "Self defense is initiated by X's attack to <me>" -> X is hostile
-    for (const l of ((soc && soc.chatLines) || []).slice(-6)) {
-      if (!l || typeof l !== 'object' || G.chatSeen.has(l)) continue;
-      G.chatSeen.add(l);
-      const t = [l.text, l.message, l.msg, l.content].filter(Boolean).join(' ');
-      const m = t.match(/initiated by (\S+?)'s attack to (\S+?)!?$/);
-      if (m && m[2].toLowerCase() === (pd.name || '').toLowerCase()) {
-        const e = w.netObjsQuery.entities.find(x => x.objectNameInWorld && x.objectNameInWorld.trim() === m[1]);
-        if (e) G.hostile.set(e.netId, now);
-        G.potUntil = now + cfg.hitWindow;
-        ev('attacked by ' + m[1]);
-      }
-    }
     const players = [], goldens = [], boxes = [], loot = [];
     const isSafe = p => !!(w.getTerrainFlag && (w.getTerrainFlag(Math.round(p.x), Math.round(p.y)) & 1) === 1);
     const meSafe = isSafe(me);
@@ -491,7 +563,8 @@ GI_INSTALL_JS = r"""
     }
     G.dragonEta = eta;
     let clearT = null;
-    if (cfg.clear && dragon && eta !== null && eta <= cfg.clearEta && eta >= cfg.clearMinEta) {
+    const outlaw = G.outlaw(h), caution = cfg.outlawCaution && outlaw;
+    if (cfg.clear && !caution && dragon && eta !== null && eta <= cfg.clearEta && eta >= cfg.clearMinEta) {
       for (const [id, t] of G.dHitters) if (now - t > 3000) G.dHitters.delete(id);
       const enemies = players.filter(x => G.dHitters.has(x.e.netId) && dist(x.p, dragon.p) <= cfg.clearLeash);
       if (enemies.length > cfg.clearMax) {
@@ -511,8 +584,12 @@ GI_INSTALL_JS = r"""
         } else G.clr = null;
       }
     } else if (G.clr) G.clr = null;
-    const hostiles = players.filter(x => G.hostile.has(x.e.netId));
-    const defense = cfg.pvpMode !== 'attack';
+    // hostiles: players active against me; with selfDefOnly only those the server gave me self-defense against
+    // (also counts one the server just named even if our hit detection missed him)
+    const hostiles = players.filter(x => cfg.selfDefOnly
+      ? G.legal(x.name, now) && (G.hostile.has(x.e.netId) || (G.selfDef.get(lc(x.name)) || 0) - cfg.selfDefMs > now - 8000)
+      : G.hostile.has(x.e.netId));
+    const defense = cfg.pvpMode !== 'attack' || caution;
     let target = null, why = '', pick = null;
     // 0. a free Box +5 close by: grab it before any fight (2026-10-11: two +5s lost while fighting players)
     // spam mode: any distance, and a box refused once is still retried until cfg.boxWait runs out (then given up)
@@ -554,7 +631,7 @@ GI_INSTALL_JS = r"""
         if (ff && now - ff > cfg.boxWait) { G.boxGaveUp.add(b.e.netId); ev('gave up a locked Box +' + (b.lvl - 7)); continue; }
         pick = b; break;
       }
-      if (pick && !defense && G.boxFirstFail.has(pick.e.netId)) {
+      if (pick && !defense && !caution && G.boxFirstFail.has(pick.e.netId)) {
         const guard = players.filter(x => dist(x.p, pick.p) <= cfg.pvpRadius || x.d <= cfg.pvpRadius);
         if (guard.length) { target = guard[0]; why = 'guarding a locked box'; pick = null; }
       }
@@ -567,6 +644,13 @@ GI_INSTALL_JS = r"""
       }
     }
     let isPlayer = !!(target && target.e.npcType === undefined);
+    // last gate: never START a fight we'd get PK for (defense mode, or outlaw with caution on).
+    // Dragon clearing (GI_CLEAR) is a deliberate attack and passes when we're not outlaw.
+    if (isPlayer && !G.legal(target.name, now) && (caution || (defense && cfg.selfDefOnly && target !== clearT))) {
+      const k = 'no-sd:' + target.name;
+      if (G.lastGate !== k) { G.lastGate = k; ev(`not attacking ${target.name}: no self-defense against him` + (outlaw ? ' (I am outlaw)' : '')); }
+      target = dragon || null; why = dragon ? 'dragon' : ''; isPlayer = false;
+    }
     if (cfg.refreshSkill && (isPlayer || players.some(x => x.d <= cfg.pvpRadius))
         && now - (G.buffAt[cfg.refreshSkill] || 0) > cfg.refreshMs) {
       G.buffAt[cfg.refreshSkill] = now;                    // one request per refresh period
@@ -658,7 +742,8 @@ GI_INSTALL_JS = r"""
     G.status = {safePlayers: safeN, ignored: G.ignored.size, mode: (isSpammingLoot && !pick) ? 'spam_loot' : (target ? (isPlayer ? 'pvp' : (target.e.npcType === 79 ? 'dragon' : 'golden')) : (pick ? 'box' : 'search')),
       spamPos: G.lootSpamPos, closing: !!closeTo, target: tName, why, players: players.length, near: players.filter(x => x.d <= cfg.pvpRadius).length,
       goldens: goldens.length, dragon: dragon ? [Math.round(dragon.p.x), Math.round(dragon.p.y), Math.round(dragon.d)] : null,
-      helping, eta: eta === null ? null : Math.round(eta), hitters: G.dHitters.size, boxes: boxes.length, loot: loot.slice(0, 20), hp, maxHp: pd.maxHP, heroState: h.heroState,
+      helping, eta: eta === null ? null : Math.round(eta), hitters: G.dHitters.size, boxes: boxes.length, loot: loot.slice(0, 20), hp, maxHp: pd.maxHP, heroState: h.heroState, outlaw, pkKills: G.pk.kills, pkStage: G.pk.stage,
+      pkClearIn: G.pk.clearAt ? Math.max(0, Math.round((G.pk.clearAt - now) / 1000)) : 0, selfDef: [...G.selfDef.keys()],
       big5: (() => { const b = boxes.find(x => x.lvl >= 12 && !G.boxGaveUp.has(x.e.netId)); return b ? Math.round(b.d) : null; })(),
       attackSkill: G.attackSkill, pots: G.pots, casts: G.casts, myCasts: G.myCasts, hitsOnMe: G.hitsOnMe, pickFails: G.pickFails,
       skill: s.currentSkill, map: w.mapIndex, x: Math.round(me.x), y: Math.round(me.y),
@@ -755,6 +840,15 @@ STATS_JS = """() => { const p = (window.__store && window.__store.playerData) ||
 
 HERO_STATE_JS = "() => { const h = window.__world && window.__world.playerEntity; return h ? h.heroState : null; }"
 
+# my PK state: hero state + what the server's chat told the fight loop (kills, stage, seconds until /pkclear
+# is allowed). The hero state alone misread once (09:55:25 2026-10-16: "not outlaw" 100 s after 2nd Stage).
+PK_STATE_JS = """() => { const h = window.__world && window.__world.playerEntity, G = window.__gi, now = Date.now();
+  const hs = h ? h.heroState : null;
+  if (!G || !G.pk) return {hs, kills: null, outlaw: hs !== null && hs !== undefined ? hs > 3 : null, clearIn: 0};
+  return {hs, kills: G.pk.kills, stage: G.pk.stage, outlaw: !!((hs > 3) || G.pk.kills > 0),
+          clearIn: G.pk.clearAt ? Math.max(0, Math.round((G.pk.clearAt - now) / 1000)) : 0,
+          cleanedAgo: G.pk.cleanedAt ? Math.round((now - G.pk.cleanedAt) / 1000) : null}; }"""
+
 BAG_BOXES_JS = """() => { const r = {}; (window.__store.playerData.items || []).forEach((it, i) => {
   if (i >= 12 && it && it.group === 14 && it.num === 11 && it.lvl >= 8) r[it.lvl] = (r[it.lvl] || 0) + 1; }); return r; }"""
 
@@ -796,6 +890,9 @@ class GoldenInvasion:
         self.pk_sent_at = 0          # GI_PKCLEAR_ON_KILL: last /pkclear sent during the hunt
         self.pk_live_tries = 0       # ... tries since we last turned outlaw
         self.pk_live_state = None    # ... hero state when we sent it
+        self.pk_kill_at = 0          # when we last saw a new kill (hero state / kill count went up)
+        self.pk_kills_seen = 0       # kill count (or hero state) at that time
+        self.pk_wait_logged = 0
         self.after_step = None
         self.last_status_log = 0
 
@@ -944,6 +1041,9 @@ class GoldenInvasion:
         self.pk_sent_at = 0
         self.pk_live_tries = 0
         self.pk_live_state = None
+        self.pk_kill_at = 0
+        self.pk_kills_seen = 0
+        self.pk_wait_logged = 0
         self.after_step = None
         self.warp_tries = 0
         self.bag0 = self.ev(BAG_BOXES_JS) or {}
@@ -960,7 +1060,7 @@ class GoldenInvasion:
             a.show_window = True
 
     def cfg(self):
-        return {"version": 17, "close": GI_CLOSE, "closeDist": GI_CLOSE_DIST, "closeEta": GI_CLOSE_ETA, "closeHp": GI_CLOSE_HP, "closeStuckMs": GI_CLOSE_STUCK_MS, "clear": GI_CLEAR, "clearEta": GI_CLEAR_ETA, "clearMinEta": GI_CLEAR_MIN_ETA, "clearMax": GI_CLEAR_MAX, "clearKillMs": GI_CLEAR_KILL_SEC * 1000, "clearLeash": GI_CLEAR_LEASH, "potHp": GI_POT_HP, "castGap": GI_CAST_GAP_MS, "dragonLock": GI_DRAGON_LOCK, "areaHitRadius": GI_AREA_HIT_RADIUS, "areaHitMs": GI_AREA_HIT_MS, "pvpMode": GI_PVP_MODE, "bigBoxRadius": GI_BIG_BOX_RADIUS, "ignoreAfter": GI_IGNORE_AFTER, "ignoreMs": GI_IGNORE_SEC * 1000, "ours": list(getattr(self.a.hub, "friends", self.a.hub.names)), "skill": GI_SKILLS.get(self.a.name.lower(), 0), "potKey": GI_POTION_KEY,
+        return {"version": 18, "selfDefOnly": GI_SELF_DEF_ONLY, "selfDefMs": GI_SELF_DEF_SEC * 1000, "outlawCaution": GI_OUTLAW_CAUTION, "close": GI_CLOSE, "closeDist": GI_CLOSE_DIST, "closeEta": GI_CLOSE_ETA, "closeHp": GI_CLOSE_HP, "closeStuckMs": GI_CLOSE_STUCK_MS, "clear": GI_CLEAR, "clearEta": GI_CLEAR_ETA, "clearMinEta": GI_CLEAR_MIN_ETA, "clearMax": GI_CLEAR_MAX, "clearKillMs": GI_CLEAR_KILL_SEC * 1000, "clearLeash": GI_CLEAR_LEASH, "potHp": GI_POT_HP, "castGap": GI_CAST_GAP_MS, "dragonLock": GI_DRAGON_LOCK, "areaHitRadius": GI_AREA_HIT_RADIUS, "areaHitMs": GI_AREA_HIT_MS, "pvpMode": GI_PVP_MODE, "bigBoxRadius": GI_BIG_BOX_RADIUS, "ignoreAfter": GI_IGNORE_AFTER, "ignoreMs": GI_IGNORE_SEC * 1000, "ours": list(getattr(self.a.hub, "friends", self.a.hub.names)), "skill": GI_SKILLS.get(self.a.name.lower(), 0), "potKey": GI_POTION_KEY,
                 "potEvery": GI_POT_EVERY_MS, "hitWindow": GI_HIT_WINDOW_MS, "pvpRadius": GI_PVP_RADIUS,
                 "view": GI_VIEW, "boxWait": GI_BOX_WAIT_SEC * 1000, "spamPickMs": GI_SPAM_PICK_MS, "closeRepathMs": GI_CLOSE_REPATH_MS, "loopMs": GI_LOOP_MS,
                 "barrierTries": GI_BARRIER_TRIES,
@@ -1480,43 +1580,45 @@ class GoldenInvasion:
                      + (" | closing in" if status.get("closing") else "")
                      + (f" | dragon ~{status.get('eta')} s left, {status.get('hitters')} other(s) hitting it" if status.get('eta') is not None else ""))
 
+    def pk_wait(self, pk, now):
+        """Seconds until /pkclear can work: the server's own count if it told us one, else GI_PKCLEAR_WAIT_SEC
+        after the last kill we noticed."""
+        level = max(pk.get("kills") or 0, (pk.get("hs") or 0) - 3)       # kills, or the outlaw stage as a stand-in
+        if level > self.pk_kills_seen:
+            self.pk_kill_at, self.pk_live_tries = now, 0                  # a new kill: the 60 s start over
+        self.pk_kills_seen = level
+        wait = (self.pk_kill_at + GI_PKCLEAR_WAIT_SEC - now) if self.pk_kill_at else 0
+        return max(wait, (pk.get("clearIn") or 0) + 1 if pk.get("clearIn") else 0, 0)
+
     def pkclear_on_kill(self, status, s):
-        """GI_PKCLEAR_ON_KILL: we turned outlaw (a kill) -> /pkclear right away, so we don't fight on as an
-        outlaw (new server rule: outlaws can drop gear). Hero state > 3 = outlaw, same test as after()."""
+        """GI_PKCLEAR_ON_KILL: we turned outlaw (a kill) -> /pkclear as soon as the server allows it (60 s after
+        the last kill, server rule 14/10), so we don't stay outlaw (outlaws can drop gear when they die)."""
         if not GI_PKCLEAR_ON_KILL:
             return
-        hs = status.get("heroState")
-        if hs is None:
+        pk = {"hs": status.get("heroState"), "kills": status.get("pkKills"), "clearIn": status.get("pkClearIn")}
+        if pk["hs"] is None and pk["kills"] is None:
             return
         now = time.time()
-        if hs <= 3:
+        if not status.get("outlaw"):
             if self.pk_live_tries:
-                self.log(f"/pkclear done mid-hunt (state {self.pk_live_state} -> {hs}, "
-                         f"zen {s.get('money') or 0:,})")
-            self.pk_live_tries, self.pk_live_state = 0, None
+                self.log(f"/pkclear done mid-hunt (zen {s.get('money') or 0:,})")
+            self.pk_live_tries, self.pk_live_state, self.pk_kills_seen, self.pk_kill_at = 0, None, 0, 0
             return
-        if self.pk_live_state is not None and hs > self.pk_live_state:
-            self.pk_live_tries = 0                     # another kill since the last try: start over
+        wait = self.pk_wait(pk, now)
+        if wait > 0:
+            if now - self.pk_wait_logged > 20:
+                self.pk_wait_logged = now
+                self.log(f"outlaw ({status.get('pkStage') or 'state ' + str(pk['hs'])}, {pk['kills'] or '?'} kill(s)) "
+                         f"-> /pkclear in {int(wait)} s (server: 60 s after the last kill); not starting any fight meanwhile")
+            return
         if self.pk_live_tries >= GI_PKCLEAR_MAX_TRIES or now - self.pk_sent_at < GI_PKCLEAR_RETRY_SEC:
             return
         self.pk_live_tries += 1
-        self.pk_live_state = hs
         self.pk_sent_at = now
-        if self.pk_live_tries == GI_PKCLEAR_MAX_TRIES:
-            self.log(f"/pkclear try {self.pk_live_tries} (state {hs}, zen {s.get('money') or 0:,}); "
-                     "if this fails too, I retry after the hunt (selling a Zen Chest if zen is short)")
-        else:
-            self.log(f"outlaw (state {hs}) after a kill -> /pkclear (try {self.pk_live_tries})")
+        self.log(f"outlaw ({status.get('pkStage') or 'state ' + str(pk['hs'])}) -> /pkclear (try {self.pk_live_tries}, "
+                 f"zen {s.get('money') or 0:,})" + ("; if this fails too, I retry after the hunt"
+                                                    if self.pk_live_tries == GI_PKCLEAR_MAX_TRIES else ""))
         self.c.chat("/pkclear")
-
-    def walk_once(self, xy, now):
-        """WALK_JS, but the same target only every GI_WALK_REPEAT_SEC: re-sending a walk every tick makes the
-        client re-path from its own (interpolated) position and the server snaps us back (rubber-banding)."""
-        xy = [int(xy[0]), int(xy[1])]
-        if getattr(self, "walk_last", None) == xy and now - getattr(self, "walk_last_at", 0) < GI_WALK_REPEAT_SEC:
-            return
-        self.walk_last, self.walk_last_at = xy, now
-        self.ev(B.WALK_JS, xy)
 
     def leave_town(self, s, status):
         """Respawned (or wandered) into the Devias safe zone: warp to another Devias zone instead of walking out."""
@@ -1731,10 +1833,19 @@ class GoldenInvasion:
         a, c, s = self.a, self.c, self.c.s
         if (s.get("hp") or 0) <= 0:
             return True
-        hs = self.ev(HERO_STATE_JS)
+        pk = self.ev(PK_STATE_JS) or {}
+        hs = pk.get("hs")
         if self.after_step == "pk":
-            if hs is None or hs <= 3:
-                return self.finish("not outlaw" if hs is not None else "hero state unknown")
+            if not pk.get("outlaw"):
+                return self.finish("not outlaw" if pk.get("outlaw") is not None else "hero state unknown")
+            wait = self.pk_wait(pk, time.time())
+            bc_soon = self.left_for_bc and self.left_for_bc - time.time() < wait + 30
+            if wait > 0 and not bc_soon:
+                if time.time() - self.pk_wait_logged > 15:
+                    self.pk_wait_logged = time.time()
+                    self.log(f"outlaw ({pk.get('stage') or 'state ' + str(hs)}, {pk.get('kills') or '?'} kill(s)) "
+                             f"-> waiting {int(wait)} s for /pkclear (server: 60 s after the last kill)")
+                return True
             if self.pk_tries >= 3:
                 return self.finish(f"/pkclear failed {self.pk_tries}x (still state {hs})")
             self.pk_tries += 1
@@ -1742,13 +1853,17 @@ class GoldenInvasion:
             c.chat("/pkclear")
             time.sleep(3)
             c.refresh()
-            hs2 = self.ev(HERO_STATE_JS)
+            pk2 = self.ev(PK_STATE_JS) or {}
             paid = zen - (c.s.get("money") or 0)
-            if hs2 is not None and hs2 <= 3:
-                self.log(f"/pkclear done (outlaw state {hs} -> {hs2}, paid {paid:,} zen)")
+            if pk2.get("outlaw") is False or (pk2.get("cleanedAgo") is not None and pk2["cleanedAgo"] < 10):
+                self.log(f"/pkclear done (outlaw state {hs} -> {pk2.get('hs')}, paid {paid:,} zen)")
                 return self.finish("pk cleared")
-            self.log(f"/pkclear did not work (state {hs2}, zen {c.s.get('money'):,})")
-            if GI_SELL_CHEST_FOR_PK and paid <= 0:
+            self.log(f"/pkclear did not work (state {pk2.get('hs')}, {pk2.get('kills')} kill(s), "
+                     f"server says wait {pk2.get('clearIn')} s, zen {c.s.get('money'):,})")
+            if pk2.get("clearIn"):
+                self.pk_tries -= 1                          # only the 60 s rule: doesn't count as a try
+                return True
+            if GI_SELL_CHEST_FOR_PK and paid <= 0 and zen < 600_000_000:   # short of zen (a clear cost up to 500M)
                 self.after_step = "sell"
             return True
         if self.after_step == "sell":
