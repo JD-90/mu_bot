@@ -40,6 +40,7 @@ import time
 
 import mu_bc as B
 import mu_group_bot as G
+import roster as R
 
 # ───────────────────────────── CONFIG ─────────────────────────────
 GI_ENABLED       = True
@@ -1126,10 +1127,30 @@ class GoldenInvasion:
 
     # ── WAIT: outside the Noria safe zone ──
     def hunters(self):
-        """Our hunters this invasion, in accounts.json order."""
-        snap = self.a.hub.snapshot()
-        names = [n for n in self.a.hub.names if (snap.get(n) or {}).get("gi_hunter") or n == self.a.name]
-        return names
+        """Our hunters this invasion on every machine (mu_hub), in roster.json order (= accounts.json
+        order on each machine, so both machines compute the same lists)."""
+        hub = self.a.hub
+        snap = hub.snapshot()
+        names = [n for n in hub.names if (snap.get(n) or {}).get("gi_hunter") or n == self.a.name]
+        link = getattr(hub, "link", None)
+        if link is not None:
+            names += [n for n, i in link.remote().items()
+                      if i.get("gi_hunter") and i.get("online") and n not in names]
+        return sorted(names, key=self.order_key)
+
+    def order_key(self, n):
+        """Position in roster.json (both machines agree), then this machine's accounts.json order."""
+        low = [x.lower() for x in R.NAMES]
+        names = self.a.hub.names
+        return (low.index(n.lower()) if n.lower() in low else len(low), names.index(n) if n in names else 0, n)
+
+    def level_of(self, n):
+        if n == self.a.name:
+            return self.c.s.get("level") or 0
+        i = self.a.hub.snapshot().get(n)
+        if i is None and getattr(self.a.hub, "link", None) is not None:
+            i = self.a.hub.link.remote().get(n)
+        return (i or {}).get("level") or 0
 
     def pick_pre_map(self):
         """Where I wait before the start: hunters spread over GI_PRE_MAPS in accounts order, each
@@ -1142,7 +1163,7 @@ class GoldenInvasion:
         snap = self.a.hub.snapshot()
         used = {m: 0 for m in GI_PRE_MAPS}
         for i, n in enumerate(hs):
-            lvl = (self.c.s.get("level") if n == self.a.name else (snap.get(n) or {}).get("level")) or 0
+            lvl = self.level_of(n)
             ok = [m for m in GI_PRE_MAPS if m != MAP_DEVIAS or lvl >= DEVIAS_MIN_LEVEL]
             pref = GI_PRE_MAPS[i % len(GI_PRE_MAPS)]
             m = min(ok, key=lambda mm: (used[mm], mm != pref, GI_PRE_MAPS.index(mm)))
@@ -1268,6 +1289,7 @@ class GoldenInvasion:
         self.map_target = None
         self.dlock, self.dlock_seen = False, 0.0
         self.call = None
+        self.__dict__.pop("focus_wait_since", None)
         self.log(f"=== HUNT START (map {c.s.get('map')} at ({c.s.get('x')},{c.s.get('y')}), "
                  f"hp {c.s.get('hp')}, lvl {c.s.get('level')}) ===")
 
@@ -1284,10 +1306,19 @@ class GoldenInvasion:
         in accounts.json), the others hunt where they waited."""
         hub = self.a.hub
         sh = hub.gi_shared
-        snap = hub.snapshot()          # BEFORE taking hub.lock: snapshot() takes it too
-        hunters = self.hunters()       # same: hunters() calls snapshot() (inside the lock it froze every bot at HUNT START)
+        hunters = self.hunters()       # BEFORE taking hub.lock: hunters() calls snapshot() (inside the lock it froze every bot at HUNT START)
+        levels = {n: self.level_of(n) for n in hunters}
         with hub.lock:
-            if "focus" not in sh:
+            undecided = "focus" not in sh
+        if undecided and hunters and hunters[0] not in hub.names:
+            # a hunter on the other machine comes first: that machine decides; wait a moment for it
+            t0 = self.__dict__.setdefault("focus_wait_since", time.time())
+            if time.time() - t0 < GI_FOCUS_WAIT:
+                return None, f"waiting for {hunters[0]}'s machine to pick the focus map"
+        with hub.lock:
+            if sh.get("focus_log"):
+                hub_log = sh.pop("focus_log")
+            elif "focus" not in sh:
                 maps = (counts or {}).get("maps") or {}
                 cnt = {m: int(maps.get(str(m), maps.get(m, 0)) or 0) for m in GI_PRE_MAPS}
                 by_name = {v.lower(): k for k, v in MAP_NAMES.items()}
@@ -1300,7 +1331,7 @@ class GoldenInvasion:
                         + f"most golden mobs in {MAP_NAMES[focus]}"
                 pre = sh.get("pre", {})
                 order = [n for n in hunters if n in pre]
-                ok = [n for n in order if focus != MAP_DEVIAS or ((snap.get(n) or {}).get("level") or 0) >= DEVIAS_MIN_LEVEL]
+                ok = [n for n in order if focus != MAP_DEVIAS or levels.get(n, 0) >= DEVIAS_MIN_LEVEL]
                 members = [n for n in ok if pre.get(n) == focus][:GI_FOCUS_COUNT]
                 members += [n for n in ok if n not in members][:GI_FOCUS_COUNT - len(members)]
                 sh["focus"], sh["members"] = focus, members
@@ -1381,7 +1412,10 @@ class GoldenInvasion:
             if banner and banner.get("at", 0) / 1000 < self.cur_start - 30:
                 banner = None                                  # an old banner from a previous hour
             if banner or (counts and counts.get("total") and rel > GI_BANNER_WAIT) or rel > GI_BANNER_WAIT + 4:
-                self.map_target, why = self.focus_map(banner, counts)
+                target, why = self.focus_map(banner, counts)
+                if target is None:
+                    return                                     # the other machine is deciding (GI_FOCUS_WAIT)
+                self.map_target = target
                 self.assign_map(self.map_target)
                 self.map_since = now
                 self.log(f"map: {MAP_NAMES.get(self.map_target)} ({why})")
@@ -1539,10 +1573,10 @@ class GoldenInvasion:
             return False
         if now - getattr(self, "apart_at", 0) < 1.5:
             return True                                    # already walking away
-        # only one of each pair moves: the later one in accounts.json (the earlier one keeps searching)
-        order = list(self.a.hub.names)
-        idx = order.index(self.a.name) if self.a.name in order else 0
-        movers = [c for c in close if (order.index(c[1]) if c[1] in order else -1) < idx]
+        # only one of each pair moves: the later one in roster.json (the earlier one keeps searching) --
+        # the same order on both machines, so exactly one of a PC/Mac pair steps away
+        me = self.order_key(self.a.name)
+        movers = [c for c in close if self.order_key(c[1]) < me]
         if not movers:
             return False
         # away from the teammates that are too close (their average), GI_SPACING + 2 tiles from the nearest
@@ -1782,3 +1816,103 @@ class GoldenInvasion:
 
 def G_HEADLESS():
     return bool(G.HEADLESS)
+
+
+# ───────────── Golden Invasion across machines (mu_hub, multi-machine phase 4) ─────────────
+# hub.gi_shared (wait spots, pre-maps, map assignments, positions for GI_SPACING, dragon calls,
+# searched cells, blocked cells, the FOCUS decision) is shared with the other machines through the
+# hub: every heartbeat (1 s while hunting) sends this machine's entries and merges the others'.
+# Times travel as ages (the machines' clocks differ).
+GI_SYNC_GRID_AGE = 30     # searched cells sent each beat: the ones (re)searched in the last N s
+GI_FOCUS_WAIT    = 6      # s a hunter waits for the other machine's FOCUS decision (its first hunter decides)
+
+
+def _cell_key(c):
+    return f"{c[0]},{c[1]}"
+
+
+def _cell(k):
+    a, b = k.split(",")
+    return (int(a), int(b))
+
+
+def gi_export(hub):
+    """This machine's part of hub.gi_shared, or None when none of its characters is in the invasion."""
+    snap = hub.snapshot()
+    if not any((snap.get(n) or {}).get("mode") == "gi" for n in hub.names):
+        return None
+    sh = getattr(hub, "gi_shared", None)
+    if not sh:
+        return None
+    now = time.time()
+    local = set(hub.names)
+    with hub.lock:
+        out = {
+            "wait": {n: list(v) for n, v in (sh.get("wait") or {}).items() if n in local},
+            "assign": {n: v for n, v in (sh.get("assign") or {}).items() if n in local and v is not None},
+            "pre": {n: v for n, v in (sh.get("pre") or {}).items() if n in local},
+            "pos": {n: {"map": v["map"], "x": v["x"], "y": v["y"], "goal": v.get("goal"), "age": round(now - v["at"], 1)}
+                    for n, v in (sh.get("pos") or {}).items() if n in local and now - v["at"] < 10},
+            "dragons": {n: {"map": v["map"], "x": v["x"], "y": v["y"], "age": round(now - v["at"], 1)}
+                        for n, v in (sh.get("dragons") or {}).items() if n in local and now - v["at"] < 10},
+            "grids": {str(m): {_cell_key(c): round(now - t, 1) for c, t in g.items() if now - t < GI_SYNC_GRID_AGE}
+                      for m, g in (sh.get("grids") or {}).items()},
+            "blocked": {str(m): [_cell_key(c) for c in cells] for m, cells in (sh.get("blocked") or {}).items()},
+        }
+        if "focus" in sh and not sh.get("focus_from"):          # decided here (not adopted)
+            out["focus"], out["members"] = sh["focus"], list(sh.get("members") or [])
+    return out
+
+
+def gi_import(hub, machine, data, lag):
+    """Merge another machine's part into hub.gi_shared (its characters' entries replace the old ones)."""
+    sh = getattr(hub, "gi_shared", None)
+    rem = hub.__dict__.setdefault("gi_remote_names", {})
+    if sh is None:
+        return
+    now = time.time()
+    local = set(hub.names)
+    names = set()
+    with hub.lock:
+        for key in ("wait", "assign", "pre"):
+            for n, v in ((data or {}).get(key) or {}).items():
+                if n in local:
+                    continue
+                sh.setdefault(key, {})[n] = tuple(v) if key == "wait" else v
+                names.add(n)
+        for key in ("pos", "dragons"):
+            for n, v in ((data or {}).get(key) or {}).items():
+                if n in local:
+                    continue
+                d = dict(v)
+                d["at"] = now - float(d.pop("age", 0) or 0) - float(lag or 0)
+                if isinstance(d.get("goal"), list):
+                    d["goal"] = tuple(d["goal"])
+                sh.setdefault(key, {})[n] = d
+                names.add(n)
+        for m, g in ((data or {}).get("grids") or {}).items():
+            grid = sh.setdefault("grids", {}).setdefault(int(m), {})
+            for k, a in g.items():
+                t = now - float(a) - float(lag or 0)
+                c = _cell(k)
+                if grid.get(c, 0) < t:
+                    grid[c] = t
+        for m, cells in ((data or {}).get("blocked") or {}).items():
+            sh.setdefault("blocked", {}).setdefault(int(m), set()).update(_cell(k) for k in cells)
+        if data and data.get("focus") is not None and "focus" not in sh:
+            sh["focus"], sh["members"], sh["focus_from"] = data["focus"], list(data.get("members") or []), machine
+            sh["focus_log"] = f"FOCUS {MAP_NAMES.get(data['focus'], data['focus'])} decided on {machine} -> " \
+                              f"{', '.join(sh['members'])} go there, the others stay"
+        for gone in rem.get(machine, set()) - names:            # left the invasion over there
+            for key in ("wait", "assign", "pre", "pos", "dragons"):
+                (sh.get(key) or {}).pop(gone, None)
+        rem[machine] = names
+
+
+def gi_wire(hub):
+    """mu_auto_bot: share hub.gi_shared through the hub link (no link = this machine only, as before)."""
+    link = getattr(hub, "link", None)
+    if link is None:
+        return
+    link.gi_fn = lambda: gi_export(hub)
+    link.on_gi = lambda m, data, age: gi_import(hub, m, data, age)

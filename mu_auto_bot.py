@@ -3665,6 +3665,7 @@ def main():
     log(R.startup_line(names))
     hub.link = HUB.make_link(hub.snapshot, log)
     if hub.link:                                # spot_stats measurements travel both ways
+        GI.gi_wire(hub)                         # Golden Invasion hunters share their state (mu_gi, 1 s beats)
         hub.link.on_samples = hub.stats.apply_remote
         hub.stats.on_add = hub.link.send_sample
         # event switches shared through the hub (B / G / T / O on any machine, or the status page)

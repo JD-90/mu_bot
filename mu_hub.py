@@ -38,6 +38,7 @@ from pathlib import Path
 HUB_FILE = Path(__file__).with_name("hub.json")
 DEFAULT_PORT = 47300
 BEAT_EVERY = 3          # s between heartbeats
+BEAT_FAST = 1           # ... while this machine has Golden Invasion hunters out (positions for GI_SPACING)
 STALE_SEC = 20          # a machine not heard from for this long: its characters are "unknown"
 TIMEOUT = 2.5           # s per request
 CLAIM_TTL_MAX = 3 * 3600
@@ -121,10 +122,11 @@ class HubState:
             if k in FLAGS:
                 self.set_flags({k: not self.flags.get(k, False)}, by)
 
-    def beat(self, machine, chars, addr, samples=None, since=None, epoch=None, flags=None, set_flags=None):
+    def beat(self, machine, chars, addr, samples=None, since=None, epoch=None, flags=None, set_flags=None, gi=None):
         now = time.time()
         with self.lock:
-            self.machines[machine] = {"at": now, "chars": chars or {}, "addr": addr, "flags": flags or {}}
+            self.machines[machine] = {"at": now, "chars": chars or {}, "addr": addr, "flags": flags or {},
+                                      "gi": gi or None}     # Golden Invasion shared state (mu_gi.gi_export)
             if set_flags:                       # switched on that machine (console key)
                 self.set_flags(set_flags, machine)
             if flags:                           # nobody set these yet: that machine's startup values
@@ -149,7 +151,7 @@ class HubState:
         self._expire(now)
         return {
             "machines": {m: {"age": round(now - d["at"], 1), "addr": d["addr"], "chars": d["chars"],
-                             "flags": d.get("flags") or {}}
+                             "flags": d.get("flags") or {}, "gi": d.get("gi")}
                          for m, d in self.machines.items()},
             "flags": dict(self.flags), "flags_ver": self.flags_ver,
             "flags_meta": {k: {"by": m.get("by"), "ago": round(now - m["at"]) if m.get("at") else None}
@@ -350,7 +352,7 @@ def make_handler(state, key):
                 return self._send(200, state.beat(str(body.get("machine")), body.get("chars"),
                                                   self.client_address[0], body.get("samples"),
                                                   body.get("since"), body.get("epoch"),
-                                                  body.get("flags"), body.get("set_flags")))
+                                                  body.get("flags"), body.get("set_flags"), body.get("gi")))
             if path == "/claim":
                 return self._send(200, state.claim(str(body.get("key")), body.get("owner"),
                                                    body.get("machine"), body.get("ttl")))
@@ -415,6 +417,9 @@ class HubLink:
         self.on_flags = None       # callback(changes {k: bool}, by) when the hub's switches differ from ours
         self.flags_out = {}        # switched here, not yet confirmed by the hub
         self.flags_ver = None
+        self.gi_fn = None          # () -> this machine's Golden Invasion state to share (None = no hunt running)
+        self.on_gi = None          # callback(machine, state or None, age_s) for each other machine, every beat
+        self.gi_active = False
         self.stop = False
         self.server = start_server(cfg, log) if cfg.get("serve") else None
 
@@ -443,7 +448,7 @@ class HubLink:
                 self.beat()
             except Exception as e:      # never let the link kill anything
                 self.log(f"hub: beat error {e!r}")
-            time.sleep(BEAT_EVERY)
+            time.sleep(BEAT_FAST if self.gi_active else BEAT_EVERY)
 
     def local_chars(self):
         out = {}
@@ -461,8 +466,16 @@ class HubLink:
                 local = self.flags_fn() or {}
             except Exception:
                 local = {}
+        gi = None
+        if self.gi_fn:
+            try:
+                gi = self.gi_fn()
+            except Exception as e:
+                self.log(f"hub: GI export: {e!r}")
+        self.gi_active = bool(gi)
         r = self._call("/beat", {"machine": self.machine, "chars": self.local_chars(), "samples": out,
-                                 "since": self.since, "epoch": self.epoch, "flags": local, "set_flags": fout})
+                                 "since": self.since, "epoch": self.epoch, "flags": local, "set_flags": fout,
+                                 "gi": gi})
         if "_error" in r or "machines" not in r:
             if self.ok is not False:
                 err = r.get("_error") or r.get("error") or "bad answer"
@@ -503,6 +516,14 @@ class HubLink:
                     self.samples_in += 1
                 except Exception as e:
                     self.log(f"hub: spot sample {key}: {e!r}")
+        if self.on_gi:
+            for m, d in (r.get("machines") or {}).items():
+                if m == self.machine:
+                    continue
+                try:
+                    self.on_gi(m, d.get("gi") if (d.get("age") or 0) <= STALE_SEC else None, d.get("age") or 0)
+                except Exception as e:
+                    self.log(f"hub: GI import from {m}: {e!r}")
         for n in self.remote():
             if n not in self.seen:
                 self.seen.add(n)
