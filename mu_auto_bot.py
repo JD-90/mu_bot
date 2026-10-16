@@ -117,6 +117,7 @@ PARTY_THANKS_TEXTS  = ["thx", "gracias", "ty", "gracia"]   # one picked at rando
 PARTY_THANKS_DELAY  = (2, 5)    # seconds after accepting (random)
 PARTY_THANKS_PARTY_CHAT = False # False = normal chat; True = party chat (~)
 PARTY_THANKS_MIN_GAP = 60       # at most once per this many seconds per character (kicked + re-invited...)
+PARTY_THANKS_BC_ONLY = True     # (Juan 2026-10-16) thank only for Blood Castle invites, never while leveling
 
 # spot rules for a character on its own (the group bot's rules for the rest, see mu_group_bot.py)
 SOLO_OWN_SPOT       = True  # plain leveling (not pairs): each character takes a spot of its own on its leg of
@@ -1842,7 +1843,8 @@ class Agent:
             if len(party) <= 1 and (from_ours or LEVEL_ACCEPT_STRANGERS):
                 self.log(f"accepting party invite{'' if from_ours else ' from a stranger'}: {text[:60]}")
                 self.ev("() => window.__social.partyRespond(true)")
-                self.queue_thanks(text)
+                if not PARTY_THANKS_BC_ONLY:
+                    self.queue_thanks(text)
                 if not from_ours:
                     self.stranger_party = {"area": (self.step_key, self.spot_idx), "joined": now,
                                            "said": False, "say_at": now + random.uniform(*LEVEL_AFK_DELAY)}
