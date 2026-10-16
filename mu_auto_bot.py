@@ -422,6 +422,7 @@ SUMMON_MANUAL_REQ_EVERY = 10    # main paused (you play him): send the trade req
 SUMMON_MANUAL_REQUESTS = 8      # ... at most this many times
 SUMMON_MANUAL_CONFIRM = 90      # ... and wait this long for you to confirm
 SUMMON_KEYS         = {"c": "come", "x": "boxes", "d": "dismiss"}   # console: C / X / D = everyone
+PK_EVERY            = 5         # s between PK status reads (hub status page)
 
 # restarts (mu_supervisor.py)
 SUPERVISED          = os.environ.get("MU_SUPERVISED") == "1"   # started by mu_supervisor.py
@@ -687,6 +688,8 @@ class Agent:
         self.trade_sent = 0
         self.trade_filled = False
         self.summon = None           # summoned to the main (mu_hub summons): see summon_tick
+        self.pk = None               # PK status for the hub page: {"lvl" 0-3, "hs", "kills", "stage", "clear_in"}
+        self.pk_at = 0
         self.leveler_name = PAIRS.get(self.name)    # who carries me after a grand reset (None = nobody)
         self.was_assisted = None
         self.pair_parked = False     # levelee waiting at the bar (leveler in Blood Castle / paused / offline)
@@ -856,6 +859,24 @@ class Agent:
             return None
 
     # ── shared state ──
+    def pk_status(self):
+        """My PK status (every PK_EVERY s), for the hub page: lvl 0 = clean, 1 = Outlaw Warning (1 kill),
+        2 = 1st Stage Outlaw (2 kills), 3 = 2nd Stage Outlaw (3+ kills). From the hero state (4 / 5 / 6+)
+        and the kills the Golden Invasion loop read from the server's chat (mu_gi PK_STATE_JS)."""
+        now = time.time()
+        if now - self.pk_at < PK_EVERY:
+            return self.pk
+        self.pk_at = now
+        r = self.ev(GI.PK_STATE_JS)
+        if not r:
+            return self.pk
+        hs = r.get("hs")
+        kills = r.get("kills") or 0
+        lvl = min(3, max(kills, (hs - 3) if isinstance(hs, (int, float)) and hs > 3 else 0))
+        self.pk = {"lvl": int(lvl), "hs": hs, "kills": kills, "stage": r.get("stage"),
+                   "clear_in": r.get("clearIn") or 0}
+        return self.pk
+
     def publish(self):
         c, s = self.c, self.c.s
         target = None
@@ -878,6 +899,7 @@ class Agent:
             "gi_hunter": bool(self.gi and self.gi.is_hunter()),
             "bc_tier": bc_as[0], "bc_role": bc_as[1],     # shared with the other machines (mu_hub)
             "summon": self.summon["kind"] if self.summon else None,
+            "pk": self.pk_status() if c.online else self.pk,
         })
 
     def recent_rate(self):

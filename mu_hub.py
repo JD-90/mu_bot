@@ -66,7 +66,7 @@ CLAIM_TTL_MAX = 3 * 3600
 SHARE_FIELDS = ("online", "paused", "mode", "map", "x", "y", "level", "resets", "hp", "party",
                 "step", "spot", "target", "rate", "bc", "bc_away", "boxes", "bag_free",
                 "assisted", "leveler", "pair_lead", "gi_hunter", "bc_tier", "bc_role",
-                "scouting", "share_with", "boxes5", "summon")
+                "scouting", "share_with", "boxes5", "summon", "pk")
 TRADE_IDLE_SEC = 30     # a trade session nobody synced for this long is dropped
 TRADE_ENDED_KEEP = 20   # an ended one stays visible this long (the other side must see "ended")
 SAMPLES_KEEP = 2000     # spot_stats samples the server remembers (other machines fetch the ones they miss)
@@ -83,6 +83,8 @@ MODE_NAMES = {"level": "leveling", "bc": "Blood Castle", "gi": "Golden Invasion"
               "start": "starting", "wait": "waiting (bar)", "summoned": "summoned"}
 SUMMON_SEC = 300        # (Juan 2026-10-16) a summon ends by itself after this long (pressing again restarts it)
 SUMMON_KINDS = {"come": "come to me", "boxes": "boxes to me"}
+# PK stages as the game colors the name (Juan 2026-10-16): light orange 1 kill, darker orange 2, red 3+
+PK_STAGES = {1: ("Outlaw Warning", "#ffb05c"), 2: ("1st Stage Outlaw", "#ff7a1a"), 3: ("2nd Stage Outlaw", "#ff2b2b")}
 
 
 def load_config():
@@ -384,11 +386,23 @@ def _status_html(v, key=""):
             if c.get("share_with"):
                 extra.append(f"sharing {c['share_with']}'s spot")
             boxes = f"{c.get('boxes') or 0}" + (f" ({c.get('boxes5')} +5)" if c.get("boxes5") else "")
+            pk = c.get("pk") or {}
+            lvl = pk.get("lvl") or 0
+            if lvl in PK_STAGES:
+                label, col = PK_STAGES[lvl]
+                kills = pk.get("kills") or lvl
+                pk_html = (f"<span style='color:{col};font-weight:bold'>{e(pk.get('stage') or label)}</span> "
+                           f"({kills} kill{'s' if kills != 1 else ''}"
+                           + (f", /pkclear in {pk['clear_in']} s" if pk.get("clear_in") else "") + ")")
+                name_html = f"<b style='color:{col}'>{e(n)}</b>"
+            else:
+                pk_html = "<span class=ok>clean</span>" if pk else ""
+                name_html = f"<b>{e(n)}</b>"
             rows.append("<tr>" + "".join(f"<td>{x}</td>" for x in (
-                e(m), f"<b>{e(n)}</b>", f"<span class=m-{e(mode)}>{e(MODE_NAMES.get(mode, mode))}</span>",
+                e(m), name_html, f"<span class=m-{e(mode)}>{e(MODE_NAMES.get(mode, mode))}</span>",
                 e(", ".join(extra)), e(c.get("level")), e(c.get("resets")), e(c.get("map")),
                 f"{e(c.get('x'))},{e(c.get('y'))}", e(c.get("hp")), e(boxes),
-                e(c.get("bag_free") if c.get("bag_free") is not None else ""), f"{d['age']} s", btns)) + "</tr>")
+                e(c.get("bag_free") if c.get("bag_free") is not None else ""), pk_html, f"{d['age']} s", btns)) + "</tr>")
     summary = " · ".join(f"{e(MODE_NAMES.get(k, k))}: {n}" for k, n in sorted(counts.items(), key=lambda x: -x[1]))
     claims = "".join(f"<tr><td>{e(k)}</td><td>{e(c['owner'])}</td>"
                      f"<td>{e(c['machine'])}</td><td>{c['left']} s</td></tr>"
@@ -410,7 +424,7 @@ button{{font:inherit;padding:3px 10px;cursor:pointer}}
 <div class=wrap><table><tr><th>event<th>state<th>last switched by{sw_head}<th></tr>{''.join(sw)}</table></div>
 <h3>Summon (to {e(main or '?')}, {SUMMON_SEC // 60} min, then back to normal)</h3><p>{cmd_all}</p>
 <h3>Characters</h3><p>{summary or 'no characters'}</p>
-<div class=wrap><table><tr><th>machine<th>name<th>doing<th>details<th>lvl<th>resets<th>map<th>pos<th>hp<th>boxes<th>bag free<th>heard<th>summon</tr>{''.join(rows)}</table></div>
+<div class=wrap><table><tr><th>machine<th>name<th>doing<th>details<th>lvl<th>resets<th>map<th>pos<th>hp<th>boxes<th>bag free<th>PK<th>heard<th>summon</tr>{''.join(rows)}</table></div>
 <h3>Box trades between machines</h3><table><tr><th>who<th>machine<th>state<th>age</tr>{trades}</table>
 <h3>Claims</h3><table><tr><th>key<th>owner<th>machine<th>left</tr>{claims}</table>
 <p>machines: {mach} · hub up {_ago(v['uptime']).replace(' ago', '')}</p>"""
