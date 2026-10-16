@@ -222,15 +222,15 @@ BIG_ON_PAUSE        = {"wizzardo"}  # these characters get a maximized, sharp wi
                                     # them with 1-5 (back to 800x500 / low graphics on resume)
 BIG_RENDER_SCALE    = 100   # Render scale (%) while big; None = leave it as the bot set it
 BIG_FULLSCREEN      = True  # True = fullscreen window while big (no browser bars); False = maximized
-BIG_RESOLUTION      = (1920, 1200)  # game size while big; capped to what the screen fits
+BIG_RESOLUTION      = (1920, 1080)  # game size while big; capped to what the screen fits
 # Game options while big (Juan 2026-10-14); index meanings are listed above GAME_OPTIONS in
 # mu_group_bot.py. On resume the Low preset + GAME_OPTIONS come back (sound off again).
 BIG_OPTIONS = {
     "otherPlayerItemEffects": True,   # World and effects: other players' gear effects ON
     "otherPlayerSkillEffects": True,  # World and effects: other players' skill effects ON
     "renderDistance": 0,              # World and effects: render distance 80
-    "fpsLimit": 4,                    # FPS limit 120
-    "volume": 5,                      # Sound: master volume 5
+    "fpsLimit": 3,                    # FPS limit 120
+    "volume": 4,                      # Sound: master volume 5
     "musicVolume": 1,                 # Sound: music 1
 }
 REMINIMIZE_RESTORED = False # True = re-minimize any window that got restored (the old behaviour).
@@ -693,6 +693,7 @@ class Agent:
         self.trade_sent = 0
         self.trade_filled = False
         self.summon = None           # summoned to the main (mu_hub summons): see summon_tick
+        self.summon_done = None      # id of a "boxes" summon I ended myself (trade over): ignored if still listed
         self.pk = None               # PK status for the hub page: {"lvl" 0-3, "hs", "kills", "stage", "clear_in"}
         self.pk_at = 0
         self.leveler_name = PAIRS.get(self.name)    # who carries me after a grand reset (None = nobody)
@@ -2963,9 +2964,21 @@ class Agent:
     def summon_cmd(self):
         """This character's live summon from the hub (None: not summoned, or its time is up)."""
         e = self.hub.summons.get(self.name)
-        if not e or self.name == self.hub.trade_to or e["until"] <= time.time():
+        if not e or self.name == self.hub.trade_to or e["until"] <= time.time() or e["id"] == self.summon_done:
             return None
         return e
+
+    def summon_dismiss_self(self, why):
+        """(Juan 2026-10-16) "boxes" summon: the trade is over -> dismissed by itself (also at the hub, so the
+        status page shows it and a restart doesn't bring it back)."""
+        sm, hub = self.summon, self.hub
+        self.summon_done = sm["id"]
+        with hub.lock:
+            if (hub.summons.get(self.name) or {}).get("id") == sm["id"]:
+                hub.summons.pop(self.name, None)
+        if hub.link:
+            threading.Thread(target=hub.link.command, args=("dismiss", self.name), daemon=True).start()
+        self.summon_end(why)
 
     def summon_tick(self):
         """True while summoned: go to the main, stand 1-3 tiles from him, follow him, trade him the
@@ -2976,6 +2989,9 @@ class Agent:
         if e is None:
             if sm:
                 self.summon_end("5 min are over" if now >= sm["until"] - 2 else "dismissed")
+            return False
+        if sm and sm["kind"] == "boxes" and sm["traded"] and sm["id"] == e["id"] and sm.get("t") is None:
+            self.summon_dismiss_self(sm.get("traded_why") or "boxes trade over")
             return False
         if sm is None:
             sm = self.summon_start(e)
@@ -2997,14 +3013,11 @@ class Agent:
             if self.my_trade is not t:
                 sm["t"] = None
                 if t.get("ok"):
-                    sm["traded"] = True
-                    self.log(f"SUMMON: boxes handed to {t['lead']} -> waiting next to him")
+                    sm["traded"], sm["traded_why"] = True, f"boxes handed to {t['lead']}"
                 else:
                     sm["tries"] += 1
                     if sm["tries"] >= SUMMON_TRADE_TRIES:
-                        sm["traded"] = True
-                        self.log(f"SUMMON: trade failed {sm['tries']} times -> just waiting "
-                                 "(press boxes again to retry)")
+                        sm["traded"], sm["traded_why"] = True, f"trade failed {sm['tries']} times"
                     else:
                         sm["trade_at"] = now + SUMMON_TRADE_RETRY
                 sm["state"], sm["spot"], sm["go_at"] = "go", None, now   # back to my place next to him
@@ -3132,8 +3145,7 @@ class Agent:
         elif SUMMON_GIVE_CRYSTALS and TRADE_CRYSTALS and self.crystals > 0:
             kind, n = "crystals", 1
         else:
-            sm["traded"] = True
-            self.log("SUMMON: no Kundun boxes (or Cristales) in my bag -> nothing to trade, just waiting")
+            sm["traded"], sm["traded_why"] = True, "no Kundun boxes (or Cristales) to give"
             return
         if remote:
             link = hub.link
