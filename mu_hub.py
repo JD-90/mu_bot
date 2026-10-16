@@ -39,6 +39,7 @@ Buttons on the status page (all / per character), console keys C / X / D on any 
 """
 import html
 import json
+import re
 import socket
 import sys
 import threading
@@ -83,6 +84,125 @@ MODE_NAMES = {"level": "leveling", "bc": "Blood Castle", "gi": "Golden Invasion"
               "start": "starting", "wait": "waiting (bar)", "summoned": "summoned"}
 SUMMON_SEC = 300        # (Juan 2026-10-16) a summon ends by itself after this long (pressing again restarts it)
 SUMMON_KINDS = {"come": "come to me", "boxes": "boxes to me"}
+# Upcoming events table (Juan 2026-10-16). Ours on top, the rest in grey rows below; each group sorted by the
+# next start. Times come from the game's event panel (EVENTS_JS in mu_auto_bot: any online character reads it
+# every EVENTS_EVERY s and sends the row texts with its beat); without a fresh reading, or for events the panel
+# doesn't show (Red Dragon, White Wizard), the server's published schedule below (Argentina time) is used.
+ART = -3 * 3600         # Argentina = UTC-3 all year (no DST): the PC's clock zone doesn't matter
+EVENTS_FRESH = 90       # a panel reading older than this (s) is not used
+# key: (name, ours?, starts [(hour or None = every hour, minute)], lasts (s, None = unknown), lasts text, panel regex)
+EVENT_DEFS = {
+    "bc": ("Blood Castle", True, [(None, 0)], 300, "door open 5 min", r"blood\s*castle"),
+    "gi": ("Golden Invasion", True, [(None, 50)], 900, "15 min", r"golden\s*invasion"),
+    "th": ("Treasure Hunt", True, [(None, 40)], 300, "5 min", r"treasure(\s*hunt)?"),
+    "bb": ("Big Boss", True, [(h, 10) for h in range(0, 24, 3)], 1800, "30 min", r"big\s*boss"),
+    "cc": ("Chaos Castle", False, [(None, 20)], None, "", r"chaos\s*castle"),
+    "ds": ("Devil Square", False, [(None, 35)], 600, "10 min", r"devil\s*square"),
+    "br": ("Battle Royale", False, [(15, 40), (18, 40), (21, 40), (0, 40)], None, "sign-up 5 min before",
+           r"battle\s*royale"),
+    "rd": ("Red Dragon invasion", False, [(5, 20), (11, 20), (17, 20), (23, 20)], 1800, "30 min", r"red\s*dragon"),
+    "ww": ("White Wizard invasion", False, [(h, 35) for h in range(9, 20, 2)], None, "", r"white\s*wizard"),
+}
+NO_PANEL = {"rd", "ww"}     # not in the game's event panel: schedule only
+
+
+def _secs(t):
+    m = re.search(r"(\d+):(\d+)(?::(\d+))?", t)
+    if not m:
+        return None
+    n = [int(v) for v in m.groups() if v is not None]
+    return n[0] * 3600 + n[1] * 60 + n[2] if len(n) == 3 else n[0] * 60 + n[1]
+
+
+def parse_event_rows(rows):
+    """Row texts of the game's event panel -> {key: {"secs", "active", "where", "text"}}.
+    secs = until the start, or (active) what the panel counts down while it's on."""
+    out = {}
+    for t in rows or []:
+        t = re.sub(r"\s+", " ", str(t)).strip()
+        for k, d in EVENT_DEFS.items():
+            m = re.search(d[5], t, re.I)
+            if not m or k in out:
+                continue
+            rest = t[m.end():].strip()
+            r = {"text": t[:120], "secs": _secs(rest), "active": bool(re.search(r"\b(open|active)\b", rest, re.I))}
+            w = re.match(r"(Lorencia|Devias|Noria|Atlans|Tarkan|Dungeon|Lost Tower|Aida|Kanturu|Icarus)\b"
+                         r"\s*(\d+\s*,\s*\d+)?", rest, re.I)
+            if w:                                   # Big Boss up (map x,y) / Treasure Hunt map
+                r["where"] = w.group(0).strip()
+                if k == "bb" and w.group(2):
+                    r["active"] = True
+            g = re.search(r"(\d+)\s*left", rest, re.I)
+            if g and r["secs"] is None:             # Golden Invasion on: "N left" (golden monsters)
+                r["active"], r["left_n"] = True, int(g.group(1))
+            out[k] = r
+            break
+    return out
+
+
+def schedule_next(k, now):
+    """(start, end) of the event's current run (if it's on now) or of the next one, from EVENT_DEFS (epoch s)."""
+    _, _, starts, dur, _, _ = EVENT_DEFS[k]
+    local = now + ART
+    day0 = local - local % 86400
+    best = None
+    for day in (-86400, 0, 86400):
+        for h, mnt in starts:
+            hours = range(24) if h is None else (h,)
+            for hh in hours:
+                st = day0 + day + hh * 3600 + mnt * 60 - ART
+                en = st + (dur or 60)
+                if en <= now:
+                    continue
+                if best is None or st < best[0]:
+                    best = (st, en)
+    return best
+
+
+def _dur_txt(sec):
+    sec = int(max(0, sec))
+    if sec < 60:
+        return f"{sec} s"
+    if sec < 3600:
+        return f"{sec // 60} min"
+    return f"{sec // 3600} h {sec % 3600 // 60} min"
+
+
+def upcoming_events(v, now=None):
+    """Rows for the Upcoming events table: [{"key", "name", "ours", "start", "end", "running", "note", ...}]"""
+    now = now or time.time()
+    live, age = {}, None
+    ev = v.get("events_live") or {}
+    if ev.get("rows") and (ev.get("age") or 0) <= EVENTS_FRESH:
+        live, age = parse_event_rows(ev["rows"]), ev.get("age") or 0
+    out = []
+    for k, (name, ours, _st, dur, lasts, _rx) in EVENT_DEFS.items():
+        sch = schedule_next(k, now)
+        r = live.get(k) if k not in NO_PANEL else None
+        row = {"key": k, "name": name, "ours": ours, "lasts": lasts, "source": "panel" if r else "schedule",
+               "where": (r or {}).get("where"), "left_n": (r or {}).get("left_n")}
+        if r and r["active"]:
+            row["running"] = True
+            row["start"] = now
+            if r["secs"] is not None:
+                row["end"] = now + r["secs"] - age
+            elif sch and sch[0] <= now:
+                row["end"] = sch[1]
+        elif r and r["secs"] is not None:
+            row["running"] = False
+            row["start"] = now + r["secs"] - age
+        elif sch:
+            row["running"] = sch[0] <= now
+            row["start"] = sch[0]
+            if row["running"] and dur:
+                row["end"] = sch[1]
+        else:
+            continue
+        out.append(row)
+    out.sort(key=lambda r: (not r["ours"], not r["running"], r["start"]))
+    return out
+
+
 # PK stages as the game colors the name (Juan 2026-10-16): light orange 1 kill, darker orange 2, red 3+
 PK_STAGES = {1: ("Outlaw Warning", "#ffb05c"), 2: ("1st Stage Outlaw", "#ff7a1a"), 3: ("2nd Stage Outlaw", "#ff2b2b")}
 
@@ -119,6 +239,7 @@ class HubState:
         self.log_seq = 0
         self.flags, self.flags_meta, self.flags_ver = {}, {}, 0    # event switches (see set_flags)
         self.summons, self.summons_ver, self.summon_id = {}, 0, 0  # name -> {"kind", "id", "until", "by"}
+        self.events_live = None     # freshest event-panel reading: {"rows": [texts], "at": server time, "machine"}
         self.main = R.NAMES[0] if R and R.NAMES else None           # the one being helped (machines send it)
         try:
             d = json.loads(FLAGS_FILE.read_text(encoding="utf-8"))
@@ -186,11 +307,15 @@ class HubState:
                 "summons_ver": f"{self.epoch}:{self.summons_ver}", "main": self.main}
 
     def beat(self, machine, chars, addr, samples=None, since=None, epoch=None, flags=None, set_flags=None, gi=None,
-             main=None):
+             main=None, events=None):
         now = time.time()
         with self.lock:
             if main:
                 self.main = main
+            if events and events.get("rows"):
+                at = now - float(events.get("age") or 0)
+                if not self.events_live or at >= self.events_live["at"]:
+                    self.events_live = {"rows": list(events["rows"])[:30], "at": at, "machine": machine}
             self.machines[machine] = {"at": now, "chars": chars or {}, "addr": addr, "flags": flags or {},
                                       "gi": gi or None}     # Golden Invasion shared state (mu_gi.gi_export)
             if set_flags:                       # switched on that machine (console key)
@@ -228,6 +353,8 @@ class HubState:
                            "ended": t["ended"], "alt_fields": t["alt_fields"]} for l, t in self.trades.items()},
             "uptime": round(now - self.started),
             **self._summons_view(now),
+            "events_live": ({"rows": self.events_live["rows"], "age": round(now - self.events_live["at"], 1),
+                             "machine": self.events_live["machine"]} if self.events_live else None),
         }
 
     def _expire(self, now):
@@ -411,6 +538,54 @@ def _status_html(v, key=""):
                      f"<td>{'ended: ' + e((t.get('ended') or {}).get('why')) if t.get('ended') else 'live'}</td>"
                      f"<td>{t['age']} s</td></tr>" for l, t in sorted((v.get("trades") or {}).items()))
     mach = " · ".join(f"{e(m)} ({e(d['addr'])}, heard {d['age']} s ago)" for m, d in machines) or "none"
+    # upcoming events
+    now = time.time()
+    allc = {n: c for _m, d in machines for n, c in d["chars"].items()}
+    doing = lambda mode: sorted(n for n, c in allc.items() if c.get("mode") == mode)
+
+    def ev_details(r):
+        k, parts = r["key"], []
+        if r.get("where"):
+            parts.append(r["where"])
+        if k == "bc":
+            plan = sorted((c["bc_tier"], n) for n, c in allc.items() if c.get("bc_tier"))
+            if plan:
+                parts.append(", ".join(f"BC{t} {n}" for t, n in plan))
+        elif k == "gi":
+            h = sorted(n for n, c in allc.items() if c.get("gi_hunter"))
+            if h:
+                parts.append("hunters: " + ", ".join(h))
+            if r.get("left_n") is not None:
+                parts.append(f"{r['left_n']} golden left")
+        if k in ("gi", "th", "bb") and r.get("running") and doing(k):
+            parts.append("there: " + ", ".join(doing(k)))
+        if r["key"] in NO_PANEL:
+            parts.append("no in-game timer (server schedule)")
+        return " · ".join(parts)
+
+    ev_rows, shown_other = [], False
+    for r in upcoming_events(v, now):
+        if not r["ours"] and not shown_other:
+            shown_other = True
+            ev_rows.append("<tr><td colspan=6 class=evsep>other events (not ours)</td></tr>")
+        if r["running"]:
+            when = "<b class=on>on now</b>" + (f" ({_dur_txt(r['end'] - now)} left)" if r.get("end") else "")
+        else:
+            when = f"<b>{_dur_txt(r['start'] - now)}</b>" if r["ours"] else _dur_txt(r["start"] - now)
+        starts = time.strftime("%H:%M", time.gmtime(r["start"] + ART + 30)) if not r["running"] else "now"
+        approx = "" if r["source"] == "panel" or r["key"] in NO_PANEL else " title='server schedule (no fresh panel reading)'"
+        if r["ours"]:
+            on = v["flags"].get(r["key"])
+            sw = "<b class=on>ON</b>" if on else "<b class=off>OFF</b>" if on is not None else ""
+            ev_rows.append(f"<tr><td class=m-{r['key']}>{e(r['name'])}</td><td{approx}>{starts}</td><td>{when}</td>"
+                           f"<td>{e(r['lasts'])}</td><td>{sw}</td><td>{e(ev_details(r))}</td></tr>")
+        else:
+            ev_rows.append(f"<tr class=evother><td>{e(r['name'])}</td><td{approx}>{starts}</td><td>{when}</td>"
+                           f"<td>{e(r['lasts'])}</td><td></td><td>{e(ev_details(r))}</td></tr>")
+    evl = v.get("events_live") or {}
+    ev_src = (f"times from {e(evl.get('machine'))}'s event panel, {int(evl.get('age') or 0)} s ago"
+              if evl.get("rows") and (evl.get("age") or 0) <= EVENTS_FRESH else "no panel reading: server schedule")
+    now_art = time.strftime("%H:%M", time.gmtime(now + ART))
     return f"""<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=5>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>MU hub</title>
 <style>body{{font:14px system-ui;margin:16px;background:#111;color:#ddd}}table{{border-collapse:collapse;margin-bottom:18px}}
@@ -418,6 +593,7 @@ td,th{{border:1px solid #444;padding:4px 8px;text-align:left}}th{{background:#22
 .on{{color:#4c4}}.off{{color:#e55}}.bad{{color:#fa3}}.ok{{color:#999}}form{{margin:0}}
 button{{font:inherit;padding:3px 10px;cursor:pointer}}
 .m-bc,.m-gi,.m-th,.m-bb,.m-summoned{{color:#fc5;font-weight:bold}}
+.evsep{{color:#777;background:#1a1a1a;font-size:12px}}.evother td{{color:#777}}.sub{{font-weight:normal;color:#888;font-size:13px}}
 .m-bc{{color:#b57cff}}.m-bb{{color:#ff3b3b}}.m-th{{color:#c97a7a}}.m-paused,.m-offline{{color:#888}}.m-level{{color:#8cf}}
 .wrap{{overflow-x:auto}}</style>
 <p><a href="/logs{q}" style="color:#8cf">Logs (every machine) &rarr;</a></p>
@@ -427,6 +603,8 @@ button{{font:inherit;padding:3px 10px;cursor:pointer}}
 <h3>Characters</h3><p>{summary or 'no characters'}</p>
 <div class=wrap><table><tr><th>machine<th>name<th>doing<th>details<th>lvl<th>resets<th>map<th>pos<th>hp<th>boxes<th>bag free<th>PK<th>heard<th>summon</tr>{''.join(rows)}</table></div>
 <h3>Box trades between machines</h3><table><tr><th>who<th>machine<th>state<th>age</tr>{trades}</table>
+<h3>Upcoming events <span class=sub>(Argentina time, now {now_art} · {ev_src})</span></h3>
+<div class=wrap><table><tr><th>event<th>starts<th>in<th>lasts<th>switch<th>who / details</tr>{''.join(ev_rows)}</table></div>
 <h3>Claims</h3><table><tr><th>key<th>owner<th>machine<th>left</tr>{claims}</table>
 <p>machines: {mach} · hub up {_ago(v['uptime']).replace(' ago', '')}</p>"""
 
@@ -530,7 +708,7 @@ def make_handler(state, key):
                                                   self.client_address[0], body.get("samples"),
                                                   body.get("since"), body.get("epoch"),
                                                   body.get("flags"), body.get("set_flags"), body.get("gi"),
-                                                  body.get("main")))
+                                                  body.get("main"), body.get("events")))
             if path == "/log":
                 return self._send(200, state.add_logs(str(body.get("machine")), body.get("lines"),
                                                       body.get("since"), body.get("epoch")))
@@ -602,6 +780,7 @@ class HubLink:
         self.on_gi = None          # callback(machine, state or None, age_s) for each other machine, every beat
         self.gi_active = False
         self.main = None           # name of the main (sent with every beat; the hub never summons him)
+        self.events_fn = None      # () -> {"rows": [event panel row texts], "age": s} or None (Upcoming events table)
         self.on_summons = None     # callback({name: {"kind", "id", "left", "by"}}) with the hub's summons
         self.summons_ver = None    # (epoch, n) of the last summons applied (an older answer never undoes a newer one)
         self.log_out = []          # this machine's log lines not yet at the hub (see send_log)
@@ -755,7 +934,7 @@ class HubLink:
         self.gi_active = bool(gi)
         r = self._call("/beat", {"machine": self.machine, "chars": self.local_chars(), "samples": out,
                                  "since": self.since, "epoch": self.epoch, "flags": local, "set_flags": fout,
-                                 "gi": gi, "main": self.main})
+                                 "gi": gi, "main": self.main, "events": self._events()})
         if "_error" in r or "machines" not in r:
             if self.ok is not False:
                 err = r.get("_error") or r.get("error") or "bad answer"
@@ -843,6 +1022,12 @@ class HubLink:
             return "hub: connected, no other machine online"
         return "hub: " + " | ".join(f"{n}@{c['machine']} lvl {c.get('level')} {c.get('mode')}" + (f" BC{c['bc_tier']}" if c.get("bc_tier") else "")
                                     for n, c in sorted(rem.items()))
+
+    def _events(self):
+        try:
+            return self.events_fn() if self.events_fn else None
+        except Exception:
+            return None
 
     def apply_summons(self, r):
         """The hub's summons -> the bot (on_summons), unless an answer with a newer version was applied already."""

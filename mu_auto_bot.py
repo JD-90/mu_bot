@@ -423,6 +423,9 @@ SUMMON_MANUAL_REQUESTS = 8      # ... at most this many times
 SUMMON_MANUAL_CONFIRM = 90      # ... and wait this long for you to confirm
 SUMMON_KEYS         = {"c": "come", "x": "boxes", "d": "dismiss"}   # console: C / X / D = everyone
 PK_EVERY            = 5         # s between PK status reads (hub status page)
+EVENTS_EVERY        = 15        # s between reads of the game's event panel (hub: Upcoming events table)
+EVENTS_JS = """() => [...document.querySelectorAll('.event-row-label')].map(e =>
+    ((e.parentElement || e).textContent || '').replace(/\\s+/g, ' ').trim()).filter(Boolean)"""
 
 # restarts (mu_supervisor.py)
 SUPERVISED          = os.environ.get("MU_SUPERVISED") == "1"   # started by mu_supervisor.py
@@ -605,6 +608,8 @@ class Hub:
         self.gi_on = GI_AUTO         # G in the console switches the Golden Invasion on/off
         self.summons = {}            # this machine's summoned characters: name -> {"kind", "id", "by", "until"}
         self.summon_spots = {}       # name -> (map, x, y) where a summoned character is going to stand
+        self.events = None           # last event panel reading: {"rows": [texts], "at"} (any online character)
+        self.events_at = 0
         self.stop = False
 
     def put(self, name, d):
@@ -859,6 +864,18 @@ class Agent:
             return None
 
     # ── shared state ──
+    def read_events(self):
+        """Every EVENTS_EVERY s one online character (whoever gets there first) reads the game's event panel
+        for the hub's Upcoming events table."""
+        hub, now = self.hub, time.time()
+        with hub.lock:
+            if now - hub.events_at < EVENTS_EVERY:
+                return
+            hub.events_at = now
+        rows = self.ev(EVENTS_JS)
+        if rows:
+            hub.events = {"rows": rows, "at": time.time()}
+
     def pk_status(self):
         """My PK status (every PK_EVERY s), for the hub page: lvl 0 = clean, 1 = Outlaw Warning (1 kill),
         2 = 1st Stage Outlaw (2 kills), 3 = 2nd Stage Outlaw (3+ kills). From the hero state (4 / 5 / 6+)
@@ -951,6 +968,7 @@ class Agent:
             c.was_online = True
             c.select_tries = 0
             self.check_msgwin()
+            self.read_events()
             if TRADE_BOXES and self.name in self.receivers():
                 self.update_bag_free()
                 self.boxes_count()          # published (boxes / boxes5): givers pick the main or the keeper by it
@@ -4543,6 +4561,8 @@ def main():
         # summons (status page buttons / C, X, D on any machine)
         hub.link.main = hub.trade_to
         hub.link.on_summons = lambda summ: apply_summons(hub, summ)
+        hub.link.events_fn = lambda: ({"rows": hub.events["rows"], "age": round(time.time() - hub.events["at"], 1)}
+                                      if hub.events else None)
     if not hub.link:
         log("hub: no hub.json -> this machine runs alone")
     if CH.CHAT_ENABLED:

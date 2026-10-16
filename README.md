@@ -64,6 +64,7 @@ With a `hub.json` (git-ignored, template `hub.example.json`) the bots also share
 - PC: `"serve": true`, url `http://127.0.0.1:47300`. On first start Windows Firewall asks about Python: allow **Private networks**. The startup log prints the address the Mac must use.
 - Mac: `"serve": false`, `"machine": "mac"`, url `http://<PC LAN IP>:47300`, same `key`. Check with `python3 mu_hub.py test` (the VPN must allow local-network access).
 - Status page: `http://<PC LAN IP>:47300/?key=<key>` in any browser on the network. The 5-minute summary in the log adds a `hub:` line with the other machine's characters.
+- Status page extras: PK status per character (name colored like the game: light orange 1 kill, darker orange 2, red 3+), and an Upcoming events table (ours on top, Chaos Castle / Devil Square / Battle Royale / Red Dragon / White Wizard in grey below, each sorted by the next start). Times come from the game's event panel (any online character reads it every 15 s); without a fresh reading, and for Red Dragon / White Wizard (not in the panel), the server's published schedule is used.
 - Shared logs: every machine sends its `mu_auto_bot.log` lines to the hub every 2 s and writes the other machines' lines next to its own log, as `mu_auto_bot.<machine>.log` (the PC gets `mu_auto_bot.mac.log`, the Mac gets `mu_auto_bot.pc.log`). Hub down -> lines wait in memory and are sent when it's back. All machines in one view: `http://<PC LAN IP>:47300/logs?key=<key>` (tabs per machine, filter box).
 
 ## Restarting without the console (supervisor)
