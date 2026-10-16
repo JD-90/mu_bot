@@ -337,14 +337,35 @@ NPC_POS_JS = """
   return e ? {x: Math.round(e.transform.pos.x), y: Math.round(e.transform.pos.z)} : null; }
 """
 
+# bag items with an Archangel-weapon code: ["slot:group/num/lvl"]
+BC_WEAPON_BAG_JS = """
+(codes) => (window.__store.playerData.items || []).map((it, i) =>
+    (i >= 12 && i < 76 && it && codes.some(([g, n]) => it.group === g && it.num === n))
+        ? `${i}:${it.group}/${it.num}/${it.lvl || 0}` : null).filter(Boolean)
+"""
+BC_DELIVER_MAX_TALKS = 8    # talks to the Archangel (every 3 s) with the weapon still in the bag -> not this castle's
+
 TRADE_YOURS_JS = """
-([minLvl, cristal]) => { const it = Object.values(window.__eco.yourTradeItems || {}).filter(Boolean);
+([minLvl, cristal, jewels]) => { const it = Object.values(window.__eco.yourTradeItems || {}).filter(Boolean);
   const g = i => i.item || i;   // an item whose fields we can't read counts as a box (not as "other")
   const box = i => g(i).group === undefined || (g(i).group === 14 && g(i).num === 11 && (g(i).lvl || 0) >= minLvl);
   const cr = i => !!cristal && g(i).group === cristal[0] && g(i).num === cristal[1];   // Cristales: only the main takes them
-  return {boxes: it.filter(box).length, crystals: it.filter(cr).length,
-          other: it.filter(i => !box(i) && !cr(i)).length}; }
+  const jw = i => !!jewels && jewels.some(p => p[0] === g(i).group && p[1] === g(i).num);   // summon: rings / pendants
+  return {boxes: it.filter(box).length, crystals: it.filter(cr).length + it.filter(i => !box(i) && !cr(i) && jw(i)).length,
+          other: it.filter(i => !box(i) && !cr(i) && !jw(i)).length}; }
 """
+
+# (Juan 2026-10-16) "boxes to me" summon: bag slots (not equipped) of excellent rings / pendants
+JEWEL_SLOTS_JS = """
+(jewels) => (window.__store.playerData.items || []).map((it, i) =>
+    (i >= 12 && i < 76 && it && it.isExcellent && jewels.some(p => p[0] === it.group && p[1] === it.num)) ? i : -1)
+    .filter(i => i >= 0)
+"""
+
+
+def jewel_list():
+    """Rings / pendants that count for the summon hand-over: [[group, num]] (mu_junk.JUNK_JEWELRY)."""
+    return sorted([g, n] for g, n in JK.JUNK_JEWELRY)
 
 # bag slots of Cristal stacks (they ride along with the boxes to the main)
 CRYSTAL_SLOTS_JS = """
@@ -415,6 +436,8 @@ SUMMON_WALK_SEC     = 20        # not on the chosen tile after this long -> pick
 SUMMON_HELPER_HP    = 0.5       # waiting and hp below this share -> MU Helper on (fights back, drinks potions)
 SUMMON_HELPER_OFF_HP = 0.9      # ... off again above this, and back next to the main
 SUMMON_GIVE_CRYSTALS = True     # boxes: Cristales go along (they always end up with the main)
+SUMMON_GIVE_JEWELRY = True      # (Juan 2026-10-16) boxes: excellent rings / pendants in the bag go along too
+                                # (the equipped ones stay on; which items: mu_junk.JUNK_JEWELRY)
 SUMMON_TRADE_TRIES  = 3         # boxes: trade attempts before giving up (until summoned again)
 SUMMON_TRADE_RETRY  = 15        # s between attempts
 SUMMON_TRADE_TIMEOUT = 150      # s for a whole summon trade (you may take a while to accept)
@@ -2849,11 +2872,14 @@ class Agent:
                 time.sleep(1)
                 boxes_left = len(self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or [])
                 self.boxes = boxes_left
-                left = (0 if t.get("kind") == "crystals" else boxes_left) + len(self.give_crystal_slots(t))
+                left = ((0 if t.get("kind") == "crystals" else boxes_left) + len(self.give_crystal_slots(t))
+                        + len(self.give_jewel_slots(t)))
                 before = t.get("before", t["n"])
                 if left < before:
                     return self.trade_end(t, True, f"done, {before - left} item(s) given "
-                                                   f"({t.get('nc', 0)} of them Cristal stacks), {boxes_left} box(es) left")
+                                                   f"({t.get('nc', 0)} of them Cristal stacks"
+                                                   + (f", {t['nj']} rings / pendants" if t.get("nj") else "")
+                                                   + f"), {boxes_left} box(es) left")
                 # both confirmed and nothing moved: most likely his bag had no room
                 self.mark_lead_full(t)
                 return self.trade_end(t, False, "trade window closed, boxes still in my bag")
@@ -2869,23 +2895,31 @@ class Agent:
                 crystals_only = t.get("kind") == "crystals"
                 slots = [] if crystals_only else (self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or [])
                 cry = self.give_crystal_slots(t)
+                jew = self.give_jewel_slots(t)
                 if not slots and not crystals_only:
                     return self.trade_end(t, False, "no boxes in the bag any more")
-                if crystals_only and not cry:
+                if crystals_only and not cry and not jew:
                     self.cry_owed = False
                     return self.trade_end(t, False, "no Cristales in the bag any more")
-                t["before"] = len(slots) + len(cry)
+                t["before"] = len(slots) + len(cry) + len(jew)
                 cap = None if manual else t.get("lead_free")
                 if cap is not None and cap < len(slots) + len(cry):
                     self.log(f"box trade: {t['lead']} has room for {cap} -> giving {cap} of {len(slots) + len(cry)} "
                              f"(boxes first)")
                     slots = slots[:max(1, cap)] if slots else []
                     cry = cry[:max(1 if not slots else 0, cap - len(slots))]
-                t["nc"] = len(cry)
+                if cap is not None:
+                    jew = jew[:max(0, cap - len(slots) - len(cry))]    # rings / pendants last (1 cell each)
+                t["nc"], t["nj"] = len(cry), len(jew)
                 slots = slots + cry
                 t["n"] = len(slots)
-                self.log(f"box trade: putting {len(slots) - len(cry)} box(es)"
-                         + (f" + {len(cry)} Cristal stack(s)" if cry else "") + " in the trade window")
+                slots = slots + jew               # summon trades only (give_jewel_slots)
+                t["n"] = len(slots)
+                if not slots:
+                    return self.trade_end(t, False, f"{t['lead']}'s bag has no room")
+                self.log(f"box trade: putting {len(slots) - len(cry) - len(jew)} box(es)"
+                         + (f" + {len(cry)} Cristal stack(s)" if cry else "")
+                         + (f" + {len(jew)} excellent ring(s) / pendant(s)" if jew else "") + " in the trade window")
                 for slot in slots:     # Inventory (0) -> my trade window (1)
                     for _ in range(8):
                         if not (self.ev(B.TRADE_STATE_JS) or {}).get("busy"):
@@ -2909,6 +2943,13 @@ class Agent:
             return
         if t["phase"] == "confirm" and now - t["phase_at"] > (SUMMON_MANUAL_CONFIRM if manual else 15):
             self.trade_end(t, False, f"{t['lead']} did not confirm")
+
+    def give_jewel_slots(self, t):
+        """(Juan 2026-10-16) "boxes to me" summon: excellent rings / pendants in my bag (never the equipped
+        ones) go to the main too."""
+        if not (SUMMON_GIVE_JEWELRY and t.get("summon")) or t["lead"] != self.hub.trade_to:
+            return []
+        return self.ev(JEWEL_SLOTS_JS, jewel_list()) or []
 
     def give_crystal_slots(self, t):
         """Cristal stacks to hand over in this trade: all of them, but only to the main (TRADE_CRYSTALS)."""
@@ -2948,10 +2989,13 @@ class Agent:
             t["lead_open"], t["lead_boxes"] = False, 0
             return
         takes_cr = TRADE_CRYSTALS and self.name == self.hub.trade_to      # only the main takes Cristales
-        box = self.ev(TRADE_YOURS_JS, [B.KUNDUN_MIN_LVL, list(CRYSTAL_ITEM) if takes_cr else None]) or {}
+        takes_jw = bool(t.get("summon")) and self.name == self.hub.trade_to and SUMMON_GIVE_JEWELRY
+        box = self.ev(TRADE_YOURS_JS, [B.KUNDUN_MIN_LVL, list(CRYSTAL_ITEM) if takes_cr else None,
+                                       jewel_list() if takes_jw else None]) or {}
         if box.get("other"):
             self.log("box trade: something other than Kundun boxes"
-                     + (" / Cristales" if takes_cr else "") + " in the window -> cancelling")
+                     + (" / Cristales" if takes_cr else "") + (" / rings / pendants" if takes_jw else "")
+                     + " in the window -> cancelling")
             self.ev("() => window.__eco.cancelTrade()")
             return self.trade_end(t, False, "unexpected items in the trade window")
         t["lead_open"], t["lead_boxes"] = True, box.get("boxes", 0) + box.get("crystals", 0)
@@ -3140,12 +3184,13 @@ class Agent:
             return
         self.boxes_at = 0
         self.boxes_count()
+        njw = len(self.ev(JEWEL_SLOTS_JS, jewel_list()) or []) if SUMMON_GIVE_JEWELRY else 0
         if self.boxes > 0:
             kind, n = "boxes", self.boxes
-        elif SUMMON_GIVE_CRYSTALS and TRADE_CRYSTALS and self.crystals > 0:
-            kind, n = "crystals", 1
+        elif (SUMMON_GIVE_CRYSTALS and TRADE_CRYSTALS and self.crystals > 0) or njw:
+            kind, n = "crystals", 1          # no boxes: only Cristales and/or rings / pendants
         else:
-            sm["traded"], sm["traded_why"] = True, "no Kundun boxes (or Cristales) to give"
+            sm["traded"], sm["traded_why"] = True, "no Kundun boxes, Cristales or excellent rings / pendants to give"
             return
         if remote:
             link = hub.link
@@ -3174,6 +3219,7 @@ class Agent:
         self.log(f"SUMMON: trading {dest} " + (f"{self.boxes} Box(es) of Kundun ({self.boxes5} +5)" if kind == "boxes"
                                               else f"{self.crystals} Cristales (no boxes)")
                  + (" + my Cristales" if kind == "boxes" and self.crystals and SUMMON_GIVE_CRYSTALS else "")
+                 + (f" + {njw} excellent ring(s) / pendant(s)" if njw else "")
                  + (f" -> you play {dest}: accept and confirm the trade there" if main.get("paused") else ""))
 
     def summon_start(self, e):
@@ -4047,6 +4093,22 @@ class Agent:
         more = f" +{len(items) - 12} more" if len(items) > 12 else ""
         self.log(f"BC ground ({len(items)} within {B.GROUND_RADIUS}): " + "; ".join(parts) + more)
 
+    def bc_weapon_items(self):
+        """Bag items with an Archangel-weapon code, as "slot:group/num/lvl"."""
+        return set(self.ev(BC_WEAPON_BAG_JS, [list(x) for x in B.WEAPON_CODES]) or [])
+
+    def bc_weapon_in_bag(self, b):
+        """(2026-10-16) This castle's weapon in my bag: items with a weapon code that were NOT already there
+        when I entered (a weapon left from an earlier castle, or gear sharing a code, never counts) and that
+        the Archangel didn't refuse (weapon_ignore)."""
+        items = self.bc_weapon_items()
+        if "weapon_base" not in b:
+            b["weapon_base"] = items
+            if items:
+                self.log(f"BC: already carrying {sorted(items)} (weapon code) when the castle starts -> "
+                         "not this castle's weapon, ignoring it")
+        return bool(items - b["weapon_base"] - b.get("weapon_ignore", set()))
+
     def inside(self, b, since_open):
         c, s = self.c, self.c.s
         st = self.ev(B.BC_STATE_JS)
@@ -4091,7 +4153,7 @@ class Agent:
                 elif time.time() - t0 > 4:
                     self.log("BC: weapon left the ground but nothing changed for us -> rescanning")
                     b["pick_try"] = None
-        in_bag = (self.ev(B.WEAPON_INV_JS, [list(x) for x in B.WEAPON_CODES]) or 0) > 0
+        in_bag = self.bc_weapon_in_bag(b)
         has_weapon = in_bag or b.get("we_have")
         if has_weapon:
             if B.BC_USE_HELPER:
@@ -4117,6 +4179,17 @@ class Agent:
             if time.time() - b["talk_at"] > 3:
                 if not in_bag and not b.get("deliver_at"):
                     b["deliver_at"] = time.time()
+                if in_bag:
+                    b["talks"] = b.get("talks", 0) + 1
+                    if b["talks"] > BC_DELIVER_MAX_TALKS:
+                        # (2026-10-16) wizzardo talked to the Archangel for 5 min with an item from an
+                        # earlier castle / a gear item with a weapon code: the Archangel won't take it
+                        left = self.bc_weapon_items()
+                        b.setdefault("weapon_ignore", set()).update(left)
+                        b["talks"], b["we_have"] = 0, False
+                        self.log(f"BC: talked to the Archangel {BC_DELIVER_MAX_TALKS} times and {left} is still "
+                                 "in the bag -> not this castle's weapon, ignoring it and carrying on")
+                        return True
                 b["talk_at"] = time.time()
                 if s.get("helper"):
                     c.set_helper(False)

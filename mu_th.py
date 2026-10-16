@@ -138,15 +138,18 @@ TH_TIMER_JS = r"""
 }
 """
 
-# walkable cells of the current map: [[cx, cy, x, y]] (x, y = a walkable tile in the cell, middle first)
+# walkable cells of the current map: [[cx, cy, x, y]] (x, y = a walkable tile in the cell, middle first).
+# Juan 2026-10-16: safe-zone tiles (terrain flag & 1, the towns) never count - chests don't spawn there, so a
+# cell entirely inside a safe zone is left out and a cell on its edge gets a goal tile outside it.
 TH_CELLS_JS = """(cell) => { const w = window.__world; if (!w || !w.isWalkable) return null;
+  const safe = (x, y) => !!w.getTerrainFlag && (w.getTerrainFlag(x, y) & 1) === 1;
   const n = Math.floor(256 / cell), out = [], offs = [];
   const h = Math.floor(cell / 2), q = Math.max(1, Math.floor(cell / 4));
   offs.push([h, h]);
   for (const a of [q, h, cell - q]) for (const b of [q, h, cell - q]) if (a !== h || b !== h) offs.push([a, b]);
   for (let cx = 0; cx < n; cx++) for (let cy = 0; cy < n; cy++) {
     for (const [dx, dy] of offs) { const x = cx * cell + dx, y = cy * cell + dy;
-      if (x > 2 && y > 2 && x < 253 && y < 253 && w.isWalkable(x, y)) { out.push([cx, cy, x, y]); break; } }
+      if (x > 2 && y > 2 && x < 253 && y < 253 && w.isWalkable(x, y) && !safe(x, y)) { out.push([cx, cy, x, y]); break; } }
   }
   return {map: w.mapIndex, cells: out}; }"""
 
