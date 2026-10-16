@@ -338,6 +338,9 @@ TRADE_BOXES         = True
 TRADE_CRYSTALS      = True    # (Juan 2026-10-15) a box trade with the MAIN (wizzardo) also hands him every Cristal
                               # stack; never to anyone else (the vault keeper only gets boxes)
 CRYSTAL_ITEM        = (14, 31)
+TRADE_CRYSTALS_AT   = 500     # (Juan 2026-10-16) Cristales always end up with the main: a character with this
+                              # many Cristales (or any, right after a box trade with the vault keeper) goes to
+                              # the main and hands him every Cristal stack, without boxes
 TRADE_TO            = None  # character that receives the boxes; None = first account in accounts.json
 TRADE_MEET_RADIUS   = 15    # same map, this close, both leveling -> trade
 TRADE_NEAR          = 3     # the alt walks this close to the main (where he is leveling) and trades there
@@ -608,6 +611,8 @@ class Agent:
         self.bag_low_logged = False
         self.boxes_at = 0
         self.boxes5 = 0              # Boxes of Kundun +5 in the bag (checked with self.boxes)
+        self.crystals = 0            # Cristales in the bag (checked with self.boxes)
+        self.cry_owed = False        # gave boxes to the vault keeper -> my Cristales still go to the main
         self.trade_trip = None       # on the way to the main with boxes: {"since"}
         self.trade_dest = TRADE_TO   # who I'm taking my boxes to (main or vault keeper)
         self.vault = None            # vault keeper: trip to the vault in progress
@@ -972,6 +977,8 @@ class Agent:
                 self.last_status = now
                 self.status()
             return
+        if self.mode != "level" and self.junk:
+            self.junk.join_at = 0                   # (Juan 2026-10-16) back to leveling -> join Cristal stacks now
         self.mode = "level"
         if self.junk:
             try:
@@ -1908,6 +1915,9 @@ class Agent:
             plus5 = self.ev(B.KUNDUN_SLOTS_JS, TRADE_PLUS5_LVL)
             if plus5 is not None:
                 self.boxes5 = len(plus5)
+            cr = self.ev(JK.CRYSTALS_JS, list(CRYSTAL_ITEM))
+            if cr and cr.get("stacks") is not None:
+                self.crystals = sum(x["n"] for x in cr["stacks"])
         return self.boxes
 
     def update_bag_free(self):
@@ -1956,11 +1966,25 @@ class Agent:
         if self.bcs or now < self.trade_next or (s.get("hp") or 0) <= 0 or c.shop_pending \
                 or lvl >= (hub.reset_level or 10 ** 6) or s.get("x") is None:
             return self.trade_trip_end()
-        if self.boxes_count() <= 0 or self.boxes5 < TRADE_MIN_PLUS5 or self.trade_quiet():
+        self.boxes_count()                      # keeps boxes / boxes5 / crystals fresh (published)
+        if self.trade_quiet():
+            return self.trade_trip_end()
+        box_due = self.boxes > 0 and self.boxes5 >= TRADE_MIN_PLUS5
+        cry_due = TRADE_CRYSTALS and self.crystals > 0 and self.name != hub.trade_to \
+            and (self.crystals >= TRADE_CRYSTALS_AT or self.cry_owed)
+        if not box_due and not cry_due:
             return self.trade_trip_end()
         if self.pair_group(hub.snapshot()):
             return self.trade_trip_end()        # carrying / being carried: stays with the pair
-        dest = self.trade_dest = self.trade_target()
+        if box_due and self.trade_target():
+            dest = self.trade_dest = self.trade_target()
+            kind = "boxes"
+        elif not cry_due:
+            return self.trade_trip_end()
+        else:
+            dest = self.trade_dest = hub.trade_to      # Cristales only ever go to the main
+            kind = "crystals"
+        self.trade_kind = kind
         if not dest:
             return self.trade_trip_end()
         lead, remote = self.peer_info(dest)
@@ -1978,7 +2002,8 @@ class Agent:
             return self.trade_travel(lead)
         if remote:
             link = hub.link
-            res = link.trade("start", dest, self.name, fields={"n": self.boxes, "phase": "meet"}) if link else None
+            res = link.trade("start", dest, self.name, fields={"n": self.boxes if kind == "boxes" else 1,
+                                                                 "phase": "meet", "kind": kind}) if link else None
             if not res or not res.get("ok"):
                 if res and res.get("alt"):
                     self.log(f"{res['alt']} is already trading with {dest} -> waiting")
@@ -1987,11 +2012,13 @@ class Agent:
             if hub.trade is not None:
                 return "travel" if self.trade_trip else None
             t = {"alt": self.name, "lead": dest, "phase": "meet", "start": now, "phase_at": now,
-                 "n": self.boxes, "requests": 0, "ok": False, "lead_free": free, "remote": remote}
+                 "n": self.boxes if kind == "boxes" else 1, "kind": kind,
+                 "requests": 0, "ok": False, "lead_free": free, "remote": remote}
             hub.trade = t
         self.trade_trip = None
         self.log(f"met {dest}{' (' + lead.get('machine', '') + ')' if remote else ''} with "
-                 f"{self.boxes} Box(es) of Kundun ({self.boxes5} +5) -> trading right here")
+                 + (f"{self.boxes} Box(es) of Kundun ({self.boxes5} +5)" if kind == "boxes"
+                    else f"{self.crystals} Cristales (no boxes)") + " -> trading right here")
         return t
 
     def peer_info(self, name):
@@ -2013,12 +2040,12 @@ class Agent:
         if need is None or alias is None or lvl < need:
             if now - getattr(self, "travel_logged", 0) > 600:
                 self.travel_logged = now
-                self.log(f"{self.boxes5} Box(es) +5 for {self.trade_dest}, but he is on map {m} "
+                self.log(f"{self.trade_what()} for {self.trade_dest}, but he is on map {m} "
                          f"({alias or '?'}, needs lvl {need or '?'}) -> not reachable from lvl {lvl}, waiting")
             return self.trade_trip_end()
         if not self.trade_trip:
             self.trade_trip = {"since": now}
-            self.log(f"{self.boxes5} Box(es) +5 ({self.boxes} Kundun in all) -> going to {self.trade_dest} "
+            self.log(f"{self.trade_what()} -> going to {self.trade_dest} "
                      f"at {alias} ({lead.get('x')}, {lead.get('y')})")
         elif now - self.trade_trip["since"] > TRADE_TRAVEL_SEC:
             self.log(f"could not reach {self.trade_dest} in {TRADE_TRAVEL_SEC}s -> back to leveling, "
@@ -2027,6 +2054,11 @@ class Agent:
             return self.trade_trip_end()
         self.go(m, alias, int(lead["x"]), int(lead["y"]), radius=max(TRADE_NEAR, TRADE_MEET_RADIUS - 5))
         return "travel"
+
+    def trade_what(self):
+        if getattr(self, "trade_kind", "boxes") == "crystals":
+            return f"{self.crystals} Cristales" + (" (after giving boxes to the keeper)" if self.cry_owed else "")
+        return f"{self.boxes5} Box(es) +5 ({self.boxes} Kundun in all)"
 
     def trade_trip_end(self, why=None):
         if self.trade_trip:
@@ -2531,6 +2563,11 @@ class Agent:
             if t.get("ok"):
                 self.trade_fails = 0
                 self.trade_next = now + 60
+                if t["lead"] == self.hub.trade_to:
+                    self.cry_owed = False                 # the main got my Cristales
+                elif TRADE_CRYSTALS and t["lead"] == VAULT_KEEPER:
+                    self.cry_owed = True                  # boxes to the keeper -> Cristales to the main next
+                    self.trade_next = now + 5
             else:
                 self.trade_fails += 1
                 wait = TRADE_GIVEUP_SEC if self.trade_fails >= TRADE_MAX_FAILS else TRADE_RETRY_SEC
@@ -2597,7 +2634,7 @@ class Agent:
             t = hub.trade
             if t is None and self.name in self.receivers():
                 t = self.remote_trade_for_me()
-            if t is None and self.name not in self.receivers():
+            if t is None and self.name != hub.trade_to:      # the keeper gives his Cristales to the main too
                 t = self.maybe_start_trade()
                 if t == "travel":
                     self.mode = "trade"
@@ -2687,7 +2724,7 @@ class Agent:
                 time.sleep(1)
                 boxes_left = len(self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or [])
                 self.boxes = boxes_left
-                left = boxes_left + len(self.give_crystal_slots(t))
+                left = (0 if t.get("kind") == "crystals" else boxes_left) + len(self.give_crystal_slots(t))
                 before = t.get("before", t["n"])
                 if left < before:
                     return self.trade_end(t, True, f"done, {before - left} item(s) given "
@@ -2704,17 +2741,21 @@ class Agent:
                                              "not trading with someone else")
                 return
             if not self.trade_filled:
-                slots = self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or []
-                if not slots:
-                    return self.trade_end(t, False, "no boxes in the bag any more")
+                crystals_only = t.get("kind") == "crystals"
+                slots = [] if crystals_only else (self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or [])
                 cry = self.give_crystal_slots(t)
+                if not slots and not crystals_only:
+                    return self.trade_end(t, False, "no boxes in the bag any more")
+                if crystals_only and not cry:
+                    self.cry_owed = False
+                    return self.trade_end(t, False, "no Cristales in the bag any more")
                 t["before"] = len(slots) + len(cry)
                 cap = t.get("lead_free")
                 if cap is not None and cap < len(slots) + len(cry):
                     self.log(f"box trade: {t['lead']} has room for {cap} -> giving {cap} of {len(slots) + len(cry)} "
                              f"(boxes first)")
-                    slots = slots[:max(1, cap)]
-                    cry = cry[:max(0, cap - len(slots))]
+                    slots = slots[:max(1, cap)] if slots else []
+                    cry = cry[:max(1 if not slots else 0, cap - len(slots))]
                 t["nc"] = len(cry)
                 slots = slots + cry
                 t["n"] = len(slots)
@@ -2733,7 +2774,7 @@ class Agent:
             # the safety check: confirm only when the MAIN sees exactly my boxes (+ Cristales) in his window
             if st.get("mine", 0) >= t["n"] and t.get("lead_boxes", 0) >= t["n"]:
                 time.sleep(0.5)
-                self.log(f"box trade: {t['lead']} sees my {t['n']} box(es) -> confirming")
+                self.log(f"box trade: {t['lead']} sees my {t['n']} item(s) -> confirming")
                 self.ev("() => window.__eco.setMyConfirm(true)")
                 self.trade_phase(t, "confirm")
             elif now - t.get("filled_at", now) > 12:

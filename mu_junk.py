@@ -23,7 +23,8 @@ Getting rid of junk (Juan 2026-10-15). Two parts, both per character, only while
          Items at +CRYST_MAX_LVL+1 or higher are kept too (fusion material, see the guide).
          Juan 2026-10-16: the end-game exception only holds from +CRYST_KEEP_FROM (7) up; excellent
          end-game gear below +7 is crystallized too. Excellent rings / pendants are always kept.
-1b. JOIN  every JOIN_EVERY s while leveling, small Cristal stacks in the bag are joined (/dividir).
+1b. JOIN  right when a character goes (back) to leveling, then every JOIN_EVERY s, small Cristal stacks in
+         the bag are joined (picked up and dropped on each other, like a player does).
          The trip waits while an event / trade / Blood Castle is on (mu_auto_bot.trade_quiet) and
          is forgotten CRYST_DUE_SEC after the hunt.
 
@@ -74,7 +75,7 @@ CRYST_KEEP_FROM  = 7         # (Juan 2026-10-16) CRYST_KEEP (end-game gear) is o
                              # below +7 ("-7") is crystallized even if it's top gear. Excellent rings / pendants
                              # are always kept (only gear groups 0-11 ever go to the Alquimista).
 JOIN_ENABLED     = True      # (Juan 2026-10-16) join small Cristal stacks in the bag while leveling
-JOIN_EVERY       = 300       # seconds between looks at the Cristal stacks (one /dividir per tick when joining)
+JOIN_EVERY       = 300       # seconds between looks at the Cristal stacks (one join per tick when joining)
 ALCHEMIST_NPC    = 693       # npcType of the Alquimista
 ALCHEMIST_MAP    = (3, "Noria")
 ALCHEMIST_NEAR   = (180, 102)    # the Chaos Goblin's Chaos Machine (guide); the Alquimista stands next to it
@@ -206,6 +207,37 @@ SPLIT_JS = """
 """
 
 
+# join two Cristal stacks the way a player does: pick one stack up and drop it on the other
+# (server: "dropping a stack on an identical one joins them"). "/dividir" only splits into an EMPTY cell --
+# onto an occupied one the server ignores it (every join attempt 2026-10-15/16 showed "no change").
+MERGE_JS = """
+([from, to]) => { const s = window.__store;
+  if (!s || s.pickedItem || s.pendingItemMove) return 'busy';
+  const items = s.playerData.items || [];
+  if (!items[from] || !items[to]) return 'slot empty';
+  s.pickInventoryItem(from);
+  if (!s.pickedItem) return 'could not pick it up';
+  s.placePickedItem(to, 0);
+  return s.pendingItemMove ? 'sent' : (s.pickedItem ? 'still in hand' : 'done');
+}
+"""
+
+CANCEL_PICK_JS = "() => { const s = window.__store; if (s && s.pickedItem && !s.pendingItemMove) { s.cancelPickedItem(); return true; } return false; }"
+
+
+def join_pair(stacks):
+    """(src, dst) for the next join, or None. Prefer a pair that fits in one stack (smallest onto the biggest
+    open stack it fits on); otherwise the smallest onto the biggest open one (the server fills up to 255)."""
+    open_ = sorted([x for x in stacks if x["n"] < CRYST_STACK_MAX], key=lambda x: (-x["n"], x["slot"]))
+    if len(open_) < 2:
+        return None
+    src = open_[-1]
+    for dst in open_[:-1]:
+        if dst["n"] + src["n"] <= CRYST_STACK_MAX:
+            return src, dst
+    return src, open_[0]
+
+
 def describe(items, limit=8):
     s = ", ".join(f"{i['g']}/{i['n']} +{i['lvl']}" for i in items[:limit])
     return s + (f" +{len(items) - limit} more" if len(items) > limit else "")
@@ -228,6 +260,7 @@ class Junk:
         self.trip = None
         self.join_at = 0             # Cristal stack joining while leveling
         self.join = None             # {"sig", "at", "stuck", "n"} while joining
+        self.hand_since = None       # a stack picked up for joining is still in hand since
 
     def log(self, msg):
         self.a.log("JUNK: " + msg)
@@ -304,7 +337,7 @@ class Junk:
         if self.last_drop:
             return                                   # a drop is waiting for its answer
         b = self.ev(CRYSTALS_JS, list(CRYST_ITEM)) or {}
-        if b.get("pending") or b.get("picked"):
+        if self.hand_stuck(b, now):
             return
         stacks = b.get("stacks") or []
         sig = tuple(sorted((x["slot"], x["n"]) for x in stacks))
@@ -313,8 +346,8 @@ class Junk:
                 return                               # the server hasn't answered the last move yet
             if j["sig"] == sig:
                 j["stuck"] += 1
-        open_ = sorted([x for x in stacks if x["n"] < CRYST_STACK_MAX], key=lambda x: (-x["n"], x["slot"]))
-        if len(open_) < 2 or (j and (j["stuck"] >= 3 or j["n"] >= 40)):
+        pair = join_pair(stacks)
+        if pair is None or (j and (j["stuck"] >= 3 or j["n"] >= 40)):
             if j is not None:
                 full = sum(1 for x in stacks if x["n"] >= CRYST_STACK_MAX)
                 self.log(f"Cristales joined: {sum(x['n'] for x in stacks)} in {len(stacks)} stack(s), {full} full"
@@ -323,11 +356,27 @@ class Junk:
             return
         if j is None:
             j = self.join = {"sig": None, "at": 0, "stuck": 0, "n": 0}
-            self.log(f"joining Cristales: {len(open_)} stacks not full ({', '.join(str(x['n']) for x in open_)})")
-        dst, src = open_[0], open_[-1]
-        k = min(src["n"], CRYST_STACK_MAX - dst["n"])
-        self.ev(SPLIT_JS, [src["slot"], dst["slot"], k])
+            open_ = [x["n"] for x in stacks if x["n"] < CRYST_STACK_MAX]
+            self.log(f"joining Cristales: {len(open_)} stacks not full ({', '.join(map(str, sorted(open_, reverse=True)))})")
+        src, dst = pair
+        r = self.ev(MERGE_JS, [src["slot"], dst["slot"]])
+        if j["n"] < 10:
+            self.log(f"Cristales: stack of {src['n']} (slot {src['slot']}) -> onto {dst['n']} (slot {dst['slot']}): {r}")
         j["sig"], j["at"], j["n"] = sig, now, j["n"] + 1
+
+    def hand_stuck(self, b, now):
+        """True while an item move is pending / a stack is in hand. A stack left in hand for more than
+        5 s (the server refused the drop) is put back."""
+        if not (b.get("pending") or b.get("picked")):
+            self.hand_since = None
+            return False
+        if b.get("picked") and not b.get("pending"):
+            self.hand_since = self.hand_since or now
+            if now - self.hand_since > 5:
+                self.ev(CANCEL_PICK_JS)
+                self.log("Cristales: a stack stayed in hand -> put back")
+                self.hand_since = None
+        return True
 
     # ── part 2: crystallize at the Alquimista ──
     def tick(self):
@@ -531,7 +580,7 @@ class Junk:
         client sends when you lay pieces of a stack on another) moves `count` pieces onto the other stack.
         Fill the biggest stack that isn't full (255 = the count is one byte) from the smallest one."""
         b = self.ev(CRYSTALS_JS, list(CRYST_ITEM)) or {}
-        if b.get("pending") or b.get("picked"):
+        if self.hand_stuck(b, now):
             return True
         stacks = b.get("stacks") or []
         sig = tuple(sorted((x["slot"], x["n"]) for x in stacks))
@@ -540,19 +589,18 @@ class Junk:
         if t.get("join_sig") == sig and t.get("join_sent"):
             t["join_stuck"] = t.get("join_stuck", 0) + 1
         t["join_sent"] = False
-        open_ = sorted([x for x in stacks if x["n"] < CRYST_STACK_MAX], key=lambda x: (-x["n"], x["slot"]))
-        if len(open_) < 2 or t.get("join_stuck", 0) >= 3 or now - t["phase_at"] > 60:
+        pair = join_pair(stacks)
+        if pair is None or t.get("join_stuck", 0) >= 3 or now - t["phase_at"] > 60:
             full = sum(1 for x in stacks if x["n"] >= CRYST_STACK_MAX)
             extra = " (joining stopped: no change from the server)" if t.get("join_stuck", 0) >= 3 else ""
             return self.end(f"{t['items']} item(s) crystallized; Cristales in the bag: {sum(x['n'] for x in stacks)} "
                             f"in {len(stacks)} stack(s), {full} full{extra}", ok=True)
-        dst, src = open_[0], open_[-1]
-        k = min(src["n"], CRYST_STACK_MAX - dst["n"])
-        r = self.ev(SPLIT_JS, [src["slot"], dst["slot"], k])
+        src, dst = pair
+        r = self.ev(MERGE_JS, [src["slot"], dst["slot"]])
         t["join_sig"], t["move_at"], t["join_sent"] = sig, now, True
         t["joins"] = t.get("joins", 0) + 1
         if t["joins"] <= 10:
-            self.log(f"Cristales: /dividir {src['slot']} {dst['slot']} {k} ({src['n']} -> onto {dst['n']}): {r}")
+            self.log(f"Cristales: stack of {src['n']} (slot {src['slot']}) -> onto {dst['n']} (slot {dst['slot']}): {r}")
         return True
 
     def end(self, why, ok, retry=None):
