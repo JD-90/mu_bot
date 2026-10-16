@@ -88,6 +88,30 @@ TH_MAPS = {
     "Atlans":     (7, ["Atlans", "Atlans2"], 70),
     "Tarkan":     (8, ["Tarkan", "Tarkan2"], 140),
 }
+# Warp points on maps that have several (Juan 2026-10-16): our hunters are spread over them in roster
+# order (both machines work out the same thing): every non-town point once, then town (its landing is in
+# the safe zone and chests don't spawn there, but they do just outside), then the non-town points again.
+# A point the character's level can't use -> its next one. Each hunter searches the part of the map
+# closest to where it landed (hunters sharing a point split that part in slices around it).
+# (alias, min level from the warp window, landing (x, y) seen in the logs or None = learned on the first warp)
+TH_SPREAD        = True
+TH_ASSIGN_WAIT   = 4         # seconds after the hunt starts before warping (the others join within ~3 s)
+TH_NEAR_POINT    = 30        # already on the map within this many tiles of my point -> no /move
+TH_POINT_TRIES   = 2         # /move tries to my point before falling back to the map's town alias
+TH_WARP_POINTS = {
+    "Devias":     {"points": [("Devias2", 20, (24, 25)), ("Devias3", 20, (225, 228)), ("Devias4", 20, (70, 179))],
+                   "town": ("Devias", 20, (215, 35))},
+    "Atlans":     {"points": [("Atlans2", 80, (226, 51)), ("Atlans3", 90, None)],
+                   "town": ("Atlans", 70, (22, 15))},
+    "Tarkan":     {"points": [("Tarkan2", 140, None)],
+                   "town": ("Tarkan", 140, (190, 64))},
+    "Dungeon":    {"points": [("Dungeon2", 40, None), ("Dungeon3", 50, None)],
+                   "town": ("Dungeon", 30, None)},
+    "Lost Tower": {"points": [("LostTower2", 50, None), ("LostTower3", 50, None), ("LostTower4", 60, None),
+                              ("LostTower5", 60, None), ("LostTower6", 70, None), ("LostTower7", 70, None)],
+                   "town": ("LostTower", 50, None)},
+}
+TH_WARPS_FILE    = G.BASE_DIR / "th_warps.json"   # landings learned for points with None above
 # ──────────────────────────────────────────────────────────────────
 
 # Event panel row: "Treasure1:44:14" / "Treasure00:02" (countdown), "TreasureActive 09:59", "TreasureLorencia 04:59"
@@ -311,6 +335,90 @@ def split_sectors(cells, names):
     return {name: {(c[0], c[1]) for c in order[i * n // k:(i + 1) * n // k]} for i, name in enumerate(names)}
 
 
+def learned_landings():
+    try:
+        return {k: tuple(v) for k, v in json.loads(TH_WARPS_FILE.read_text(encoding="utf-8")).items()}
+    except Exception:
+        return {}
+
+
+def save_landing(alias, xy):
+    d = learned_landings()
+    d[alias] = tuple(xy)
+    try:
+        TH_WARPS_FILE.write_text(json.dumps({k: list(v) for k, v in sorted(d.items())}, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def point_anchor(alias, cfg_xy, learned=None):
+    if cfg_xy:
+        return tuple(cfg_xy)
+    return (learned if learned is not None else learned_landings()).get(alias)
+
+
+def assign_points(map_name, names, levels):
+    """Roster-ordered hunters -> {name: (alias, anchor or None)}. Order of points handed out: every non-town
+    point, town, then the non-town points again (round robin); a point above a hunter's level is skipped for
+    that hunter (it takes the next one it can use, town last)."""
+    w = TH_WARP_POINTS.get(map_name)
+    if not w:
+        return {}
+    learned = learned_landings()
+    pts = w["points"]
+    seq = list(pts) + [w["town"]] + list(pts) * max(1, len(names))
+    used = [False] * len(seq)
+    out = {}
+    for n in names:
+        lvl = levels.get(n)
+        pick = None
+        for i, (al, need, xy) in enumerate(seq):
+            if not used[i] and (lvl is None or lvl >= need):
+                pick = i
+                break
+        if pick is None:
+            al, need, xy = w["town"]
+        else:
+            used[pick] = True
+            al, need, xy = seq[pick]
+        out[n] = (al, point_anchor(al, xy, learned))
+    return out
+
+
+def split_by_points(cells, names, assign):
+    """Each cell goes to the nearest landing point among the hunters' points; hunters sharing a point
+    split its part in pie slices around it. Hunters whose point has no known landing share pie slices
+    of the whole map (old behaviour). Returns {name: set((cx, cy))}."""
+    anchors = {}
+    for n in names:
+        a = (assign.get(n) or (None, None))[1]
+        if a:
+            anchors.setdefault(tuple(a), []).append(n)
+    lost = [n for n in names if not (assign.get(n) or (None, None))[1]]
+    if not anchors:
+        return split_sectors(cells, names)
+    groups = {a: [] for a in anchors}
+    for c in cells:
+        a = min(anchors, key=lambda p: (math.hypot(c[2] - p[0], c[3] - p[1]), p))
+        groups[a].append(c)
+    out = {}
+    for a, who in anchors.items():
+        part = groups[a]
+        if len(who) == 1:
+            out[who[0]] = {(c[0], c[1]) for c in part}
+            continue
+        def key(c, a=a):
+            return (round(math.atan2(c[3] - a[1], c[2] - a[0]) % (2 * math.pi), 6),
+                    math.hypot(c[2] - a[0], c[3] - a[1]), c[0], c[1])
+        order = sorted(part, key=key)
+        n, k = len(order), len(who)
+        for i, name in enumerate(who):
+            out[name] = {(c[0], c[1]) for c in order[i * n // k:(i + 1) * n // k]}
+    if lost:
+        out.update(split_sectors(cells, lost))
+    return out
+
+
 class TreasureHunt:
     """One per character. tick() returns True while the Treasure Hunt owns the character."""
 
@@ -452,6 +560,8 @@ class TreasureHunt:
         self.goal_best = 1e9
         self.goal_progress_at = 0
         self.arrived_at = None
+        self.point = None            # (alias, anchor) my warp point (TH_WARP_POINTS)
+        self.assign = {}
         install = self.ev(TH_INSTALL_JS, self.cfg())
         self.log(f"=== TREASURE HUNT in {self.map_name} -> going (was {a.mode}; chest loop {install}) ===")
         c.set_helper(False)
@@ -522,12 +632,18 @@ class TreasureHunt:
             return self.finish(f"safety cap ({TH_MAX_SEC} s)")
         if dead:
             return True
-        if s.get("map") != self.map_idx:
+        if self.point is None and TH_SPREAD and self.map_name in TH_WARP_POINTS:
+            if now - self.started < TH_ASSIGN_WAIT:
+                return True                          # let the others join first (same assignment everywhere)
+            self.pick_point()
+        if s.get("map") != self.map_idx or self.wants_point_warp(s):
             self.travel(s, now)
         else:
             if self.arrived_at is None:
                 self.arrived_at = now
-                self.log(f"on {self.map_name} {int(now - self.started)} s after leaving, at ({s.get('x')},{s.get('y')})")
+                self.log(f"on {self.map_name} {int(now - self.started)} s after leaving, at ({s.get('x')},{s.get('y')})"
+                         + (f" (point {self.point[0]})" if self.point else ""))
+                self.learn_landing(s)
             if mode == "search":
                 self.search_step(s, now)
             else:
@@ -545,7 +661,15 @@ class TreasureHunt:
             return
         if self.warp_tries >= TH_WARP_TRIES:
             return self.finish(f"could not /move to {self.map_name} after {self.warp_tries} tries")
-        alias = self.aliases[min(self.warp_tries, len(self.aliases) - 1)]
+        if self.point and self.warp_tries < TH_POINT_TRIES:
+            alias = self.point[0]
+        else:
+            k = self.warp_tries - (TH_POINT_TRIES if self.point else 0)
+            alias = self.aliases[min(max(k, 0), len(self.aliases) - 1)]
+            if self.point and k == 0:
+                self.log(f"/move {self.point[0]} didn't work -> town alias instead")
+                self.point_failed = True
+        self.warp_alias = alias
         self.warp_tries += 1
         self.log(f"/move {alias} (try {self.warp_tries})")
         c = self.c
@@ -555,6 +679,55 @@ class TreasureHunt:
         self.last_warp = now
         c.walk_target = None
         self.goal = None
+
+    # ── warp points (TH_WARP_POINTS) ──
+    def hunter_levels(self, names):
+        a, hub = self.a, self.a.hub
+        snap = {n.lower(): v for n, v in hub.snapshot().items()}
+        rem = {}
+        link = getattr(hub, "link", None)
+        if link:
+            try:
+                rem = {n.lower(): v for n, v in (link.remote() or {}).items()}
+            except Exception:
+                rem = {}
+        out = {}
+        for n in names:
+            v = snap.get(n.lower()) or rem.get(n.lower()) or {}
+            out[n] = v.get("level")
+        out[a.name] = self.c.s.get("level") or out.get(a.name)
+        return out
+
+    def pick_point(self):
+        names = self.hunters()
+        self.assign = assign_points(self.map_name, names, self.hunter_levels(names))
+        self.point = self.assign.get(self.a.name) or (None, None)
+        self.point_failed = False
+        self.sector = None                           # recomputed around the points
+        self.log(f"warp points: " + ", ".join(f"{n} {p[0]}" for n, p in self.assign.items()) + f" -> me: {self.point[0]}")
+
+    def wants_point_warp(self, s):
+        """Already on the treasure map but far from my point -> /move to it once (before the hunt search)."""
+        if not self.point or not self.point[0] or self.arrived_at is not None or getattr(self, "point_failed", False):
+            return False
+        if self.warp_tries:                          # I warped already: arrived is decided by the map index
+            return False
+        anc = self.point[1]
+        if anc is None or s.get("x") is None:
+            return False
+        if math.hypot(s["x"] - anc[0], s["y"] - anc[1]) <= TH_NEAR_POINT:
+            return False
+        return True
+
+    def learn_landing(self, s):
+        al = getattr(self, "warp_alias", None)
+        if not al or s.get("x") is None or not self.point or al != self.point[0] or self.point[1]:
+            return
+        save_landing(al, (s["x"], s["y"]))
+        self.point = (al, (s["x"], s["y"]))
+        self.assign[self.a.name] = self.point
+        self.sector = None
+        self.log(f"learned the landing of /move {al}: ({s['x']},{s['y']}) -> {TH_WARPS_FILE.name}")
 
     # ── who is in the hunt -> my slice of the map ──
     def hunters(self):
@@ -604,8 +777,15 @@ class TreasureHunt:
             _CELLS[k] = [tuple(x) for x in r["cells"]]
         cells = _CELLS[k]
         names = self.hunters()
-        if names != self.sector_names:
-            sec = split_sectors(cells, names).get(self.a.name) or set()
+        if names != self.sector_names or self.sector is None:
+            if self.assign:
+                for n in names:                      # someone who joined late: give it a point too
+                    if n not in self.assign:
+                        self.assign[n] = assign_points(self.map_name, names, self.hunter_levels(names)).get(n) \
+                            or (None, None)
+                sec = split_by_points(cells, names, self.assign).get(self.a.name) or set()
+            else:
+                sec = split_sectors(cells, names).get(self.a.name) or set()
             self.log(f"slice: {len(sec)} of {len(cells)} cells, hunters {', '.join(names)}")
             self.sector, self.sector_names = sec, names
             self.goal = None

@@ -29,3 +29,13 @@
 {"t": "2026-10-16T07:41:03", "map": "Tarkan", "map_idx": 8, "by": "cucaracha", "id": 908, "x": 159, "y": 106, "event": "broken", "mine": true}
 {"t": "2026-10-16T07:44:39", "map": "Tarkan", "map_idx": 8, "by": "wizzardo", "id": 932, "x": 135, "y": 65, "d": 27, "event": "seen"}
 {"t": "2026-10-16T07:44:45", "map": "Tarkan", "map_idx": 8, "by": "wizzardo", "id": 932, "x": 135, "y": 65, "event": "broken", "mine": true}
+{"t": "2026-10-16T10:41:36", "map": "Tarkan", "map_idx": 8, "by": "bruto", "id": 963, "x": 164, "y": 186, "d": 33, "event": "seen"}
+{"t": "2026-10-16T10:41:44", "map": "Tarkan", "map_idx": 8, "by": "bruto", "id": 963, "x": 164, "y": 186, "event": "broken", "mine": false, "killer": 951}
+{"t": "2026-10-16T10:42:36", "map": "Tarkan", "map_idx": 8, "by": "cucaracha", "id": 940, "x": 52, "y": 235, "d": 30, "event": "seen"}
+{"t": "2026-10-16T10:42:36", "map": "Tarkan", "map_idx": 8, "by": "cucaracha", "id": 940, "x": 52, "y": 235, "event": "broken", "mine": false, "killer": 881}
+{"t": "2026-10-16T10:43:48", "map": "Tarkan", "map_idx": 8, "by": "bruto", "id": 949, "x": 119, "y": 81, "d": 23, "event": "seen"}
+{"t": "2026-10-16T10:43:54", "map": "Tarkan", "map_idx": 8, "by": "bruto", "id": 949, "x": 119, "y": 81, "event": "broken", "mine": true}
+{"t": "2026-10-16T10:44:00", "map": "Tarkan", "map_idx": 8, "by": "bruto", "id": 879, "x": 113, "y": 85, "d": 8, "event": "seen"}
+{"t": "2026-10-16T10:44:02", "map": "Tarkan", "map_idx": 8, "by": "bruto", "id": 879, "x": 113, "y": 85, "event": "broken", "mine": true}
+{"t": "2026-10-16T10:44:13", "map": "Tarkan", "map_idx": 8, "by": "cucaracha", "id": 957, "x": 74, "y": 57, "d": 30, "event": "seen"}
+{"t": "2026-10-16T10:44:21", "map": "Tarkan", "map_idx": 8, "by": "cucaracha", "id": 957, "x": 74, "y": 57, "event": "broken", "mine": true}

@@ -649,7 +649,7 @@ GI_INSTALL_JS = r"""
     if (isPlayer && !G.legal(target.name, now) && (caution || (defense && cfg.selfDefOnly && target !== clearT))) {
       const k = 'no-sd:' + target.name;
       if (G.lastGate !== k) { G.lastGate = k; ev(`not attacking ${target.name}: no self-defense against him` + (outlaw ? ' (I am outlaw)' : '')); }
-      target = dragon || null; why = dragon ? 'dragon' : ''; isPlayer = false;
+      target = dragon || goldens[0] || null; why = target ? (dragon ? 'dragon' : 'golden') : ''; isPlayer = false;
     }
     if (cfg.refreshSkill && (isPlayer || players.some(x => x.d <= cfg.pvpRadius))
         && now - (G.buffAt[cfg.refreshSkill] || 0) > cfg.refreshMs) {
