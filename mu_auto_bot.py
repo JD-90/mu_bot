@@ -3034,8 +3034,9 @@ class Agent:
             return True
         # another map: /move there (if my level allows it)
         if s.get("map") != m:
-            alias, need, lvl = MAP_ALIAS.get(m), WARP_MIN_LEVEL.get(m), s.get("level") or 0
-            if in_bc(m) or alias is None or need is None or lvl < need:
+            lvl = s.get("level") or 0
+            alias, need = self.summon_warp(m, mx, my, lvl, sm.get("warp_tries", 0))
+            if in_bc(m) or alias is None:
                 if now - sm.get("warp_logged", 0) > 60:
                     sm["warp_logged"] = now
                     self.log(f"SUMMON: {main_name} is on map {m} ({alias or '?'}) -> I can't /move there "
@@ -3043,8 +3044,12 @@ class Agent:
                 c.walk_target = None
                 return True
             sm["state"], sm["spot"] = "go", None
+            if time.time() - c.last_warp > 15:               # go() sends the /move now: count the try
+                sm["warp_tries"] = sm.get("warp_tries", 0) + 1
+                self.log(f"SUMMON: /move {alias} -> {main_name} at ({mx}, {my})")
             self.go(m, alias, mx, my, radius=SUMMON_DIST[1] + 3)
             return True
+        sm["warp_tries"] = 0
         d_main = dist(s, mx, my)
         if sm["state"] == "stand":
             if d_main > sm["follow"]:                   # he walked off: after a moment, walk up to him again
@@ -3063,7 +3068,8 @@ class Agent:
             spot = sm["spot"] = self.summon_pick_spot(m, mx, my)
             sm["spot_at"] = now
         far = d_main > 30
-        if self.go(m, MAP_ALIAS.get(m) if far else None, spot[1], spot[2], radius=0.9):
+        if self.go(m, self.summon_warp(m, mx, my, s.get("level") or 0)[0] if far else None, spot[1], spot[2],
+                   radius=0.9):
             sm["state"] = "stand"
             sm["follow"] = random.uniform(*SUMMON_FOLLOW)
             if not sm["arrived"]:
@@ -3071,6 +3077,28 @@ class Agent:
                 self.log(f"SUMMON: next to {main_name} ({int(dist(s, mx, my))} tiles) after "
                          f"{int(now - sm['since'])} s -> waiting" + (", then the boxes" if sm["kind"] == "boxes" else ""))
         return True
+
+    def summon_warp(self, m, mx, my, lvl, tries=0):
+        """/move alias toward the main on map m, or (None, min level). Every map we know a /move for: the
+        leveling maps (ROUTE) plus the town maps of the Treasure Hunt / Big Boss tables (Noria, Dungeon,
+        Lost Tower, Atlans, Tarkan...). Several aliases (Devias 1-4, Atlans 1-3, Tarkan 1-2): the landing
+        closest to him first; a /move that didn't take (tries) -> the next one."""
+        need, first, rest = WARP_MIN_LEVEL.get(m), [], [MAP_ALIAS[m]] if m in MAP_ALIAS else []
+        for name, (idx, al, lv) in list(getattr(TH, "TH_MAPS", {}).items()) + list(getattr(BB, "BB_MAPS", {}).items()):
+            if idx != m:
+                continue
+            need = lv if need is None else min(need, lv)
+            entries = getattr(BB, "BB_MAP_ENTRIES", {}).get(name)
+            if entries and not first:       # known landings: the one closest to him first
+                first = [a for a, xy in sorted(entries, key=lambda e: math.hypot(e[1][0] - mx, e[1][1] - my))]
+            rest += list(al)
+        aliases = []
+        for a in first + rest:
+            if a not in aliases:
+                aliases.append(a)
+        if not aliases or need is None or lvl < need:
+            return None, need
+        return aliases[(tries // 2) % len(aliases)], need
 
     def summon_pick_spot(self, m, mx, my):
         """(map, x, y): a random walkable tile 1-3 tiles from the main, away from our others."""
