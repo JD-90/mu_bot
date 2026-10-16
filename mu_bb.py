@@ -48,14 +48,14 @@ BB_LOOT_SEC      = 3         # after the kill: loot at least this long ...
 BB_LOOT_MAX      = 30        # ... and keep looting while anything of the boss's is on the ground, up to this long
 BB_LOOT_EMPTY    = 2         # ... done once the ground around the corpse has been empty this long
 BB_PICK_REPEAT_MS = 80       # ask for the same item again after this long (every item, every loop turn)
-BB_PICK_PER_TURN = 2         # pickup requests per loop turn (BB_LOOP_MS) at most, best first
+BB_PICK_PER_TURN = 1         # pickup requests per loop turn (BB_LOOP_MS) at most, best first
 BB_LIMIT_LOOT    = True      # (Juan 2026-10-16, feature flag) don't take everything off the corpse; False = v4, all grab all:
-BB_LOOTERS       = 4         # ... only this many of our party loot each boss (picked from the boss's id + the party,
+BB_LOOTERS       = 5         # ... only this many of our party loot each boss (picked from the boss's id + the party,
                              #     so every machine agrees without talking); no party -> 3 in 5 chance
-BB_SKIP_CHANCE   = 0.2       # ... a looter ignores each item with this chance (decided once per item)
+BB_SKIP_CHANCE   = 0.3       # ... a looter ignores each item with this chance (decided once per item)
 BB_VALUABLE_ONLY = True      # ... only rings / pendants and Box of Kundun +5, nothing else
                              # (Space is not pressed while this is on: it would grab whatever is nearest)
-BB_SPACE_SPAM    = True      # also press Space while looting (Juan 2026-10-15) ...
+BB_SPACE_SPAM    = False      # also press Space while looting (Juan 2026-10-15) ...
 BB_SPACE_EVERY   = 0.1       # ... this often (s)
 # rings and pendants (group 13): Ring of Ice 8, Poison 9, Pendant of Lightning 12, Fire 13, Ring of Fire 21,
 # Earth 22, Wind 23, Magic 24, Pendant of Ice 25, Wind 26, Water 27, Ability 28 (99B item list; 13/9, 13/12 and
@@ -83,7 +83,7 @@ BB_BUFFS         = [16, 48]  # Soul Barrier (mages) / Greater Fortitude (knights
 BB_SKILLS        = {}        # fixed skill per character (lower-case name -> skill number)
 BB_SHOW_WINDOW   = True      # restore the window during the boss (minimized windows cast much slower, see GI)
 BB_RECORD        = True      # record with mu_recorder while the boss runs (first runs: data for tuning)
-BB_LOOP_MS       = 50
+BB_LOOP_MS       = 200
 BB_BOSS_TYPE     = 694       # Balrog Colosal
 BB_WALK_EVERY    = 2.0       # seconds between walk orders toward the boss while travelling
 BB_WARP_IF_FARTHER = 70      # on the boss map but further than this -> /move to the town first
