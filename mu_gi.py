@@ -1580,6 +1580,14 @@ class GoldenInvasion:
                      + (" | closing in" if status.get("closing") else "")
                      + (f" | dragon ~{status.get('eta')} s left, {status.get('hitters')} other(s) hitting it" if status.get('eta') is not None else ""))
 
+    def walk_once(self, xy, now):
+        """Repeat a walk target sparingly to avoid client re-pathing and rubber-banding."""
+        xy = [int(xy[0]), int(xy[1])]
+        if getattr(self, "walk_last", None) == xy and now - getattr(self, "walk_last_at", 0) < GI_WALK_REPEAT_SEC:
+            return
+        self.walk_last, self.walk_last_at = xy, now
+        self.ev(B.WALK_JS, xy)
+
     def pk_wait(self, pk, now):
         """Seconds until /pkclear can work: the server's own count if it told us one, else GI_PKCLEAR_WAIT_SEC
         after the last kill we noticed."""
