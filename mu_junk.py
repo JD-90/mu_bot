@@ -56,6 +56,9 @@ JUNK_JEWELRY     = {(13, n) for n in (8, 9, 12, 13, 21, 22, 23, 24, 25, 26, 27, 
                                          # Wind/Magic, Pendant of Ice/Wind/Water/Ability. NOT: Wizard ring (13/20),
                                          # Transformation rings, event rings
 JUNK_NEVER       = {(4, 7), (4, 15)} | set(B.WEAPON_CODES)   # bolts, arrows, Blood Castle quest weapon
+JUNK_CLOAKS      = True      # (Juan 2026-10-16) leftover Invisibility Cloaks (B.CLOAK) are dropped too, once the
+                             # character is back to leveling with no Blood Castle planned (never while it holds
+                             # one for the next castle)
 
 CRYST_ENABLED    = True      # part 2 on/off
 CRYST_SKIP_CHARS = {"wizzardo"}   # these characters never crystallize (Juan 2026-10-15: not the main)
@@ -96,7 +99,7 @@ CRYST_KEEP = (
 
 # bag slots by kind: junk to drop / excellent gear to crystallize
 BAG_JS = """
-([never, jewelry, keep, maxLvl, skip, keepFrom]) => {
+([never, jewelry, keep, maxLvl, skip, keepFrom, cloak]) => {
   const s = window.__store; if (!s || !s.playerData) return null;
   const items = s.playerData.items || [], has = (l, it) => l.some(p => p[0] === it.group && p[1] === it.num);
   const junk = [], cryst = [];
@@ -104,6 +107,7 @@ BAG_JS = """
     const it = items[i]; if (!it || it.group === undefined) continue;
     const key = `${it.group}/${it.num}/${it.lvl || 0}/${it.isExcellent ? 1 : 0}`;
     const d = {slot: i, g: it.group, n: it.num, lvl: it.lvl || 0, key};
+    if (cloak && it.group === cloak[0] && it.num === cloak[1]) { if (!skip.includes(i + ':' + key)) junk.push({...d, cloak: true}); continue; }
     if (has(never, it)) continue;
     const gear = it.group >= 0 && it.group <= 11, jew = has(jewelry, it);
     if (!gear && !jew) continue;
@@ -275,8 +279,9 @@ class Junk:
     def bag(self):
         now = time.time()
         self.skip = {k: t for k, t in self.skip.items() if t > now}
+        cloak = list(B.CLOAK) if JUNK_CLOAKS and getattr(self.a, "bcs", None) is None else None
         return self.ev(BAG_JS, [sorted(JUNK_NEVER), sorted(JUNK_JEWELRY), sorted(CRYST_KEEP),
-                                CRYST_MAX_LVL, list(self.skip), CRYST_KEEP_FROM])
+                                CRYST_MAX_LVL, list(self.skip), CRYST_KEEP_FROM, cloak])
 
     # called by mu_th when a Treasure Hunt ends
     def hunt_over(self):
@@ -317,7 +322,8 @@ class Junk:
         if r == "sent":
             self.last_drop = (j["slot"], j["key"], now)
             self.drop_at = 0                         # next one right after the check
-            self.log(f"dropped {j['g']}/{j['n']} +{j['lvl']} (not excellent / ancient) at "
+            self.log(f"dropped {j['g']}/{j['n']} +{j['lvl']} "
+                     + ("(leftover Blood Castle cloak)" if j.get("cloak") else "(not excellent / ancient)") + " at "
                      f"({self.c.s.get('x')},{self.c.s.get('y')}); {len(b['junk']) - 1} more to go")
         elif r not in ("busy", None):
             self.skip[f"{j['slot']}:{j['key']}"] = now + JUNK_DROP_RETRY

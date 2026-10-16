@@ -69,6 +69,10 @@ TH_COMBO_STEP_MS = 700
 TH_SKILLS        = {}        # fixed skill per character (lower-case name -> skill number)
 TH_LOOP_MS       = 50
 TH_SHOW_WINDOW   = True      # restore the window during the hunt (minimized windows cast much slower, see GI)
+TH_SHOW_ON_CHEST = True      # (Juan 2026-10-16, feature flag) instead of the whole hunt: windows stay minimized
+                             # while searching and are restored only while a chest is in play (spotted / being
+                             # hit / looted), then minimized again. False = TH_SHOW_WINDOW as before.
+TH_CHEST_WINDOW_LINGER = 4   # s with no chest in play before minimizing again (a new chest often shows right away)
 TH_RECORD        = True      # record with mu_recorder (first runs: data for tuning)
 TH_END_GRACE     = 4         # panel back to a countdown this long -> over
 TH_MAX_SEC       = 720       # safety cap from the start
@@ -134,15 +138,18 @@ TH_TIMER_JS = r"""
 }
 """
 
-# walkable cells of the current map: [[cx, cy, x, y]] (x, y = a walkable tile in the cell, middle first)
+# walkable cells of the current map: [[cx, cy, x, y]] (x, y = a walkable tile in the cell, middle first).
+# Juan 2026-10-16: safe-zone tiles (terrain flag & 1, the towns) never count - chests don't spawn there, so a
+# cell entirely inside a safe zone is left out and a cell on its edge gets a goal tile outside it.
 TH_CELLS_JS = """(cell) => { const w = window.__world; if (!w || !w.isWalkable) return null;
+  const safe = (x, y) => !!w.getTerrainFlag && (w.getTerrainFlag(x, y) & 1) === 1;
   const n = Math.floor(256 / cell), out = [], offs = [];
   const h = Math.floor(cell / 2), q = Math.max(1, Math.floor(cell / 4));
   offs.push([h, h]);
   for (const a of [q, h, cell - q]) for (const b of [q, h, cell - q]) if (a !== h || b !== h) offs.push([a, b]);
   for (let cx = 0; cx < n; cx++) for (let cy = 0; cy < n; cy++) {
     for (const [dx, dy] of offs) { const x = cx * cell + dx, y = cy * cell + dy;
-      if (x > 2 && y > 2 && x < 253 && y < 253 && w.isWalkable(x, y)) { out.push([cx, cy, x, y]); break; } }
+      if (x > 2 && y > 2 && x < 253 && y < 253 && w.isWalkable(x, y) && !safe(x, y)) { out.push([cx, cy, x, y]); break; } }
   }
   return {map: w.mapIndex, cells: out}; }"""
 
@@ -567,8 +574,11 @@ class TreasureHunt:
         c.set_helper(False)
         c.close_windows()
         c.walk_target = None
-        self.showed = bool(TH_SHOW_WINDOW)
-        if TH_SHOW_WINDOW:
+        self.showed = bool(TH_SHOW_WINDOW) and not TH_SHOW_ON_CHEST
+        self.chest_win = False       # TH_SHOW_ON_CHEST: window restored for a chest right now
+        self.chest_seen_at = 0
+        self.chest_win_at = 0
+        if self.showed:
             if c.minimized and not G.HEADLESS:
                 c.set_window("normal")
             a.show_window = True
@@ -626,6 +636,8 @@ class TreasureHunt:
         elif t.get("secs") is not None:
             self.countdown_since = self.countdown_since or now
         busy = mode in ("loot", "break", "approach")
+        if TH_SHOW_ON_CHEST and not dead:
+            self.chest_window(busy, mode, now)
         if self.countdown_since and now - self.countdown_since >= TH_END_GRACE and not busy:
             return self.finish("the panel is counting down again (hunt over)")
         if now - self.started > TH_MAX_SEC and not busy:
@@ -655,6 +667,26 @@ class TreasureHunt:
                      f"slice {sec} cells of {len(self.sector_names or [])} hunters | chests seen {self.stats.get('seen', 0)}, "
                      f"broken by me {self.stats.get('broken', 0)}, by others {self.stats.get('lost', 0)}")
         return True
+
+    def chest_window(self, busy, mode, now):
+        """TH_SHOW_ON_CHEST: restore the window when a chest comes into play (approach / break / loot), minimize
+        it again TH_CHEST_WINDOW_LINGER s after the last one. A window you opened yourself is left alone."""
+        a, c = self.a, self.c
+        if busy:
+            self.chest_seen_at = now
+            if not self.chest_win:
+                self.chest_win, self.chest_win_at = True, now
+                a.show_window = True
+                if c.minimized and not G.HEADLESS:
+                    c.set_window("normal")
+                self.log(f"chest in play ({mode}) -> window restored (TH_SHOW_ON_CHEST)")
+        elif self.chest_win and now - self.chest_seen_at > TH_CHEST_WINDOW_LINGER:
+            self.chest_win = False
+            a.show_window = False
+            if G.MINIMIZE_WINDOWS and not G.HEADLESS and not getattr(a, "user_opened", False):
+                c.set_window("minimized")
+            self.log(f"no chest in play for {TH_CHEST_WINDOW_LINGER} s -> window minimized again "
+                     f"(was restored {int(now - self.chest_win_at)} s)")
 
     def travel(self, s, now):
         if now - self.last_warp < 8:
@@ -872,8 +904,9 @@ class TreasureHunt:
         self.phase = "idle"
         if getattr(a, "junk", None):
             a.junk.hunt_over()                 # mu_junk: crystallize the excellents picked up (Juan 2026-10-15)
-        if getattr(self, "showed", False):
+        if getattr(self, "showed", False) or getattr(self, "chest_win", False):
             a.show_window = False
+            self.chest_win = False
         a.step_key = None
         c.walk_target = None
         c.spot = None

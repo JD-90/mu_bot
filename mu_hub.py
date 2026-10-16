@@ -270,10 +270,13 @@ class HubState:
                 pass
         return changed
 
-    def toggle(self, k, by):
+    def toggle(self, k, by, value=None):
+        """One switch (value None = flip it) or k="all": every event switch to value (Juan 2026-10-16)."""
         with self.lock:
-            if k in FLAGS:
-                self.set_flags({k: not self.flags.get(k, False)}, by)
+            if k == "all" and value is not None:
+                self.set_flags({f: value for f in FLAGS}, by)
+            elif k in FLAGS:
+                self.set_flags({k: (not self.flags.get(k, False)) if value is None else value}, by)
 
     def command(self, cmd, who, by):
         """Summons: cmd come / boxes / dismiss, who = a character name or "all" (every character
@@ -472,10 +475,18 @@ def _status_html(v, key=""):
             local.append(f"<td class={'ok' if ok else 'bad'}>{'on' if lv else 'off' if lv is not None else '?'}"
                          f"{'' if ok else ' (not synced yet)'}</td>")
         who = f"{e(meta.get('by'))}, {_ago(meta.get('ago'))}" if meta.get("by") else ""
-        btn = (f"<form method=post action='/toggle{q}{'&' if q else '?'}f={k}'>"
-               f"<button>{'switch OFF' if on else 'switch ON'}</button></form>")
-        sw.append(f"<tr><td class=m-{k}>{e(label)}</td><td>{state}</td><td>{who}</td>{''.join(local)}<td>{btn}</td></tr>")
+        sw.append((k, f"<tr><td class=m-{k}>{e(label)}</td><td>{state}</td><td>{who}</td>{''.join(local)}<td>", on))
     sw_head = "".join(f"<th>{e(m)} sees" for m, _ in machines)
+
+    def flag_btn(k, value, label, cls=""):
+        return (f"<form method=post action='/toggle{q}{'&' if q else '?'}f={k}&v={1 if value else 0}' "
+                f"style='display:inline'><button{f' class={cls}' if cls else ''}>{e(label)}</button></form>")
+    sw = [row + (flag_btn(k, False, "switch OFF", "btnoff") if on else flag_btn(k, True, "switch ON", "btnon"))
+          + "</td></tr>" for k, row, on in sw]
+    any_on = any(v["flags"].get(k) for k in FLAGS)
+    any_off = any(not v["flags"].get(k) for k in FLAGS)
+    sw_all = " ".join(([flag_btn("all", False, "Turn OFF all events", "btnoff")] if any_on else [])
+                      + ([flag_btn("all", True, "Turn ON all events", "btnon")] if any_off else []))
     # summons (commands to our characters, to help the main)
     main = v.get("main")
     summons = v.get("summons") or {}
@@ -576,9 +587,10 @@ def _status_html(v, key=""):
         approx = "" if r["source"] == "panel" or r["key"] in NO_PANEL else " title='server schedule (no fresh panel reading)'"
         if r["ours"]:
             on = v["flags"].get(r["key"])
-            sw = "<b class=on>ON</b>" if on else "<b class=off>OFF</b>" if on is not None else ""
+            ev_sw = ("<b class=on>ON</b> " + flag_btn(r["key"], False, "turn off", "btnoff") if on else
+                  "<b class=off>OFF</b> " + flag_btn(r["key"], True, "turn on", "btnon"))
             ev_rows.append(f"<tr><td class=m-{r['key']}>{e(r['name'])}</td><td{approx}>{starts}</td><td>{when}</td>"
-                           f"<td>{e(r['lasts'])}</td><td>{sw}</td><td>{e(ev_details(r))}</td></tr>")
+                           f"<td>{e(r['lasts'])}</td><td>{ev_sw}</td><td>{e(ev_details(r))}</td></tr>")
         else:
             ev_rows.append(f"<tr class=evother><td>{e(r['name'])}</td><td{approx}>{starts}</td><td>{when}</td>"
                            f"<td>{e(r['lasts'])}</td><td></td><td>{e(ev_details(r))}</td></tr>")
@@ -591,13 +603,14 @@ def _status_html(v, key=""):
 <style>body{{font:14px system-ui;margin:16px;background:#111;color:#ddd}}table{{border-collapse:collapse;margin-bottom:18px}}
 td,th{{border:1px solid #444;padding:4px 8px;text-align:left}}th{{background:#222}}
 .on{{color:#4c4}}.off{{color:#e55}}.bad{{color:#fa3}}.ok{{color:#999}}form{{margin:0}}
-button{{font:inherit;padding:3px 10px;cursor:pointer}}
+button{{font:inherit;padding:3px 10px;cursor:pointer}}.btnoff{{background:#5a1f1f;color:#fdd;border:1px solid #a33}}
+.btnon{{background:#1f4a1f;color:#dfd;border:1px solid #3a3}}
 .m-bc,.m-gi,.m-th,.m-bb,.m-summoned{{color:#fc5;font-weight:bold}}
 .evsep{{color:#777;background:#1a1a1a;font-size:12px}}.evother td{{color:#777}}.sub{{font-weight:normal;color:#888;font-size:13px}}
 .m-bc{{color:#b57cff}}.m-bb{{color:#ff3b3b}}.m-th{{color:#c97a7a}}.m-paused,.m-offline{{color:#888}}.m-level{{color:#8cf}}
 .wrap{{overflow-x:auto}}</style>
 <p><a href="/logs{q}" style="color:#8cf">Logs (every machine) &rarr;</a></p>
-<h3>Events (shared by every machine)</h3>
+<h3>Events (shared by every machine)</h3><p>{sw_all}</p>
 <div class=wrap><table><tr><th>event<th>state<th>last switched by{sw_head}<th></tr>{''.join(sw)}</table></div>
 <h3>Summon (to {e(main or '?')}, {SUMMON_SEC // 60} min, then back to normal)</h3><p>{cmd_all}</p>
 <h3>Characters</h3><p>{summary or 'no characters'}</p>
@@ -685,7 +698,9 @@ def make_handler(state, key):
             path = self.path.split("?", 1)[0]
             if path == "/toggle":                # button on the status page
                 qs = urllib.parse.parse_qs((self.path.split("?", 1) + [""])[1])
-                state.toggle((qs.get("f") or [""])[0], f"status page ({self.client_address[0]})")
+                val = (qs.get("v") or [""])[0]
+                state.toggle((qs.get("f") or [""])[0], f"status page ({self.client_address[0]})",
+                             None if val not in ("0", "1") else val == "1")
                 self.send_response(303)
                 self.send_header("Location", "/" + (f"?key={urllib.parse.quote(key)}" if key else ""))
                 self.send_header("Content-Length", "0")
