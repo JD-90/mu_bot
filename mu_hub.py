@@ -422,6 +422,34 @@ class HubLink:
         self.gi_active = False
         self.stop = False
         self.server = start_server(cfg, log) if cfg.get("serve") else None
+        self.cfg_mtime = self._cfg_mtime()
+
+    # ── hub.json edited while running: pick up a new url / key (no restart) ──
+    @staticmethod
+    def _cfg_mtime():
+        try:
+            return HUB_FILE.stat().st_mtime
+        except OSError:
+            return None
+
+    def reload_config(self):
+        """Called before every beat. If hub.json changed on disk, take its url and key
+        (e.g. the PC got a new IP). "machine" and "serve" still need a restart."""
+        m = self._cfg_mtime()
+        if m is None or m == self.cfg_mtime:
+            return
+        self.cfg_mtime = m
+        cfg = load_config()
+        if not cfg:
+            self.log("hub: hub.json changed but can't be used -> keeping the old settings")
+            return
+        url, key = cfg["url"], cfg.get("key") or ""
+        if url == self.url and key == self.key:
+            return
+        self.log(f"hub: hub.json changed -> url {self.url} -> {url}" + (" (new key)" if key != self.key else ""))
+        self.url, self.key = url, key
+        self.cfg["url"], self.cfg["key"] = url, key
+        self.ok = None                 # log the next connect / failure again
 
     # ── http ──
     def _req(self, path, body=None):
@@ -457,6 +485,7 @@ class HubLink:
         return out
 
     def beat(self):
+        self.reload_config()
         with self.lock:
             out, self.outbox = self.outbox, []
             fout = dict(self.flags_out)
