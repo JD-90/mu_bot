@@ -22,6 +22,20 @@ Event switches (Juan 2026-10-15): Blood Castle / Golden Invasion / Treasure Hunt
 at the hub, so switching one on any machine (console key, or the buttons on the status page) switches
 it on every machine. The server keeps them in hub_flags.json (git-ignored), so a restart keeps them.
 A machine that can't reach the hub keeps its own switches and sends what it changed once it's back.
+
+Shared logs (Juan 2026-10-16): every machine sends its mu_auto_bot.log lines to the hub (POST /log, its
+own thread, every LOG_EVERY s) and gets the other machines' new lines back, which it appends to
+mu_auto_bot.<machine>.log next to its own log (e.g. the PC gets mu_auto_bot.mac.log, the Mac gets
+mu_auto_bot.pc.log). Hub unreachable -> lines wait in memory (LOG_OUTBOX_MAX) and go once it's back.
+Browser: http://<hub>:47300/logs?key=<key> (all machines, newest at the bottom; &m=mac, &q=text).
+
+Summons (Juan 2026-10-16): commands to our characters, to help the main (wizzardo). The hub keeps
+{name: kind} for SUMMON_SEC (5 min; pressing again restarts the 5 min); every machine applies the ones
+for its characters (mu_auto_bot Agent.summon_tick):
+    come   -> drop everything, go to the main, stand 1-3 tiles from him (random), follow him, wait
+    boxes  -> same, plus trade him every Kundun box (+ Cristales), then keep waiting
+    dismiss-> back to normal (leveling / whatever event is on)
+Buttons on the status page (all / per character), console keys C / X / D on any machine (everyone).
 """
 import html
 import json
@@ -35,6 +49,11 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+try:
+    import roster as R          # our characters on every machine ("all" summons, the main's name)
+except Exception:               # mu_hub.py run on its own somewhere without roster.py
+    R = None
+
 HUB_FILE = Path(__file__).with_name("hub.json")
 DEFAULT_PORT = 47300
 BEAT_EVERY = 3          # s between heartbeats
@@ -47,16 +66,23 @@ CLAIM_TTL_MAX = 3 * 3600
 SHARE_FIELDS = ("online", "paused", "mode", "map", "x", "y", "level", "resets", "hp", "party",
                 "step", "spot", "target", "rate", "bc", "bc_away", "boxes", "bag_free",
                 "assisted", "leveler", "pair_lead", "gi_hunter", "bc_tier", "bc_role",
-                "scouting", "share_with", "boxes5")
+                "scouting", "share_with", "boxes5", "summon")
 TRADE_IDLE_SEC = 30     # a trade session nobody synced for this long is dropped
 TRADE_ENDED_KEEP = 20   # an ended one stays visible this long (the other side must see "ended")
 SAMPLES_KEEP = 2000     # spot_stats samples the server remembers (other machines fetch the ones they miss)
 FLAGS_FILE = Path(__file__).with_name("hub_flags.json")
+LOG_EVERY = 2           # s between log shipments (both ways)
+LOG_KEEP = 20000        # log lines the server remembers (all machines together)
+LOG_CHUNK = 1000        # lines per POST /log (a backlog goes in several requests)
+LOG_OUTBOX_MAX = 50000  # lines kept while the hub is unreachable (oldest dropped beyond)
+LOG_LINE_MAX = 2000     # chars per line
 FLAGS = {"bc": "Blood Castle", "gi": "Golden Invasion", "th": "Treasure Hunt", "bb": "Big Boss"}
 MODE_NAMES = {"level": "leveling", "bc": "Blood Castle", "gi": "Golden Invasion", "th": "Treasure Hunt",
               "bb": "Big Boss", "trade": "box trade", "vault": "vault trip", "crystal": "Alquimista",
               "reset": "reset", "shop": "Zen Chests", "paused": "paused", "offline": "offline",
-              "start": "starting", "wait": "waiting (bar)"}
+              "start": "starting", "wait": "waiting (bar)", "summoned": "summoned"}
+SUMMON_SEC = 300        # (Juan 2026-10-16) a summon ends by itself after this long (pressing again restarts it)
+SUMMON_KINDS = {"come": "come to me", "boxes": "boxes to me"}
 
 
 def load_config():
@@ -87,7 +113,11 @@ class HubState:
         self.samples = []       # [(seq, machine, key, levels, minutes)] spot_stats samples from every machine
         self.seq = 0
         self.trades = {}        # lead -> box trade session between machines (see trade())
+        self.logs = []          # [(seq, machine, server_time, line)] every machine's log lines (see add_logs)
+        self.log_seq = 0
         self.flags, self.flags_meta, self.flags_ver = {}, {}, 0    # event switches (see set_flags)
+        self.summons, self.summons_ver, self.summon_id = {}, 0, 0  # name -> {"kind", "id", "until", "by"}
+        self.main = R.NAMES[0] if R and R.NAMES else None           # the one being helped (machines send it)
         try:
             d = json.loads(FLAGS_FILE.read_text(encoding="utf-8"))
             self.flags = {k: bool(v) for k, v in (d.get("flags") or {}).items() if k in FLAGS}
@@ -122,9 +152,43 @@ class HubState:
             if k in FLAGS:
                 self.set_flags({k: not self.flags.get(k, False)}, by)
 
-    def beat(self, machine, chars, addr, samples=None, since=None, epoch=None, flags=None, set_flags=None, gi=None):
+    def command(self, cmd, who, by):
+        """Summons: cmd come / boxes / dismiss, who = a character name or "all" (every character
+        we know of except the main). Returns the summons view."""
         now = time.time()
         with self.lock:
+            self._expire(now)
+            if who == "all":
+                names = set(self.summons) if cmd == "dismiss" else {
+                    n for d in self.machines.values() for n in (d.get("chars") or {})} | set(R.NAMES if R else [])
+            else:
+                names = {who} if who else set()
+            names.discard(self.main)
+            if cmd in SUMMON_KINDS:
+                for n in names:
+                    self.summon_id += 1
+                    self.summons[n] = {"kind": cmd, "id": f"{self.started:.0f}-{self.summon_id}",
+                                       "until": now + SUMMON_SEC, "by": by}
+            elif cmd == "dismiss":
+                for n in names:
+                    self.summons.pop(n, None)
+            else:
+                return {"ok": False, "error": "bad command"}
+            if names:
+                self.summons_ver += 1
+            return {"ok": True, "names": sorted(names), **self._summons_view(now)}
+
+    def _summons_view(self, now):
+        return {"summons": {n: {"kind": d["kind"], "id": d["id"], "left": round(d["until"] - now), "by": d["by"]}
+                            for n, d in self.summons.items()},
+                "summons_ver": f"{self.epoch}:{self.summons_ver}", "main": self.main}
+
+    def beat(self, machine, chars, addr, samples=None, since=None, epoch=None, flags=None, set_flags=None, gi=None,
+             main=None):
+        now = time.time()
+        with self.lock:
+            if main:
+                self.main = main
             self.machines[machine] = {"at": now, "chars": chars or {}, "addr": addr, "flags": flags or {},
                                       "gi": gi or None}     # Golden Invasion shared state (mu_gi.gi_export)
             if set_flags:                       # switched on that machine (console key)
@@ -161,6 +225,7 @@ class HubState:
             "trades": {l: {"alt": t["alt"], "machine": t["machine"], "age": round(now - t["at"], 1),
                            "ended": t["ended"], "alt_fields": t["alt_fields"]} for l, t in self.trades.items()},
             "uptime": round(now - self.started),
+            **self._summons_view(now),
         }
 
     def _expire(self, now):
@@ -169,6 +234,11 @@ class HubState:
         for k in [k for k, t in self.trades.items()
                   if now - t["at"] > (TRADE_ENDED_KEEP if t["ended"] else TRADE_IDLE_SEC)]:
             del self.trades[k]
+        gone = [n for n, d in self.summons.items() if d["until"] <= now]
+        for n in gone:
+            del self.summons[n]
+        if gone:
+            self.summons_ver += 1
 
     def trade(self, body, machine):
         """Box trade between characters on different machines. One session per receiver ("lead").
@@ -201,6 +271,32 @@ class HubState:
                     t["at"] = now
                 return {"ok": True}
         return {"ok": False, "error": "bad op"}
+
+    def add_logs(self, machine, lines, since=None, epoch=None):
+        """POST /log: store `machine`'s new log lines, return the OTHER machines' lines after `since`.
+        First contact (since None): only lines from now on. Server restarted (other epoch): all it has."""
+        now = time.time()
+        with self.lock:
+            for ln in lines or []:
+                self.log_seq += 1
+                self.logs.append((self.log_seq, machine, now, str(ln)[:LOG_LINE_MAX]))
+            del self.logs[:-LOG_KEEP]
+            if since is None:
+                since = self.log_seq
+            elif epoch != self.epoch:
+                since = 0
+            out = [[q, m, ln] for q, m, _t, ln in self.logs if q > since and m != machine]
+            return {"lines": out, "seq": self.log_seq, "epoch": self.epoch}
+
+    def tail_logs(self, machine=None, q=None, n=500):
+        with self.lock:
+            rows = list(self.logs)
+        if machine:
+            rows = [r for r in rows if r[1] == machine]
+        if q:
+            ql = q.lower()
+            rows = [r for r in rows if ql in r[3].lower()]
+        return rows[-n:]
 
     def claim(self, key, owner, machine, ttl):
         """Take `key` for `owner` (or renew it). Refused while someone else holds it."""
@@ -251,6 +347,15 @@ def _status_html(v, key=""):
                f"<button>{'switch OFF' if on else 'switch ON'}</button></form>")
         sw.append(f"<tr><td>{e(label)}</td><td>{state}</td><td>{who}</td>{''.join(local)}<td>{btn}</td></tr>")
     sw_head = "".join(f"<th>{e(m)} sees" for m, _ in machines)
+    # summons (commands to our characters, to help the main)
+    main = v.get("main")
+    summons = v.get("summons") or {}
+
+    def cmd_btn(c, who, label):
+        return (f"<form method=post action='/command{q}{'&' if q else '?'}c={c}&who={urllib.parse.quote(who)}' "
+                f"style='display:inline'><button>{e(label)}</button></form>")
+    cmd_all = " ".join([cmd_btn("come", "all", "Come to me (all)"), cmd_btn("boxes", "all", "Boxes to me (all)"),
+                        cmd_btn("dismiss", "all", "Dismiss all")])
     # what everyone is doing
     counts = {}
     rows = []
@@ -261,6 +366,15 @@ def _status_html(v, key=""):
                 mode = "paused"
             counts[mode] = counts.get(mode, 0) + 1
             extra = []
+            sm = summons.get(n)
+            if sm:
+                left = max(0, int(sm.get("left") or 0))
+                extra.append(f"{SUMMON_KINDS.get(sm['kind'], sm['kind'])} ({left // 60}:{left % 60:02d} left)")
+            if n == main:
+                btns = "<i>main</i>"
+            else:
+                btns = " ".join([cmd_btn("come", n, "come"), cmd_btn("boxes", n, "boxes")]
+                                + ([cmd_btn("dismiss", n, "dismiss")] if sm else []))
             if c.get("bc_tier"):
                 extra.append(f"BC{c['bc_tier']} {c.get('bc_role') or ''}".strip())
             if c.get("gi_hunter"):
@@ -274,7 +388,7 @@ def _status_html(v, key=""):
                 e(m), f"<b>{e(n)}</b>", f"<span class=m-{e(mode)}>{e(MODE_NAMES.get(mode, mode))}</span>",
                 e(", ".join(extra)), e(c.get("level")), e(c.get("resets")), e(c.get("map")),
                 f"{e(c.get('x'))},{e(c.get('y'))}", e(c.get("hp")), e(boxes),
-                e(c.get("bag_free") if c.get("bag_free") is not None else ""), f"{d['age']} s")) + "</tr>")
+                e(c.get("bag_free") if c.get("bag_free") is not None else ""), f"{d['age']} s", btns)) + "</tr>")
     summary = " · ".join(f"{e(MODE_NAMES.get(k, k))}: {n}" for k, n in sorted(counts.items(), key=lambda x: -x[1]))
     claims = "".join(f"<tr><td>{e(k)}</td><td>{e(c['owner'])}</td>"
                      f"<td>{e(c['machine'])}</td><td>{c['left']} s</td></tr>"
@@ -289,15 +403,48 @@ def _status_html(v, key=""):
 td,th{{border:1px solid #444;padding:4px 8px;text-align:left}}th{{background:#222}}
 .on{{color:#4c4}}.off{{color:#e55}}.bad{{color:#fa3}}.ok{{color:#999}}form{{margin:0}}
 button{{font:inherit;padding:3px 10px;cursor:pointer}}
-.m-bc,.m-gi,.m-th,.m-bb{{color:#fc5;font-weight:bold}}.m-paused,.m-offline{{color:#888}}.m-level{{color:#8cf}}
+.m-bc,.m-gi,.m-th,.m-bb,.m-summoned{{color:#fc5;font-weight:bold}}.m-paused,.m-offline{{color:#888}}.m-level{{color:#8cf}}
 .wrap{{overflow-x:auto}}</style>
+<p><a href="/logs{q}" style="color:#8cf">Logs (every machine) &rarr;</a></p>
 <h3>Events (shared by every machine)</h3>
 <div class=wrap><table><tr><th>event<th>state<th>last switched by{sw_head}<th></tr>{''.join(sw)}</table></div>
+<h3>Summon (to {e(main or '?')}, {SUMMON_SEC // 60} min, then back to normal)</h3><p>{cmd_all}</p>
 <h3>Characters</h3><p>{summary or 'no characters'}</p>
-<div class=wrap><table><tr><th>machine<th>name<th>doing<th>details<th>lvl<th>resets<th>map<th>pos<th>hp<th>boxes<th>bag free<th>heard</tr>{''.join(rows)}</table></div>
+<div class=wrap><table><tr><th>machine<th>name<th>doing<th>details<th>lvl<th>resets<th>map<th>pos<th>hp<th>boxes<th>bag free<th>heard<th>summon</tr>{''.join(rows)}</table></div>
 <h3>Box trades between machines</h3><table><tr><th>who<th>machine<th>state<th>age</tr>{trades}</table>
 <h3>Claims</h3><table><tr><th>key<th>owner<th>machine<th>left</tr>{claims}</table>
 <p>machines: {mach} · hub up {_ago(v['uptime']).replace(' ago', '')}</p>"""
+
+
+def _logs_html(state, key, qs):
+    e = html.escape
+    m = (qs.get("m") or [""])[0]
+    q = (qs.get("q") or [""])[0]
+    try:
+        n = max(50, min(int((qs.get("n") or ["500"])[0]), LOG_KEEP))
+    except ValueError:
+        n = 500
+    with state.lock:
+        machines = sorted(set(state.machines) | {r[1] for r in state.logs})
+    rows = state.tail_logs(m or None, q or None, n)
+    kq = f"key={urllib.parse.quote(key)}&" if key else ""
+    tabs = " · ".join(
+        (f"<b>{e(lbl)}</b>" if mm == m else f"<a href='/logs?{kq}m={urllib.parse.quote(mm)}&q={urllib.parse.quote(q)}'>{e(lbl)}</a>")
+        for mm, lbl in [("", "all")] + [(x, x) for x in machines])
+    colors = ["#8cf", "#fc5", "#c9f", "#7d7", "#f99"]
+    col = {mm: colors[i % len(colors)] for i, mm in enumerate(machines)}
+    body = "\n".join(f"<span style='color:{col.get(mc, '#ccc')}'>{e(mc):<4}</span> {e(ln)}" for _s, mc, _t, ln in rows)
+    pause = "" if q else "<meta http-equiv=refresh content=5>"
+    return f"""<!doctype html><meta charset=utf-8>{pause}
+<meta name=viewport content="width=device-width,initial-scale=1"><title>MU logs</title>
+<style>body{{font:13px system-ui;margin:16px;background:#111;color:#ddd}}a{{color:#8cf}}
+pre{{font:12px ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word}}
+input{{font:inherit;padding:3px 6px}}</style>
+<p><a href="/{'?key=' + urllib.parse.quote(key) if key else ''}">&larr; status</a> · {tabs}</p>
+<form method=get action=/logs>{f"<input type=hidden name=key value='{e(key)}'>" if key else ""}
+<input type=hidden name=m value='{e(m)}'><input name=q value='{e(q)}' placeholder='filter (stops auto-refresh)'>
+<input name=n value='{n}' size=5> lines <button>show</button></form>
+<pre>{body or 'no lines yet'}</pre><script>scrollTo(0,document.body.scrollHeight)</script>"""
 
 
 def make_handler(state, key):
@@ -328,6 +475,9 @@ def make_handler(state, key):
                 return self._send(200, state.view())
             if path == "/":
                 return self._send(200, _status_html(state.view(), key or "").encode(), "text/html; charset=utf-8")
+            if path == "/logs":
+                qs = urllib.parse.parse_qs((self.path.split("?", 1) + [""])[1])
+                return self._send(200, _logs_html(state, key or "", qs).encode(), "text/html; charset=utf-8")
             self._send(404, {"error": "not found"})
 
         def do_POST(self):
@@ -336,7 +486,7 @@ def make_handler(state, key):
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(n) or b"{}"
-                body = {} if self.path.startswith("/toggle") else json.loads(raw)
+                body = {} if self.path.startswith(("/toggle", "/command")) else json.loads(raw)
             except (ValueError, OSError):
                 return self._send(400, {"error": "bad json"})
             path = self.path.split("?", 1)[0]
@@ -348,11 +498,27 @@ def make_handler(state, key):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+            if path == "/command":               # summon buttons on the status page
+                qs = urllib.parse.parse_qs((self.path.split("?", 1) + [""])[1])
+                state.command((qs.get("c") or [""])[0], (qs.get("who") or [""])[0],
+                              f"status page ({self.client_address[0]})")
+                self.send_response(303)
+                self.send_header("Location", "/" + (f"?key={urllib.parse.quote(key)}" if key else ""))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if path == "/cmd":                   # summons from a machine's console keys (JSON)
+                return self._send(200, state.command(str(body.get("c")), str(body.get("who")),
+                                                     str(body.get("by") or body.get("machine"))))
             if path == "/beat":
                 return self._send(200, state.beat(str(body.get("machine")), body.get("chars"),
                                                   self.client_address[0], body.get("samples"),
                                                   body.get("since"), body.get("epoch"),
-                                                  body.get("flags"), body.get("set_flags"), body.get("gi")))
+                                                  body.get("flags"), body.get("set_flags"), body.get("gi"),
+                                                  body.get("main")))
+            if path == "/log":
+                return self._send(200, state.add_logs(str(body.get("machine")), body.get("lines"),
+                                                      body.get("since"), body.get("epoch")))
             if path == "/claim":
                 return self._send(200, state.claim(str(body.get("key")), body.get("owner"),
                                                    body.get("machine"), body.get("ttl")))
@@ -420,6 +586,14 @@ class HubLink:
         self.gi_fn = None          # () -> this machine's Golden Invasion state to share (None = no hunt running)
         self.on_gi = None          # callback(machine, state or None, age_s) for each other machine, every beat
         self.gi_active = False
+        self.main = None           # name of the main (sent with every beat; the hub never summons him)
+        self.on_summons = None     # callback({name: {"kind", "id", "left", "by"}}) with the hub's summons
+        self.summons_ver = None    # (epoch, n) of the last summons applied (an older answer never undoes a newer one)
+        self.log_out = []          # this machine's log lines not yet at the hub (see send_log)
+        self.log_dropped = 0       # lines lost because the outbox overflowed while the hub was down
+        self.log_since, self.log_epoch = None, None
+        self.log_files = {}        # machine -> path of its copy here (mu_auto_bot.<machine>.log)
+        self.log_in = 0            # lines received from other machines
         self.stop = False
         self.server = start_server(cfg, log) if cfg.get("serve") else None
         self.cfg_mtime = self._cfg_mtime()
@@ -468,7 +642,69 @@ class HubLink:
     # ── heartbeat thread ──
     def start(self):
         threading.Thread(target=self._loop, name="hub-link", daemon=True).start()
+        threading.Thread(target=self._log_loop, name="hub-log", daemon=True).start()
         return self
+
+    # ── shared logs ──
+    def send_log(self, line):
+        """One line of this machine's log -> the hub (next shipment). Cheap, never blocks."""
+        with self.lock:
+            self.log_out.append(line)
+            if len(self.log_out) > LOG_OUTBOX_MAX:
+                cut = len(self.log_out) - LOG_OUTBOX_MAX
+                del self.log_out[:cut]
+                self.log_dropped += cut
+
+    def _log_loop(self):
+        while not self.stop:
+            try:
+                more = self.ship_logs()
+            except Exception:           # never let the log link kill anything (and never log about it: loop)
+                more = False
+            if not more:
+                time.sleep(LOG_EVERY)
+
+    def ship_logs(self):
+        """Send up to LOG_CHUNK of our lines, write the other machines' new lines to their files here.
+        Returns True when more of our lines are waiting (send again right away)."""
+        with self.lock:
+            out = self.log_out[:LOG_CHUNK]
+            dropped, self.log_dropped = self.log_dropped, 0
+        if dropped:
+            out = [f"[hub] {dropped} log lines from {self.machine} were lost while the hub was unreachable"] + out
+        r = self._call("/log", {"machine": self.machine, "lines": out,
+                                "since": self.log_since, "epoch": self.log_epoch})
+        if "_error" in r or "lines" not in r:
+            if dropped:
+                with self.lock:
+                    self.log_dropped += dropped
+            return False                # the heartbeat already logs "can't reach"; lines stay queued
+        with self.lock:
+            del self.log_out[:len(out) - (1 if dropped else 0)]
+            more = len(self.log_out) > 0
+        self.log_since, self.log_epoch = r.get("seq"), r.get("epoch")
+        by_m = {}
+        for _q, m, ln in r.get("lines") or []:
+            by_m.setdefault(m, []).append(ln)
+        for m, lines in by_m.items():
+            self._write_remote(m, lines)
+        return more
+
+    def _write_remote(self, machine, lines):
+        safe = "".join(c for c in str(machine) if c.isalnum() or c in "-_") or "other"
+        path = Path(__file__).with_name(f"mu_auto_bot.{safe}.log")
+        try:
+            with path.open("a", encoding="utf-8") as f:
+                if machine not in self.log_files:
+                    f.write(f"===== {time.strftime('%Y-%m-%d %H:%M:%S')} ({self.machine}'s clock): "
+                            f"{machine}'s log continues here (lines while not linked are missing) =====\n")
+                f.write("\n".join(lines) + "\n")
+        except OSError:
+            return
+        if machine not in self.log_files:
+            self.log_files[machine] = path
+            self.log(f"hub: {machine}'s log -> {path.name} (copied here as it happens)")
+        self.log_in += len(lines)
 
     def _loop(self):
         while not self.stop:
@@ -504,7 +740,7 @@ class HubLink:
         self.gi_active = bool(gi)
         r = self._call("/beat", {"machine": self.machine, "chars": self.local_chars(), "samples": out,
                                  "since": self.since, "epoch": self.epoch, "flags": local, "set_flags": fout,
-                                 "gi": gi})
+                                 "gi": gi, "main": self.main})
         if "_error" in r or "machines" not in r:
             if self.ok is not False:
                 err = r.get("_error") or r.get("error") or "bad answer"
@@ -537,6 +773,7 @@ class HubLink:
                 except Exception as e:
                     self.log(f"hub: applying switches {diff}: {e!r}")
         self.flags_ver = r.get("flags_ver")
+        self.apply_summons(r)
         self.since, self.epoch = r.get("seq", self.since), r.get("epoch", self.epoch)
         for q, key, levels, minutes in r.get("samples") or []:
             if self.on_samples:
@@ -591,6 +828,33 @@ class HubLink:
             return "hub: connected, no other machine online"
         return "hub: " + " | ".join(f"{n}@{c['machine']} lvl {c.get('level')} {c.get('mode')}" + (f" BC{c['bc_tier']}" if c.get("bc_tier") else "")
                                     for n, c in sorted(rem.items()))
+
+    def apply_summons(self, r):
+        """The hub's summons -> the bot (on_summons), unless an answer with a newer version was applied already."""
+        ver = str(r.get("summons_ver") or "")
+        if not self.on_summons or ":" not in ver:
+            return
+        ep, n = ver.rsplit(":", 1)
+        try:
+            n = int(n)
+        except ValueError:
+            return
+        with self.lock:
+            if self.summons_ver and self.summons_ver[0] == ep and n < self.summons_ver[1]:
+                return
+            self.summons_ver = (ep, n)
+        try:
+            self.on_summons(r.get("summons") or {})
+        except Exception as e:
+            self.log(f"hub: applying summons: {e!r}")
+
+    def command(self, cmd, who="all"):
+        """Summon / dismiss (console keys). Applied here as soon as the hub answers. None = hub unreachable."""
+        r = self._call("/cmd", {"c": cmd, "who": who, "machine": self.machine, "by": self.machine})
+        if "_error" in r or not r.get("ok"):
+            return None
+        self.apply_summons(r)
+        return r
 
     def set_flag(self, k, value):
         """Switched here (console key) -> to the hub with the next heartbeat (every BEAT_EVERY s)."""

@@ -31,6 +31,7 @@ Use `./restart_bot.sh` to restart the supervised auto bot, or create a `RESTART`
 - `B` in the console switches Blood Castle on / off. It starts as `BC_AUTO` near the top of `mu_auto_bot.py` (currently off). Switching off drops anyone who hasn't entered a castle yet; anyone already inside finishes it.
 - `O` in the console switches the Big Boss (`mu_bb.py`) on / off. It starts as `BB_AUTO` near the top of `mu_auto_bot.py` (off). Switching off sends anyone at the boss back to normal and drops the reset hold before the boss.
 - `T` in the console switches the Treasure Hunt (`mu_th.py`) on / off. It starts as `TH_AUTO` near the top of `mu_auto_bot.py` (on). Switching off sends anyone hunting back to normal and drops the reset hold before :40.
+- Summons (help the main, wizzardo): `C` = everyone comes to him, `X` = everyone brings him their boxes, `D` = dismiss everyone. The hub status page has the same buttons, for everyone and per character. A summoned character drops whatever it is doing (events and Blood Castle included), goes to the main, stands 1-3 tiles from him (random) and follows him when he moves. With *boxes* it also trades him every Kundun box and its Cristales: if the main is paused (you play him) you accept and confirm the trade yourself; otherwise his bot accepts. Dismiss (or 5 minutes passing) sends them back to normal. While waiting, a summoned character turns its MU Helper on if its hp drops below half (it fights back and drinks potions), then comes back.
 - Restart to load code changes, but not between :45 and :10 (Blood Castle time).
 
 ## Idle wiggle
@@ -63,6 +64,7 @@ With a `hub.json` (git-ignored, template `hub.example.json`) the bots also share
 - PC: `"serve": true`, url `http://127.0.0.1:47300`. On first start Windows Firewall asks about Python: allow **Private networks**. The startup log prints the address the Mac must use.
 - Mac: `"serve": false`, `"machine": "mac"`, url `http://<PC LAN IP>:47300`, same `key`. Check with `python3 mu_hub.py test` (the VPN must allow local-network access).
 - Status page: `http://<PC LAN IP>:47300/?key=<key>` in any browser on the network. The 5-minute summary in the log adds a `hub:` line with the other machine's characters.
+- Shared logs: every machine sends its `mu_auto_bot.log` lines to the hub every 2 s and writes the other machines' lines next to its own log, as `mu_auto_bot.<machine>.log` (the PC gets `mu_auto_bot.mac.log`, the Mac gets `mu_auto_bot.pc.log`). Hub down -> lines wait in memory and are sent when it's back. All machines in one view: `http://<PC LAN IP>:47300/logs?key=<key>` (tabs per machine, filter box).
 
 ## Restarting without the console (supervisor)
 

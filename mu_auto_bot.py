@@ -252,6 +252,24 @@ TRADE_FROM_JS = """
 }
 """
 
+# summons: a random walkable tile on the ring at distance d (Chebyshev) around the main, not next to `avoid`
+# (our other characters); other rings up to dmax + 1 if that one is full. null = nothing walkable.
+SUMMON_SPOT_JS = """
+([cx, cy, d, dmax, avoid]) => {
+  const w = window.__world; if (!w || !w.isWalkable) return null;
+  const bad = (x, y) => (avoid || []).some(([ax, ay]) => Math.abs(ax - x) <= 1 && Math.abs(ay - y) <= 1);
+  const rings = [d]; for (let k = 1; k <= dmax + 1; k++) if (k !== d) rings.push(k);
+  for (const r of rings) {
+    const ring = [];
+    for (let dx = -r; dx <= r; dx++) for (let dy = -r; dy <= r; dy++)
+      if (Math.max(Math.abs(dx), Math.abs(dy)) === r && w.isWalkable(cx + dx, cy + dy) && !bad(cx + dx, cy + dy))
+        ring.push([cx + dx, cy + dy]);
+    if (ring.length) return ring[Math.floor(Math.random() * ring.length)];
+  }
+  return null;
+}
+"""
+
 # what the other side put in my trade window: Kundun boxes / anything else
 # vault window (mu_eco): open / PIN-locked / items inside / an item move waiting for the server
 VAULT_STATE_JS = """
@@ -382,6 +400,29 @@ CRYSTAL_BANK_TIMEOUT = 90   # the whole /baul deposit
 CRYSTAL_BANK_RETRY  = 1800  # failed deposit -> next try
 TRADE_BC_QUIET      = 180   # no new trades from BC_PLAN_SEC + this before a castle opens until the door closes
 
+# summons (Juan 2026-10-16): commands to help the main (TRADE_TO = wizzardo), from the hub status page buttons
+# (all / one character) or the console keys below (everyone). Every character but the main drops whatever it
+# is doing (events, Blood Castle, trades, trips: everything), goes to the main and waits next to him.
+#   come  -> stand 1-3 tiles from him (random each time), follow him when he moves (random distance too)
+#   boxes -> same, plus trade him every Kundun box (+1..+5) and Cristal stack. Main paused (you play him):
+#            you accept / confirm the trade yourself. Main run by the bot: he accepts and confirms by himself.
+#   dismiss (or SUMMON_SEC passing) -> back to normal (leveling, or whatever event is still on)
+SUMMON_SEC          = HUB.SUMMON_SEC   # 5 min, then the summon ends by itself (pressing again restarts it)
+SUMMON_DIST         = (1, 3)    # tiles from the main where they stand (picked at random every time)
+SUMMON_FOLLOW       = (4.0, 6.5)  # he moved more than this from me (random every time) -> walk up to him again
+SUMMON_REACT_SEC    = (0.5, 2.5)  # wait this long before walking after him (not everyone at the same instant)
+SUMMON_WALK_SEC     = 20        # not on the chosen tile after this long -> pick another one
+SUMMON_HELPER_HP    = 0.5       # waiting and hp below this share -> MU Helper on (fights back, drinks potions)
+SUMMON_HELPER_OFF_HP = 0.9      # ... off again above this, and back next to the main
+SUMMON_GIVE_CRYSTALS = True     # boxes: Cristales go along (they always end up with the main)
+SUMMON_TRADE_TRIES  = 3         # boxes: trade attempts before giving up (until summoned again)
+SUMMON_TRADE_RETRY  = 15        # s between attempts
+SUMMON_TRADE_TIMEOUT = 150      # s for a whole summon trade (you may take a while to accept)
+SUMMON_MANUAL_REQ_EVERY = 10    # main paused (you play him): send the trade request every this many s ...
+SUMMON_MANUAL_REQUESTS = 8      # ... at most this many times
+SUMMON_MANUAL_CONFIRM = 90      # ... and wait this long for you to confirm
+SUMMON_KEYS         = {"c": "come", "x": "boxes", "d": "dismiss"}   # console: C / X / D = everyone
+
 # restarts (mu_supervisor.py)
 SUPERVISED          = os.environ.get("MU_SUPERVISED") == "1"   # started by mu_supervisor.py
 STOP_BOT_FILE       = G.BASE_DIR / "STOP_BOT"   # supervisor -> bot: close the browsers and exit
@@ -391,6 +432,7 @@ EXIT_STOPPED, EXIT_OTHER_BOT, EXIT_ALL_DEAD = 0, 2, 3
 # ──────────────────────────────────────────────────────────────────
 
 _log_lock = threading.Lock()
+_log_share = []     # lines logged before the hub link exists; then the link's send_log (shared logs, mu_hub)
 
 
 def log(msg, who="auto"):
@@ -399,6 +441,20 @@ def log(msg, who="auto"):
         print(line, flush=True)
         with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
+        if isinstance(_log_share, list):
+            if len(_log_share) < 1000:
+                _log_share.append(line)
+        else:
+            _log_share(line)
+
+
+def share_log(link):
+    """Every log line from now on (and the startup lines so far) also goes to the hub -> other machines."""
+    global _log_share
+    with _log_lock:
+        early, _log_share = _log_share, link.send_log
+        for ln in early if isinstance(early, list) else []:
+            link.send_log(ln)
 
 
 G.log = log   # Char.log / set_helpers in mu_group_bot write through this (thread-safe, own log file)
@@ -546,6 +602,8 @@ class Hub:
         self.bb_on = BB_AUTO         # O in the console switches the Big Boss on/off
         self.th_on = TH_AUTO         # T in the console switches the Treasure Hunt on/off
         self.gi_on = GI_AUTO         # G in the console switches the Golden Invasion on/off
+        self.summons = {}            # this machine's summoned characters: name -> {"kind", "id", "by", "until"}
+        self.summon_spots = {}       # name -> (map, x, y) where a summoned character is going to stand
         self.stop = False
 
     def put(self, name, d):
@@ -628,6 +686,7 @@ class Agent:
         self.trade_fails = 0
         self.trade_sent = 0
         self.trade_filled = False
+        self.summon = None           # summoned to the main (mu_hub summons): see summon_tick
         self.leveler_name = PAIRS.get(self.name)    # who carries me after a grand reset (None = nobody)
         self.was_assisted = None
         self.pair_parked = False     # levelee waiting at the bar (leveler in Blood Castle / paused / offline)
@@ -818,6 +877,7 @@ class Agent:
             "pair_lead": bool(self.my_levelees()), "parked": self.pair_parked,
             "gi_hunter": bool(self.gi and self.gi.is_hunter()),
             "bc_tier": bc_as[0], "bc_role": bc_as[1],     # shared with the other machines (mu_hub)
+            "summon": self.summon["kind"] if self.summon else None,
         })
 
     def recent_rate(self):
@@ -899,6 +959,15 @@ class Agent:
             except Exception as e:
                 self.log(f"chat error: {e!r}")
         self.thanks_tick()                  # any mode: leveling, Blood Castle, Golden Invasion...
+        if self.summon_tick():              # summoned to the main: comes before everything (Juan 2026-10-16)
+            self.publish()
+            if now - self.last_status > 60:
+                self.last_status = now
+                self.status()
+            return
+        if self.name == hub.trade_to and self.summon_lead_tick():   # main: a summoned one brings boxes
+            self.publish()
+            return
         lvl = s.get("level") or 1
         if not self.history or now - self.history[-1][0] >= 10:
             self.history.append((now, lvl, s.get("resets")))
@@ -1007,6 +1076,10 @@ class Agent:
                 where += f" (with {self.anchor_name})"
         r = self.recent_rate()
         bc = f" | BC{self.bcs['tier']} {self.bcs['role']}/{self.bcs['phase']}" if self.bcs else ""
+        if self.summon:
+            sm = self.summon
+            bc += (f" | SUMMONED ({sm['kind']}) by {sm['by']}, {sm['state']}, "
+                   f"{max(0, int(sm['until'] - time.time()))} s left")
         if self.my_trade:
             t = self.my_trade
             bc += f" | box trade {t['alt']} -> {t['lead']} ({t['phase']})"
@@ -2562,6 +2635,10 @@ class Agent:
         if self.name == t["alt"]:
             self.boxes_at = 0
             now = time.time()
+            if t.get("summon"):                           # summon_tick decides about retries
+                if t.get("ok") and t["lead"] == self.hub.trade_to:
+                    self.cry_owed = False
+                return
             if t.get("ok"):
                 self.trade_fails = 0
                 self.trade_next = now + 60
@@ -2622,7 +2699,8 @@ class Agent:
             if self.hub.trade is not None:
                 return None
             t = {"alt": sess["alt"], "lead": self.name, "phase": f.get("phase", "meet"), "start": now,
-                 "phase_at": now, "n": f.get("n", 0), "requests": 0, "ok": False, "remote": True}
+                 "phase_at": now, "n": f.get("n", 0), "requests": 0, "ok": False, "remote": True,
+                 "summon": bool(f.get("summon")), "kind": f.get("kind", "boxes")}
             self.hub.trade = t
         return t
 
@@ -2658,20 +2736,21 @@ class Agent:
         other, _ = self.peer_info(t["lead"] if self.name == t["alt"] else t["alt"])
         other = other or {}
         off_key = "off_" + self.name
-        if other.get("online") and not other.get("paused"):
+        if other.get("online") and (not other.get("paused") or t.get("summon")):   # summon: you may play him
             t.pop(off_key, None)
         else:
             t.setdefault(off_key, now)      # a few seconds offline (map loading) is fine
         grace = TRADE_OFFLINE_GRACE + (TRADE_REMOTE_LAG if t.get("remote") else 0)
         if self.bcs or other.get("bc"):
             self.trade_end(t, False, "Blood Castle comes first")
-        elif other.get("paused") or now - t.get(off_key, now) > grace:
+        elif (other.get("paused") and not t.get("summon")) or now - t.get(off_key, now) > grace:
             self.trade_end(t, False, "the other character is offline / paused")
         elif other.get("map") is not None and other.get("map") != self.c.s.get("map") \
                 and now - t["start"] > (TRADE_REMOTE_LAG if t.get("remote") else 0):
             self.trade_end(t, False, "not on the same map any more")
-        elif now - t["start"] > TRADE_TIMEOUT:
-            self.trade_end(t, False, f"took more than {TRADE_TIMEOUT}s (phase {t['phase']})")
+        elif now - t["start"] > (SUMMON_TRADE_TIMEOUT if t.get("summon") else TRADE_TIMEOUT):
+            self.trade_end(t, False, f"took more than {SUMMON_TRADE_TIMEOUT if t.get('summon') else TRADE_TIMEOUT}s "
+                                     f"(phase {t['phase']})")
         if hub.trade is not t:
             self.trade_cleanup(t)
             return False
@@ -2692,6 +2771,8 @@ class Agent:
         but only once the MAIN's own window shows the boxes arriving (= it's really him)."""
         c, s = self.c, self.c.s
         now = time.time()
+        # summoned while you play the main (he is paused): nobody runs his side -> you accept and confirm
+        manual = bool(t.get("summon") and lead.get("paused"))
         if t["phase"] == "meet":
             c.set_helper(False)
             lx, ly = lead.get("x"), lead.get("y")
@@ -2708,16 +2789,17 @@ class Agent:
             if st.get("open"):
                 self.trade_phase(t, "fill")
                 return
-            if now - self.trade_sent < 6:
+            if now - self.trade_sent < (SUMMON_MANUAL_REQ_EVERY if manual else 6):
                 return
-            if t["requests"] >= 3:
+            if t["requests"] >= (SUMMON_MANUAL_REQUESTS if manual else 3):
                 return self.trade_end(t, False, f"{t['lead']} never opened the trade window")
             c.set_helper(False)
             c.close_windows()
             res = self.ev(B.TRADE_REQUEST_JS, t["lead"])
             t["requests"] += 1
             self.trade_sent = now
-            self.log(f"box trade: request to {t['lead']}: {res}")
+            self.log(f"box trade: request to {t['lead']}: {res}"
+                     + (f" (you play {t['lead']}: accept it there)" if manual else ""))
             if res == "not in view":
                 self.trade_phase(t, "meet")     # he moved: walk up to him again
             return
@@ -2736,7 +2818,7 @@ class Agent:
                 return self.trade_end(t, False, "trade window closed, boxes still in my bag")
             return self.trade_end(t, False, "trade window closed before confirming")
         if t["phase"] == "fill":
-            if not t.get("lead_open"):
+            if not t.get("lead_open") and not manual:
                 # my window is open but the main's isn't (yet): wait a bit, then it's someone else
                 if now - t["phase_at"] > 8:
                     self.trade_end(t, False, f"my trade window opened but {t['lead']}'s didn't -> "
@@ -2752,7 +2834,7 @@ class Agent:
                     self.cry_owed = False
                     return self.trade_end(t, False, "no Cristales in the bag any more")
                 t["before"] = len(slots) + len(cry)
-                cap = t.get("lead_free")
+                cap = None if manual else t.get("lead_free")
                 if cap is not None and cap < len(slots) + len(cry):
                     self.log(f"box trade: {t['lead']} has room for {cap} -> giving {cap} of {len(slots) + len(cry)} "
                              f"(boxes first)")
@@ -2774,16 +2856,17 @@ class Agent:
                 t["filled_at"] = time.time()
                 return
             # the safety check: confirm only when the MAIN sees exactly my boxes (+ Cristales) in his window
-            if st.get("mine", 0) >= t["n"] and t.get("lead_boxes", 0) >= t["n"]:
+            if st.get("mine", 0) >= t["n"] and (manual or t.get("lead_boxes", 0) >= t["n"]):
                 time.sleep(0.5)
-                self.log(f"box trade: {t['lead']} sees my {t['n']} item(s) -> confirming")
+                self.log(f"box trade: {t['n']} item(s) in the window -> confirming (confirm it on {t['lead']})" if manual
+                         else f"box trade: {t['lead']} sees my {t['n']} item(s) -> confirming")
                 self.ev("() => window.__eco.setMyConfirm(true)")
                 self.trade_phase(t, "confirm")
             elif now - t.get("filled_at", now) > 12:
                 self.trade_end(t, False, f"{st.get('mine', 0)}/{t['n']} boxes in my window, "
                                          f"{t.get('lead_boxes', 0)} seen by {t['lead']}")
             return
-        if t["phase"] == "confirm" and now - t["phase_at"] > 15:
+        if t["phase"] == "confirm" and now - t["phase_at"] > (SUMMON_MANUAL_CONFIRM if manual else 15):
             self.trade_end(t, False, f"{t['lead']} did not confirm")
 
     def give_crystal_slots(self, t):
@@ -2835,6 +2918,253 @@ class Agent:
             time.sleep(0.5)
             self.log(f"box trade: {st.get('yours')} box(es) in the window -> confirming")
             self.ev("() => window.__eco.setMyConfirm(true)")
+
+    # ── summons (mu_hub: status page buttons / console C, X, D) ──
+    def summon_cmd(self):
+        """This character's live summon from the hub (None: not summoned, or its time is up)."""
+        e = self.hub.summons.get(self.name)
+        if not e or self.name == self.hub.trade_to or e["until"] <= time.time():
+            return None
+        return e
+
+    def summon_tick(self):
+        """True while summoned: go to the main, stand 1-3 tiles from him, follow him, trade him the
+        boxes (kind "boxes"). Everything else waits until dismissed / SUMMON_SEC is over."""
+        e = self.summon_cmd()
+        sm = self.summon
+        now = time.time()
+        if e is None:
+            if sm:
+                self.summon_end("5 min are over" if now >= sm["until"] - 2 else "dismissed")
+            return False
+        if sm is None:
+            sm = self.summon_start(e)
+        elif sm["id"] != e["id"]:                       # pressed again (maybe the other button)
+            if e["kind"] != sm["kind"]:
+                self.log(f"summon changed: {sm['kind']} -> {e['kind']} (by {e['by']})")
+            if e["kind"] == "boxes":
+                sm["traded"], sm["tries"], sm["trade_at"] = False, 0, 0
+            sm["id"], sm["kind"], sm["by"] = e["id"], e["kind"], e["by"]
+        sm["until"] = e["until"]
+        self.mode = "summoned"
+        c, s = self.c, self.c.s
+        if (s.get("hp") or 0) <= 0:
+            return True
+        t = sm.get("t")
+        if t is not None:                               # trading the boxes
+            if self.my_trade is t:
+                self.trade_tick()
+            if self.my_trade is not t:
+                sm["t"] = None
+                if t.get("ok"):
+                    sm["traded"] = True
+                    self.log(f"SUMMON: boxes handed to {t['lead']} -> waiting next to him")
+                else:
+                    sm["tries"] += 1
+                    if sm["tries"] >= SUMMON_TRADE_TRIES:
+                        sm["traded"] = True
+                        self.log(f"SUMMON: trade failed {sm['tries']} times -> just waiting "
+                                 "(press boxes again to retry)")
+                    else:
+                        sm["trade_at"] = now + SUMMON_TRADE_RETRY
+                sm["state"], sm["spot"], sm["go_at"] = "go", None, now   # back to my place next to him
+            return True
+        main_name = self.hub.trade_to
+        main, remote = self.peer_info(main_name)
+        if not main or not main.get("online") or main.get("map") is None or main.get("x") is None:
+            if now - sm.get("lost_logged", 0) > 60:
+                sm["lost_logged"] = now
+                self.log(f"SUMMON: can't see {main_name} right now (offline / not heard) -> waiting here")
+            c.walk_target = None
+            return True
+        m, mx, my = main["map"], int(main["x"]), int(main["y"])
+        # attacked while waiting: let the MU Helper fight back and drink potions, then back next to him
+        hp, mhp = s.get("hp") or 0, s.get("maxHP") or 0
+        if sm["helper"]:
+            if mhp and hp >= SUMMON_HELPER_OFF_HP * mhp:
+                c.set_helper(False)
+                sm["helper"] = False
+                sm["state"], sm["spot"], sm["go_at"] = "go", None, now
+                self.log("SUMMON: hp back up -> MU Helper off, back next to the main")
+            return True
+        if mhp and hp < SUMMON_HELPER_HP * mhp and s.get("map") == m:
+            c.set_helper(True)
+            sm["helper"] = True
+            self.log(f"SUMMON: hp {hp}/{mhp} -> MU Helper on to fight back / drink potions")
+            return True
+        # another map: /move there (if my level allows it)
+        if s.get("map") != m:
+            alias, need, lvl = MAP_ALIAS.get(m), WARP_MIN_LEVEL.get(m), s.get("level") or 0
+            if in_bc(m) or alias is None or need is None or lvl < need:
+                if now - sm.get("warp_logged", 0) > 60:
+                    sm["warp_logged"] = now
+                    self.log(f"SUMMON: {main_name} is on map {m} ({alias or '?'}) -> I can't /move there "
+                             f"(lvl {lvl}, needs {need or '?'}), waiting here")
+                c.walk_target = None
+                return True
+            sm["state"], sm["spot"] = "go", None
+            self.go(m, alias, mx, my, radius=SUMMON_DIST[1] + 3)
+            return True
+        d_main = dist(s, mx, my)
+        if sm["state"] == "stand":
+            if d_main > sm["follow"]:                   # he walked off: after a moment, walk up to him again
+                sm["state"], sm["spot"] = "go", None
+                sm["go_at"] = now + random.uniform(*SUMMON_REACT_SEC)
+            else:
+                c.walk_target = None
+                if sm["kind"] == "boxes" and not sm["traded"] and now >= sm["trade_at"]:
+                    self.summon_trade(main, remote)
+                return True
+        if now < sm["go_at"]:
+            return True
+        spot = sm["spot"]
+        if spot is None or spot[0] != m or max(abs(spot[1] - mx), abs(spot[2] - my)) > SUMMON_DIST[1] + 1 \
+                or now - sm["spot_at"] > SUMMON_WALK_SEC:
+            spot = sm["spot"] = self.summon_pick_spot(m, mx, my)
+            sm["spot_at"] = now
+        far = d_main > 30
+        if self.go(m, MAP_ALIAS.get(m) if far else None, spot[1], spot[2], radius=0.9):
+            sm["state"] = "stand"
+            sm["follow"] = random.uniform(*SUMMON_FOLLOW)
+            if not sm["arrived"]:
+                sm["arrived"] = True
+                self.log(f"SUMMON: next to {main_name} ({int(dist(s, mx, my))} tiles) after "
+                         f"{int(now - sm['since'])} s -> waiting" + (", then the boxes" if sm["kind"] == "boxes" else ""))
+        return True
+
+    def summon_pick_spot(self, m, mx, my):
+        """(map, x, y): a random walkable tile 1-3 tiles from the main, away from our others."""
+        avoid = []
+        for n, i in list(self.hub.snapshot().items()) + list((self.hub.link.remote() if self.hub.link else {}).items()):
+            if n not in (self.name, self.hub.trade_to) and i.get("map") == m and i.get("x") is not None:
+                avoid.append([int(i["x"]), int(i["y"])])
+        with self.hub.lock:
+            for n, sp in self.hub.summon_spots.items():
+                if n != self.name and sp[0] == m:
+                    avoid.append([sp[1], sp[2]])
+        d = random.randint(*SUMMON_DIST)
+        xy = self.ev(SUMMON_SPOT_JS, [mx, my, d, SUMMON_DIST[1], avoid])
+        if not xy:
+            xy = [mx + random.choice((-1, 1)) * d, my + random.choice((-1, 1)) * d]
+        spot = (m, int(xy[0]), int(xy[1]))
+        with self.hub.lock:
+            self.hub.summon_spots[self.name] = spot
+        return spot
+
+    def summon_trade(self, main, remote):
+        """Kind "boxes", standing next to the main: open a trade with him (same flow as box trades)."""
+        sm, hub, now = self.summon, self.hub, time.time()
+        dest = hub.trade_to
+        if main.get("bc") or (main.get("hp") or 0) <= 0:
+            return
+        self.boxes_at = 0
+        self.boxes_count()
+        if self.boxes > 0:
+            kind, n = "boxes", self.boxes
+        elif SUMMON_GIVE_CRYSTALS and TRADE_CRYSTALS and self.crystals > 0:
+            kind, n = "crystals", 1
+        else:
+            sm["traded"] = True
+            self.log("SUMMON: no Kundun boxes (or Cristales) in my bag -> nothing to trade, just waiting")
+            return
+        if remote:
+            link = hub.link
+            res = link.trade("start", dest, self.name, fields={"n": n, "phase": "meet", "kind": kind,
+                                                                "summon": True}) if link else None
+            if not res or not res.get("ok"):
+                if res and res.get("alt") and now - sm.get("busy_logged", 0) > 30:
+                    sm["busy_logged"] = now
+                    self.log(f"SUMMON: {res['alt']} is trading with {dest} -> my turn after")
+                sm["trade_at"] = now + 3
+                return
+        with hub.lock:
+            if hub.trade is not None:
+                if hub.trade.get("alt") != self.name and now - sm.get("busy_logged", 0) > 30:
+                    sm["busy_logged"] = now
+                    self.log(f"SUMMON: {hub.trade.get('alt')} is trading with {hub.trade.get('lead')} -> my turn after")
+                sm["trade_at"] = now + 3
+                return
+            t = {"alt": self.name, "lead": dest, "phase": "meet", "start": now, "phase_at": now, "n": n,
+                 "kind": kind, "requests": 0, "ok": False, "remote": remote, "summon": True,
+                 "lead_free": None if main.get("paused") else main.get("bag_free")}
+            hub.trade = t
+        self.my_trade, self.trade_sent, self.trade_filled = t, 0, False
+        sm["t"] = t
+        self.c.set_helper(False)
+        self.log(f"SUMMON: trading {dest} " + (f"{self.boxes} Box(es) of Kundun ({self.boxes5} +5)" if kind == "boxes"
+                                              else f"{self.crystals} Cristales (no boxes)")
+                 + (" + my Cristales" if kind == "boxes" and self.crystals and SUMMON_GIVE_CRYSTALS else "")
+                 + (f" -> you play {dest}: accept and confirm the trade there" if main.get("paused") else ""))
+
+    def summon_start(self, e):
+        """Summoned: drop whatever I was doing (Juan 2026-10-16: interrupts everything)."""
+        now = time.time()
+        main = self.hub.trade_to
+        self.summon = sm = {"id": e["id"], "kind": e["kind"], "by": e["by"], "until": e["until"], "since": now,
+                            "state": "go", "go_at": now + random.uniform(*SUMMON_REACT_SEC), "spot": None,
+                            "spot_at": 0, "follow": SUMMON_FOLLOW[0], "arrived": False, "helper": False,
+                            "traded": False, "tries": 0, "trade_at": 0, "t": None}
+        doing = self.mode
+        self.log(f"=== SUMMONED ({'come to me' if e['kind'] == 'come' else 'boxes to me'}) by {e['by']} -> "
+                 f"dropping '{doing}', going to {main} ({SUMMON_SEC // 60} min or until dismissed) ===")
+        c = self.c
+        try:
+            if self.my_trade is not None:
+                t = self.my_trade
+                self.trade_end(t, False, "summoned")
+                self.trade_cleanup(t)
+            self.trade_trip_end("summoned")
+            if self.bcs is not None:
+                self.bc_done("summoned")
+            if self.gi and self.gi.active():
+                self.gi.on_pause()
+                self.gi.finish("summoned")
+            if self.bb and self.bb.active():
+                self.bb.finish("summoned")
+            if self.th and self.th.active():
+                self.th.finish("summoned")
+            if self.junk and self.junk.busy():
+                self.junk.end("summoned", ok=False, retry=60)
+            if self.vault is not None:
+                self.vault_end("summoned", ok=False, retry=60)
+            c.set_helper(False)
+        except Exception as ex:
+            self.log(f"summon: stopping '{doing}': {ex!r}")
+        c.walk_target = None
+        return sm
+
+    def summon_end(self, why):
+        sm, self.summon = self.summon, None
+        t = sm.get("t")
+        if t is not None and self.my_trade is t:
+            self.trade_end(t, False, f"summon over ({why})")
+            self.trade_cleanup(t)
+        with self.hub.lock:
+            self.hub.summon_spots.pop(self.name, None)
+        c, now = self.c, time.time()
+        c.walk_target, c.relocating, c.following = None, True, False      # as after a pause: re-pick leg and spot
+        c.last_follow_check, c.last_warp, c.last_ingame, c.walk_progress_at = now, 0, now, now
+        self.step_key = None
+        self.samples, self.stat_point, self.deaths = [], None, []
+        self.spot_since = now
+        self.mode = "level"
+        self.log(f"=== SUMMON OVER ({why}) -> back to normal ===")
+
+    def summon_lead_tick(self):
+        """Main, run by the bot (not paused): a summoned character is trading me its boxes -> handle it
+        right away, even during an event (it only takes a moment)."""
+        t = self.my_trade
+        if t is None:
+            ht = self.hub.trade
+            if ht is not None and ht.get("summon") and ht.get("lead") == self.name:
+                t = ht
+            elif ht is None and self.hub.link:
+                sess = self.hub.link.trades().get(self.name)
+                if sess and not sess.get("ended") and (sess.get("alt_fields") or {}).get("summon"):
+                    t = sess
+        if t is None or not t.get("summon", (t.get("alt_fields") or {}).get("summon")):
+            return False
+        return self.trade_tick()
 
     # ── Blood Castle ──
     def read_bc_timer(self):
@@ -4072,6 +4402,42 @@ def switch_event(hub, ev, on, by=None):
         hub.link.set_flag(ev, on)
 
 
+def apply_summons(hub, summons):
+    """The hub's summons (every machine's) -> the ones for this machine's characters."""
+    now = time.time()
+    mine = {n: {"kind": d.get("kind"), "id": d.get("id"), "by": d.get("by"), "until": now + max(0, d.get("left") or 0)}
+            for n, d in (summons or {}).items() if n in hub.names and n != hub.trade_to}
+    with hub.lock:
+        hub.summons = mine
+
+
+def summon_command(hub, cmd):
+    """Console C / X / D: summon everyone (come / boxes) or dismiss everyone. Through the hub when there is
+    one (every machine follows); hub unreachable / no hub -> only this machine's characters."""
+    what = {"come": f"everyone comes to {hub.trade_to}", "boxes": f"everyone brings {hub.trade_to} their boxes",
+            "dismiss": "everyone dismissed"}[cmd]
+
+    def local():
+        now = time.time()
+        with hub.lock:
+            if cmd == "dismiss":
+                hub.summons = {}
+            else:
+                for n in hub.names:
+                    if n != hub.trade_to:
+                        hub.summons[n] = {"kind": cmd, "id": f"local-{now:.3f}", "by": "console", "until": now + SUMMON_SEC}
+
+    def send():
+        if hub.link.command(cmd, "all") is None:
+            log(f"SUMMON: hub unreachable -> {what} on this machine only")
+            local()
+    log(f"=== SUMMON: {what}" + (" (every machine)" if hub.link else "") + " ===")
+    if hub.link:
+        threading.Thread(target=send, daemon=True).start()
+    else:
+        local()
+
+
 def read_keys(hub, agents):
     """P = pause/resume everyone, 1..5 = one character. A PAUSE file pauses everyone."""
     try:
@@ -4087,6 +4453,8 @@ def read_keys(hub, agents):
                 else:
                     log("R pressed, but this bot was not started by the supervisor -> "
                         "close it and start run_auto.sh to get restarts")
+            elif k in SUMMON_KEYS:
+                summon_command(hub, SUMMON_KEYS[k])
             elif k in EVENT_KEYS:
                 ev = EVENT_KEYS[k]
                 switch_event(hub, ev, not getattr(hub, ev + "_on"))
@@ -4143,12 +4511,16 @@ def main():
     log(R.startup_line(names))
     hub.link = HUB.make_link(hub.snapshot, log)
     if hub.link:                                # spot_stats measurements travel both ways
+        share_log(hub.link)                     # this log is copied to every machine (mu_auto_bot.<machine>.log)
         GI.gi_wire(hub)                         # Golden Invasion hunters share their state (mu_gi, 1 s beats)
         hub.link.on_samples = hub.stats.apply_remote
         hub.stats.on_add = hub.link.send_sample
         # event switches shared through the hub (B / G / T / O on any machine, or the status page)
         hub.link.flags_fn = lambda: {ev: getattr(hub, ev + "_on") for ev in EVENT_TEXT}
         hub.link.on_flags = lambda diff, by: [switch_event(hub, ev, on, by) for ev, on in diff.items()]
+        # summons (status page buttons / C, X, D on any machine)
+        hub.link.main = hub.trade_to
+        hub.link.on_summons = lambda summ: apply_summons(hub, summ)
     if not hub.link:
         log("hub: no hub.json -> this machine runs alone")
     if CH.CHAT_ENABLED:
@@ -4168,6 +4540,7 @@ def main():
         + (" | with the hub, these switches follow the hub (every machine, status page)" if hub.link else ""))
     log("Keys in this window: P = pause/resume everyone, B = Blood Castle on/off, O = Big Boss on/off, "
         "T = Treasure Hunt on/off, G = Golden Invasion on/off, R = restart now, "
+        f"C = everyone comes to {hub.trade_to}, X = everyone brings {hub.trade_to} their boxes, D = dismiss everyone, "
         + ", ".join(f"{i + 1} = {a.name}" for i, a in enumerate(agents)) + " (pause/resume one)")
     last_summary = 0
     rc = EXIT_ALL_DEAD             # the loop ends by itself only when every character thread stopped
