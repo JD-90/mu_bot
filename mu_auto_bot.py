@@ -399,6 +399,8 @@ TRADE_FULL_SEC      = 7200  # a trade the main failed to take while his bag look
 TRADE_MIN_PLUS5     = 4     # Juan 2026-10-15: with this many Boxes of Kundun +5 a character goes to the main
                             # (wherever he levels, any machine) and gives him ALL its Kundun boxes (+1..+5)
 TRADE_PLUS5_LVL     = 12    # item level of a Box of Kundun +5
+TRADE_MAIN_PLUS5_ONLY = True  # (Juan 2026-10-17) the main (wizzardo) only gets Boxes of Kundun +5: +1..+4 stay
+                              # in the alts' bags (box trips, summons); the vault keeper still takes every box
 TRADE_TRAVEL_SEC    = 180   # giving up on reaching the main after this long (then TRADE_RETRY_SEC)
 TRADE_REMOTE_LAG    = 6     # extra seconds of slack when the other side is on another machine (3 s heartbeat)
 WARP_MIN_LEVEL      = {m: min(f for f, _, _, mm, _ in G.ROUTE if mm == m) for m in {r[3] for r in G.ROUTE}}
@@ -2233,7 +2235,7 @@ class Agent:
             return self.trade_travel(lead)
         if remote:
             link = hub.link
-            res = link.trade("start", dest, self.name, fields={"n": self.boxes if kind == "boxes" else 1,
+            res = link.trade("start", dest, self.name, fields={"n": self.boxes_for(dest) if kind == "boxes" else 1,
                                                                  "phase": "meet", "kind": kind}) if link else None
             if not res or not res.get("ok"):
                 if res and res.get("alt"):
@@ -2243,7 +2245,7 @@ class Agent:
             if hub.trade is not None:
                 return "travel" if self.trade_trip else None
             t = {"alt": self.name, "lead": dest, "phase": "meet", "start": now, "phase_at": now,
-                 "n": self.boxes if kind == "boxes" else 1, "kind": kind,
+                 "n": self.boxes_for(dest) if kind == "boxes" else 1, "kind": kind,
                  "requests": 0, "ok": False, "lead_free": free, "remote": remote}
             hub.trade = t
         self.trade_trip = None
@@ -2302,6 +2304,14 @@ class Agent:
     def receivers(self):
         """Characters that take boxes and never give them: the main and the vault keeper."""
         return {n for n in (self.hub.trade_to, VAULT_KEEPER) if n}
+
+    def box_min_lvl(self, dest):
+        """Lowest Kundun box level traded to `dest`: +5 only for the main (TRADE_MAIN_PLUS5_ONLY)."""
+        return TRADE_PLUS5_LVL if TRADE_MAIN_PLUS5_ONLY and dest == self.hub.trade_to else B.KUNDUN_MIN_LVL
+
+    def boxes_for(self, dest):
+        """How many Kundun boxes I'd give `dest` (last count)."""
+        return self.boxes5 if self.box_min_lvl(dest) == TRADE_PLUS5_LVL else self.boxes
 
     def trade_target(self):
         """Juan 2026-10-15: boxes go to the main (TRADE_TO) until he holds MAIN_PLUS5_FULL Boxes +5,
@@ -2962,8 +2972,8 @@ class Agent:
         if not st.get("open"):
             if t["phase"] == "confirm":
                 time.sleep(1)
-                boxes_left = len(self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or [])
-                self.boxes = boxes_left
+                boxes_left = len(self.ev(B.KUNDUN_SLOTS_JS, self.box_min_lvl(t["lead"])) or [])
+                self.boxes_at = 0                # recount every level at the next check
                 left = ((0 if t.get("kind") == "crystals" else boxes_left) + len(self.give_crystal_slots(t))
                         + len(self.give_jewel_slots(t)))
                 before = t.get("before", t["n"])
@@ -2985,7 +2995,7 @@ class Agent:
                 return
             if not self.trade_filled:
                 crystals_only = t.get("kind") == "crystals"
-                slots = [] if crystals_only else (self.ev(B.KUNDUN_SLOTS_JS, B.KUNDUN_MIN_LVL) or [])
+                slots = [] if crystals_only else (self.ev(B.KUNDUN_SLOTS_JS, self.box_min_lvl(t["lead"])) or [])
                 cry = self.give_crystal_slots(t)
                 jew = self.give_jewel_slots(t)
                 if not slots and not crystals_only:
@@ -3082,7 +3092,7 @@ class Agent:
             return
         takes_cr = TRADE_CRYSTALS and self.name == self.hub.trade_to      # only the main takes Cristales
         takes_jw = bool(t.get("summon")) and self.name == self.hub.trade_to and SUMMON_GIVE_JEWELRY
-        box = self.ev(TRADE_YOURS_JS, [B.KUNDUN_MIN_LVL, list(CRYSTAL_ITEM) if takes_cr else None,
+        box = self.ev(TRADE_YOURS_JS, [self.box_min_lvl(self.name), list(CRYSTAL_ITEM) if takes_cr else None,
                                        jewel_list() if takes_jw else None]) or {}
         if box.get("other"):
             self.log("box trade: something other than Kundun boxes"
@@ -3277,8 +3287,8 @@ class Agent:
         self.boxes_at = 0
         self.boxes_count()
         njw = len(self.ev(JEWEL_SLOTS_JS, jewel_list()) or []) if SUMMON_GIVE_JEWELRY else 0
-        if self.boxes > 0:
-            kind, n = "boxes", self.boxes
+        if self.boxes_for(dest) > 0:
+            kind, n = "boxes", self.boxes_for(dest)
         elif (SUMMON_GIVE_CRYSTALS and TRADE_CRYSTALS and self.crystals > 0) or njw:
             kind, n = "crystals", 1          # no boxes: only Cristales and/or rings / pendants
         else:
