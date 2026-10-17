@@ -49,8 +49,8 @@ BB_LOOT_MAX      = 30        # ... and keep looting while anything of the boss's
 BB_LOOT_EMPTY    = 2         # ... done once the ground around the corpse has been empty this long
 BB_PICK_REPEAT_MS = 80       # ask for the same item again after this long (every item, every loop turn)
 BB_PICK_PER_TURN = 2         # pickup requests per loop turn (BB_LOOP_MS) at most, best first
-BB_LIMIT_LOOT    = True      # (Juan 2026-10-16, feature flag) don't take everything off the corpse; False = v4, all grab all:
-BB_LOOTERS       = 5         # ... only this many of our party loot each boss (picked from the boss's id + the party,
+BB_LIMIT_LOOT    = False      # (Juan 2026-10-16, feature flag) don't take everything off the corpse; False = v4, all grab all:
+BB_LOOTERS       = 3         # ... only this many of our party loot each boss (picked from the boss's id + the party,
                              #     so every machine agrees without talking); no party -> 3 in 5 chance
 BB_SKIP_CHANCE   = 0.15       # ... a looter ignores each item with this chance (decided once per item)
 BB_VALUABLE_ONLY = True      # ... only rings / pendants and Box of Kundun +5, nothing else

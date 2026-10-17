@@ -140,7 +140,7 @@ SOLO_DEATHS_TO_SWITCH = 3   # my deaths at one spot within DEATH_WINDOW_SEC -> s
 #     it never climbs or resets for one) and the levelee waits at the Lorencia bar meanwhile
 #   * at ASSIST_UNTIL_RESETS resets the pair breaks up by itself; a later grand reset starts it again
 PAIRS               = {
-    "mogulin": "invalido",
+    "cucaracha": "bruto",
 }
 ASSIST_UNTIL_RESETS = 5
 CAP_FIGHT           = True  # (2026-10-14) since the server update the MU Helper turns off at the reset level and
