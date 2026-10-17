@@ -1896,7 +1896,7 @@ class Agent:
         self.stat_alloc_check = now + LEVELEE_ALLOC_EVERY
         c, s = self.c, self.c.s
         pts = s.get("points")
-        if not pts or pts <= 0 or (s.get("hp") or 0) <= 0:
+        if not pts or pts < 500 or (s.get("hp") or 0) <= 0:
             return
 
         st = self.ev(GI.STATS_JS) or {}
@@ -1933,29 +1933,30 @@ class Agent:
                 self.log(f"VIT allocation: unknown class {cls!r}; need Soul Master or Black Knight class data")
             return
         elif stats[main] >= LEVELEE_STAT_MAX:
-            # Once the main stat is capped, put every available point into AGI until it caps too.
-            if stats["agi"] < LEVELEE_STAT_MAX:
-                allocations = [("agi", min(pts, LEVELEE_STAT_MAX - stats["agi"]))]
-            else:
-                # Then fill VIT first, followed by any remaining uncapped stats.
-                allocations = []
-                for k in ("vit", "ene", "str", "agi"):
-                    n = min(pts - sum(v for _, v in allocations), LEVELEE_STAT_MAX - stats[k])
-                    if n > 0:
-                        allocations.append((k, n))
-                    if sum(v for _, v in allocations) >= pts:
-                        break
+            # After the main stat caps, spend in priority order: AGI, VIT, then other stats.
+            allocations = []
+            remaining = int(pts)
+            order = ("agi", "vit", "ene", "str") if main == "ene" else ("agi", "vit", "str", "ene")
+            for k in order:
+                n = min(remaining, LEVELEE_STAT_MAX - stats[k])
+                if n > 0:
+                    allocations.append((k, n))
+                    remaining -= n
+                if remaining <= 0:
+                    break
         else:
-            # Hold sub-500 leftovers so each regular tranche follows the requested 70/25/5 split.
-            if pts < 500:
-                return
-            n_main = min(350, LEVELEE_STAT_MAX - stats[main])
-            overflow = 350 - n_main
-            agi_target = 125 + overflow
+            # Wait for at least 500 points, then allocate all available points in the requested split.
+            n = int(pts)
+            main_target = int(n * 0.70)
+            agi_target = int(n * 0.25)
+            vit_target = n - main_target - agi_target
+            n_main = min(main_target, LEVELEE_STAT_MAX - stats[main])
+            overflow = main_target - n_main
+            agi_target += overflow
             n_agi = min(agi_target, LEVELEE_STAT_MAX - stats["agi"])
             overflow = agi_target - n_agi
-            n_vit = min(25 + overflow, LEVELEE_STAT_MAX - stats["vit"])
-            overflow = 25 + overflow - n_vit
+            n_vit = min(vit_target + overflow, LEVELEE_STAT_MAX - stats["vit"])
+            overflow = vit_target + overflow - n_vit
             allocations = [(main, n_main), ("agi", n_agi), ("vit", n_vit)]
             # Redirect any points blocked by caps to other stats, preferring VIT.
             for k in ("vit", "ene", "str", "agi"):
