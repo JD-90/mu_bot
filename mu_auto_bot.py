@@ -149,9 +149,10 @@ CAP_FIGHT           = True  # (2026-10-14) since the server update the MU Helper
                             # no-helper loop (mu_bc.BC_GRAB_JS) in "guard" mode at the spot (hits anything in
                             # skill range, potions on Q, buffs). False = old behaviour (helper, which now fails)
 PAIR_LEVELER_GRACE  = 30    # leveler offline (reload / map change) this long -> the levelee waits at the bar
-LEVELEE_VIT_MAX     = 1500  # every levelee in PAIRS puts its free points into VIT ("/add vit N") until it has
-                            # this much (also after it graduates); above it nothing is added
-LEVELEE_VIT_EVERY   = 60    # seconds between checks for free points
+LEVELEE_VIT_MAX     = 1500  # first, fill VIT to this value
+LEVELEE_ENE_FIRST   = 700   # second, fill ENE to this value
+LEVELEE_STAT_MAX    = 65535 # per-stat cap used for the later allocation phases
+LEVELEE_ALLOC_EVERY = 60    # seconds between checks for free points
 
 # Blood Castle
 BC_AUTO             = True    # (Juan 2026-10-14: on by default) Blood Castle on/off AT STARTUP. Press B in the console to switch it live
@@ -703,7 +704,7 @@ class Agent:
         self.open_logged = None
         self.npc_talk_since = 0      # when the Archangel's dialog was first seen open
         self.boxes = 0               # Boxes of Kundun (+1..+5) in my bag (checked every 30 s)
-        self.bag_free = None         # main only: free bag cells (checked every 30 s)
+        self.bag_free = None         # free bag cells (checked every 30 s and published to the hub)
         self.bag_free_at = 0
         self.bag_keys_logged = False
         self.bag_low_logged = False
@@ -733,8 +734,8 @@ class Agent:
         self.was_assisted = None
         self.pair_parked = False     # levelee waiting at the bar (leveler in Blood Castle / paused / offline)
         self.leveler_off_since = None
-        self.vit_check = 0
-        self.vit_fails = 0
+        self.stat_alloc_check = 0
+        self.stat_alloc_fails = 0
         self.wig_home = None         # waiting spot I'm idle-wiggling around: (map, x, y)
         self.wig_next = 0
         self.wan_target = None       # idle wander: point I'm walking to, when I set it, linger-until
@@ -1004,8 +1005,8 @@ class Agent:
             c.select_tries = 0
             self.check_msgwin()
             self.read_events()
+            self.update_bag_free()
             if TRADE_BOXES and self.name in self.receivers():
-                self.update_bag_free()
                 self.boxes_count()          # published (boxes / boxes5): givers pick the main or the keeper by it
             if not c.gfx_done:
                 c.set_low_graphics()
@@ -1091,7 +1092,7 @@ class Agent:
                 self.last_status = now
                 self.status()
             return
-        self.add_vit()
+        self.add_stats()
         if lvl >= hub.reset_level and self.bb and self.bb.hold_reset():
             if not getattr(self, "bb_hold_logged", False):
                 self.bb_hold_logged = True
@@ -1887,32 +1888,112 @@ class Agent:
             self.log(f"PAIR: at {rl}, holding until {', '.join(levelees)} get{'s' if len(levelees) == 1 else ''} there")
         return ok
 
-    def add_vit(self):
-        """Levelees in PAIRS (grand-reset characters): every LEVELEE_VIT_EVERY s, free level-up points
-        -> VIT until VIT reaches LEVELEE_VIT_MAX. Carried or not (also after graduating)."""
+    def add_stats(self):
+        """Allocate a levelee's free points in the configured phases, including after graduating."""
         now = time.time()
-        if self.name not in PAIRS or now < self.vit_check:
+        if self.name not in PAIRS or now < self.stat_alloc_check:
             return
-        self.vit_check = now + LEVELEE_VIT_EVERY
+        self.stat_alloc_check = now + LEVELEE_ALLOC_EVERY
         c, s = self.c, self.c.s
-        vit, pts = s.get("vit"), s.get("points")
-        if vit is None or not pts or pts <= 0 or vit >= LEVELEE_VIT_MAX or (s.get("hp") or 0) <= 0:
+        pts = s.get("points")
+        if not pts or pts <= 0 or (s.get("hp") or 0) <= 0:
             return
-        n = int(min(pts, LEVELEE_VIT_MAX - vit))
-        c.chat(f"/add vit {n}")
-        time.sleep(1.5)
-        after = c.refresh().get("vit")
-        if after is not None and after > vit:
-            self.vit_fails = 0
-            self.log(f"VIT {vit} -> {after} (+{after - vit} of {pts} free points, up to {LEVELEE_VIT_MAX})")
+
+        st = self.ev(GI.STATS_JS) or {}
+        stats = {k: st.get(k) for k in ("str", "agi", "vit", "ene")}
+        if any(v is None for v in stats.values()):
+            if not getattr(self, "vit_stats_logged", False):
+                self.vit_stats_logged = True
+                self.log(f"VIT allocation: can't read all stats ({st}) -> waiting")
             return
-        self.vit_fails += 1
+        self.vit_stats_logged = False
+
+        cls = st.get("cls")
+        cls_text = str(cls or "").strip().lower().replace("_", " ").replace("-", " ")
+        if isinstance(cls, (int, float)) or (isinstance(cls, str) and re.fullmatch(r"\d+", cls.strip())):
+            # Classic MU class codes: Dark Wizard / Soul Master / Grand Master = 0..2;
+            # Dark Knight / Blade Knight / Blade Master = 16..18.
+            class_code = int(cls)
+            main = "ene" if class_code in (0, 1, 2) else "str" if class_code in (16, 17, 18) else None
+        elif any(x in cls_text for x in ("soul master", "grand master", "dark wizard", "wizard")):
+            main = "ene"
+        elif any(x in cls_text for x in ("black knight", "dark knight", "blade knight", "blade master")):
+            main = "str"
+        else:
+            main = None
+
+        # Phase 1 and 2 spend available points immediately up to their fixed targets.
+        if stats["vit"] < LEVELEE_VIT_MAX:
+            allocations = [("vit", min(pts, LEVELEE_VIT_MAX - stats["vit"]))]
+        elif stats["ene"] < LEVELEE_ENE_FIRST:
+            allocations = [("ene", min(pts, LEVELEE_ENE_FIRST - stats["ene"]))]
+        elif main is None:
+            if not getattr(self, "vit_class_logged", False):
+                self.vit_class_logged = True
+                self.log(f"VIT allocation: unknown class {cls!r}; need Soul Master or Black Knight class data")
+            return
+        elif stats[main] >= LEVELEE_STAT_MAX:
+            # Once the main stat is capped, put every available point into AGI until it caps too.
+            if stats["agi"] < LEVELEE_STAT_MAX:
+                allocations = [("agi", min(pts, LEVELEE_STAT_MAX - stats["agi"]))]
+            else:
+                # Then fill VIT first, followed by any remaining uncapped stats.
+                allocations = []
+                for k in ("vit", "ene", "str", "agi"):
+                    n = min(pts - sum(v for _, v in allocations), LEVELEE_STAT_MAX - stats[k])
+                    if n > 0:
+                        allocations.append((k, n))
+                    if sum(v for _, v in allocations) >= pts:
+                        break
+        else:
+            # Hold sub-500 leftovers so each regular tranche follows the requested 70/25/5 split.
+            if pts < 500:
+                return
+            n_main = min(350, LEVELEE_STAT_MAX - stats[main])
+            overflow = 350 - n_main
+            agi_target = 125 + overflow
+            n_agi = min(agi_target, LEVELEE_STAT_MAX - stats["agi"])
+            overflow = agi_target - n_agi
+            n_vit = min(25 + overflow, LEVELEE_STAT_MAX - stats["vit"])
+            overflow = 25 + overflow - n_vit
+            allocations = [(main, n_main), ("agi", n_agi), ("vit", n_vit)]
+            # Redirect any points blocked by caps to other stats, preferring VIT.
+            for k in ("vit", "ene", "str", "agi"):
+                if overflow <= 0:
+                    break
+                extra = min(overflow, LEVELEE_STAT_MAX - stats[k] - sum(v for name, v in allocations if name == k))
+                if extra > 0:
+                    for i, (name, amount) in enumerate(allocations):
+                        if name == k:
+                            allocations[i] = (name, amount + extra)
+                            break
+                    else:
+                        allocations.append((k, extra))
+                    overflow -= extra
+            allocations = [(k, v) for k, v in allocations if v > 0]
+
+        before = dict(stats)
+        attempted = []
+        for stat, amount in allocations:
+            if amount <= 0:
+                continue
+            attempted.append(f"{stat.upper()} +{amount}")
+            c.chat(f"/add {stat} {int(amount)}")
+            time.sleep(1.5)
+            refreshed = self.ev(GI.STATS_JS) or {}
+            stats = {k: refreshed.get(k) if refreshed.get(k) is not None else stats[k] for k in before}
+        changed = [f"{k.upper()} {before[k]}->{stats[k]}" for k in before if stats[k] > before[k]]
+        if changed:
+            self.stat_alloc_fails = 0
+            self.log(f"stats allocated ({', '.join(attempted)}): {', '.join(changed)}; {max(0, pts - sum(v for _, v in allocations))} free points remain")
+            return
+        self.stat_alloc_fails += 1
         lines = self.ev(G.CHAT_LINES_JS) or []
-        self.log(f"/add vit {n} did not raise VIT ({vit}) - server: {' | '.join(lines[-2:])}")
-        if self.vit_fails >= 3:
-            self.vit_fails = 0
-            self.vit_check = now + 600
-            self.log("VIT: 3 failures in a row -> trying again in 10 min")
+        self.log(f"/add command(s) {', '.join(attempted)} did not raise stats - server: {' | '.join(lines[-2:])}")
+        if self.stat_alloc_fails >= 3:
+            self.stat_alloc_fails = 0
+            self.stat_alloc_check = now + 600
+            self.log("stat allocation: 3 failures in a row -> trying again in 10 min")
 
     def pair_wait_tick(self):
         """Levelee whose leveler can't carry it (Blood Castle, paused, offline): wait at the bar."""
@@ -2154,7 +2235,7 @@ class Agent:
         return self.boxes
 
     def update_bag_free(self):
-        """Main only: free bag cells, published so the alts know whether a trade can fit."""
+        """Measure free bag cells for the hub; receivers also publish it so box trades can use it."""
         now = time.time()
         if now - self.bag_free_at < 30:
             return
@@ -2163,6 +2244,8 @@ class Agent:
         if not r:
             return
         prev, self.bag_free = self.bag_free, r["free"]
+        if self.name not in self.receivers():
+            return
         hub = self.hub
         if not self.bag_keys_logged and r.get("keys"):
             self.bag_keys_logged = True

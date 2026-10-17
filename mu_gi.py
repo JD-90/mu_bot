@@ -836,7 +836,8 @@ WALKABLE_JS = """(pts) => { const w = window.__world; if (!w) return null;
 STATS_JS = """() => { const p = (window.__store && window.__store.playerData) || {};
   const f = (...k) => { for (const x of k) if (typeof p[x] === 'number') return p[x]; return null; };
   return {str: f('str', 'strength'), agi: f('agi', 'agility', 'dex', 'dexterity'), vit: f('sta', 'vit', 'vitality'),
-          ene: f('eng', 'ene', 'energy'), keys: Object.keys(p).filter(k => typeof p[k] === 'number').join(',')}; }"""
+          ene: f('eng', 'ene', 'energy'), cls: p.className || p.class || p.characterClass || p.charClass || null,
+          keys: Object.keys(p).filter(k => typeof p[k] === 'number').join(',')}; }"""
 
 HERO_STATE_JS = "() => { const h = window.__world && window.__world.playerEntity; return h ? h.heroState : null; }"
 

@@ -49,7 +49,9 @@ PAIRS = {
 Until the levelee has `ASSIST_UNTIL_RESETS` (5) resets:
 - both farm together in their own party, at the zone for the lower of their two levels, and reset together;
 - the levelee skips Blood Castle and waits at the Lorencia bar while the leveler is in Blood Castle, paused or offline;
-- the levelee puts its free points into VIT (`/add vit <amount>`) up to `LEVELEE_VIT_MAX` (1500).
+- the levelee allocates free points in order: VIT to 1,500, ENE to 700, then 500-point batches split
+  70% to its class's main stat (ENERGY for Soul Master, STR for Black Knight), 25% AGI and 5% VIT;
+  once the main stat reaches 65,535, it fills AGI, then VIT and any remaining stats.
 
 At 5 resets the pair splits by itself; the next grand reset (detected when the reset counter drops to 0) starts it again.
 
