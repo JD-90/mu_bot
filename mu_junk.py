@@ -66,7 +66,7 @@ CRYST_DUE_SEC    = 7200      # after a Treasure Hunt / bot start, try for this l
                              # right after the :40 hunt come GI :50 and BC :00, so the trip usually starts ~:05)
 CRYST_CHECK_EVERY = 10      # while due: look at the bag this often
 CRYST_AFTER_RESET = True     # (Juan 2026-10-15) a trip is due after every /reset (and grand reset), if I carry any
-CRYST_AFTER_TH   = False     # ... no longer after every Treasure Hunt (resets come far more often); True = both
+CRYST_AFTER_TH   = True      # ... and after every Treasure Hunt too (Juan 2026-10-17: lots of junk there); False = resets only
 CRYST_MIN_LEVEL  = 10        # right after a reset: wait until /move Noria is allowed (level 10)
 CRYST_RETRY_SEC  = 300       # failed trip -> try again after this long (while still due)
 CRYST_TIMEOUT    = 300       # whole trip
