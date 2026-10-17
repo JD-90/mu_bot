@@ -899,7 +899,8 @@ class Char:
         s = self.s
         _, _, alias, map_idx, tx, ty = step
         if s["map"] != map_idx:
-            if time.time() - self.last_warp > 15:
+            gate = getattr(self, "warp_gate", None)     # mu_auto_bot: party members warp a few s apart
+            if time.time() - self.last_warp > 15 and (gate is None or gate(alias, map_idx)):
                 self.set_helper(False)
                 self.chat(f"/move {alias}")
                 self.last_warp = time.time()

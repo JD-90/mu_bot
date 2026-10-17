@@ -123,6 +123,10 @@ PARTY_THANKS_BC_ONLY = True     # (Juan 2026-10-16) thank only for Blood Castle 
 SOLO_OWN_SPOT       = True  # plain leveling (not pairs): each character takes a spot of its own on its leg of
                             # the route; it joins (and parties with) another of ours only when every spot of the
                             # leg is taken. A spot freeing up later -> the one sharing moves there (Juan 2026-10-15)
+LEVEL_WARP_STAGGER  = True  # (Juan 2026-10-16, feature flag) party members of ours don't /move to the same leveling
+                            # map together: one goes, the others wait until he has been there LEVEL_WARP_GAP s
+LEVEL_WARP_GAP      = 5     # ... seconds between our party members' warps to the same map (from when he lands)
+LEVEL_WARP_WAIT_MAX = 20    # ... waiting for a party member ahead of me who hasn't warped yet: at most this long
 SOLO_SPOT_CHECK     = 5     # seconds between "is someone of ours on my spot / did a spot free up" checks
 SPOT_CLAIM_TTL      = 30    # mu_hub: a spot claim (renewed every SOLO_SPOT_CHECK) lapses this long after its holder left
 SOLO_DEATHS_TO_SWITCH = 3   # my deaths at one spot within DEATH_WINDOW_SEC -> switch (not on the best spot)
@@ -623,6 +627,7 @@ class Hub:
         self.lead_full = None        # {"free", "at"}: the main couldn't take boxes -> no trades until he has more room
         self.pair_round = set()      # paired characters that /reset now (the whole pair reached the reset level)
         self.pair_deaths = {}        # leveler -> [(time, name)] deaths of its levelees (for its spot switching)
+        self.warps = {}              # LEVEL_WARP_STAGGER: name -> [map, time of the /move (then of landing), landed]
         self.paused = set()
         self.pause_all = False       # P / PAUSE file: everyone paused, windows stay minimized
         self.bc_on = BC_AUTO         # B in the console switches Blood Castle on/off
@@ -661,6 +666,9 @@ class Agent:
         self.history = []            # (time, level, resets) for the recent levels/min (BC plan)
         self.scouting = False
         self.scout = {}
+        self.warp_wait_since = None  # LEVEL_WARP_STAGGER: waiting for a party member's warp since
+        self.warp_wait_note = None
+        self.warp_gate_at = 0
         self.party_check = 0
         self.alone_since = None
         self.invited = {}
@@ -941,6 +949,7 @@ class Agent:
             "bc_tier": bc_as[0], "bc_role": bc_as[1],     # shared with the other machines (mu_hub)
             "summon": self.summon["kind"] if self.summon else None,
             "pk": self.pk_status() if c.online else self.pk,
+            **self.warp_share(),
         })
 
     def recent_rate(self):
@@ -1392,8 +1401,91 @@ class Agent:
             self.share_with = who["name"]
             self.log(f"{alias}: every spot is taken -> sharing {who['name']}'s spot (party)")
 
+    # ── LEVEL_WARP_STAGGER: party members of ours /move to the same leveling map a few seconds apart ──
+    def warp_share(self):
+        """My last leveling warp for the other machines: map + seconds ago (machines' clocks differ)."""
+        w = self.hub.warps.get(self.name)
+        return {"warp_map": w[0], "warp_ago": round(time.time() - w[1], 1)} if w else {}
+
+    def note_landing(self):
+        """After my leveling /move: the moment I'm on that map counts as the warp (the server's /move
+        delay varies), so the next of ours waits LEVEL_WARP_GAP s from when I actually got there."""
+        w = self.hub.warps.get(self.name)
+        if w and not w[2] and self.c.s.get("map") == w[0]:
+            with self.hub.lock:
+                w[1], w[2] = time.time(), True
+
+    def warp_party(self):
+        """Ours in my in-game party, this machine + the others: {name: info (+ warp_map / warp_ago)}."""
+        party = {(n or "").lower() for n in (self.c.s.get("party") or [])}
+        party.discard(self.name.lower())
+        if not party:
+            return {}
+        out = {}
+        link = self.hub.link
+        if link:
+            try:
+                for n, i in link.remote().items():
+                    if n.lower() in party:
+                        i = dict(i)
+                        if i.get("warp_ago") is not None:
+                            i["warp_ago"] = i["warp_ago"] + (i.get("age") or 0)
+                        out[n] = i
+            except Exception:
+                pass
+        now = time.time()
+        for n, i in self.hub.snapshot().items():
+            if n != self.name and n.lower() in party:
+                i = dict(i)
+                w = self.hub.warps.get(n)
+                i["warp_map"], i["warp_ago"] = (w[0], now - w[1]) if w else (None, None)
+                out[n] = i
+        return out
+
+    def level_warp_gate(self, alias, map_idx):
+        """Called right before a leveling /move (Char.move_tick). False = not yet:
+        - a party member of ours got to that map less than LEVEL_WARP_GAP s ago -> wait the rest;
+        - a party member ahead of me (leveler first, then by name -- the same order on every machine) is
+          headed to that map and hasn't warped yet -> he goes first (at most LEVEL_WARP_WAIT_MAX s)."""
+        if not LEVEL_WARP_STAGGER or self.mode != "level":
+            return True
+        now = time.time()
+        if now - self.warp_gate_at > 5:
+            self.warp_wait_since = None           # a new trip, not the wait from an earlier one
+        self.warp_gate_at = now
+        with self.hub.lock:                       # (same machine: two of ours can't both pass at once)
+            members = self.warp_party()
+            wait = who = None
+            for n, i in members.items():
+                ago = i.get("warp_ago")
+                if i.get("warp_map") == map_idx and ago is not None and ago < LEVEL_WARP_GAP:
+                    wait, who = f"{n} warped to {alias} {ago:.1f} s ago -> waiting {LEVEL_WARP_GAP - ago:.1f} s", n
+                    break
+            if not wait and (self.warp_wait_since is None or now - self.warp_wait_since < LEVEL_WARP_WAIT_MAX):
+                me = (0 if self.my_levelees() else 1, self.name.lower())
+                for n, i in sorted(members.items(), key=lambda kv: kv[0].lower()):
+                    t = i.get("target")
+                    if (i.get("online") and not i.get("paused") and i.get("mode") == "level"
+                            and (i.get("hp") or 0) > 0 and t and t[0] == map_idx and i.get("map") != map_idx
+                            and (0 if i.get("pair_lead") else 1, n.lower()) < me):
+                        wait, who = f"{n} is warping to {alias} first", n
+                        break
+            if wait:
+                self.warp_wait_since = self.warp_wait_since or now
+                if self.warp_wait_note != (who, map_idx, wait.split(" ")[1]):
+                    self.warp_wait_note = (who, map_idx, wait.split(" ")[1])
+                    self.log(f"WARP STAGGER: {wait}")
+                return False
+            if self.warp_wait_since is not None:
+                self.log(f"WARP STAGGER: /move {alias} after waiting {now - self.warp_wait_since:.1f} s for the party")
+            self.warp_wait_since = self.warp_wait_note = None
+            self.hub.warps[self.name] = [map_idx, now, False]
+        return True
+
     def level_tick(self):
         c, s = self.c, self.c.s
+        c.warp_gate = self.level_warp_gate
+        self.note_landing()
         lvl = s.get("level") or 1
         snap = self.hub.snapshot()
         grp = self.pair_group(snap)

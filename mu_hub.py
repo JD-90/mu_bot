@@ -67,7 +67,7 @@ CLAIM_TTL_MAX = 3 * 3600
 SHARE_FIELDS = ("online", "paused", "mode", "map", "x", "y", "level", "resets", "hp", "party",
                 "step", "spot", "target", "rate", "bc", "bc_away", "boxes", "bag_free",
                 "assisted", "leveler", "pair_lead", "gi_hunter", "bc_tier", "bc_role",
-                "scouting", "share_with", "boxes5", "summon", "pk")
+                "scouting", "share_with", "boxes5", "summon", "pk", "warp_map", "warp_ago")
 TRADE_IDLE_SEC = 30     # a trade session nobody synced for this long is dropped
 TRADE_ENDED_KEEP = 20   # an ended one stays visible this long (the other side must see "ended")
 SAMPLES_KEEP = 2000     # spot_stats samples the server remembers (other machines fetch the ones they miss)
