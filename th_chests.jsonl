@@ -76,3 +76,29 @@
 {"t": "2026-10-16T22:43:51", "map": "Devias", "map_idx": 2, "by": "wizzardo", "id": 1281, "x": 107, "y": 24, "event": "broken", "mine": true}
 {"t": "2026-10-16T22:43:53", "map": "Devias", "map_idx": 2, "by": "bruto", "id": 1262, "x": 195, "y": 140, "d": 34, "event": "seen"}
 {"t": "2026-10-16T22:44:01", "map": "Devias", "map_idx": 2, "by": "bruto", "id": 1262, "x": 195, "y": 140, "event": "broken", "mine": true}
+{"t": "2026-10-17T07:41:50", "map": "Lorencia", "map_idx": 0, "by": "invalido", "id": 1089, "x": 40, "y": 156, "d": 33, "event": "seen"}
+{"t": "2026-10-17T07:41:57", "map": "Lorencia", "map_idx": 0, "by": "invalido", "id": 1089, "x": 40, "y": 156, "event": "broken", "mine": false, "killer": 1015}
+{"t": "2026-10-17T07:43:21", "map": "Lorencia", "map_idx": 0, "by": "invalido", "id": 1087, "x": 50, "y": 157, "d": 26, "event": "seen"}
+{"t": "2026-10-17T07:43:27", "map": "Lorencia", "map_idx": 0, "by": "invalido", "id": 1087, "x": 50, "y": 157, "event": "broken", "mine": true}
+{"t": "2026-10-17T07:43:27", "map": "Lorencia", "map_idx": 0, "by": "wizzardo", "id": 1037, "x": 238, "y": 63, "d": 17, "event": "seen"}
+{"t": "2026-10-17T07:43:30", "map": "Lorencia", "map_idx": 0, "by": "wizzardo", "id": 1037, "x": 238, "y": 63, "event": "broken", "mine": true}
+{"t": "2026-10-17T07:43:30", "map": "Lorencia", "map_idx": 0, "by": "mogulin", "id": 1039, "x": 92, "y": 115, "d": 29, "event": "seen"}
+{"t": "2026-10-17T07:43:37", "map": "Lorencia", "map_idx": 0, "by": "mogulin", "id": 1039, "x": 92, "y": 115, "event": "broken", "mine": true}
+{"t": "2026-10-17T07:43:38", "map": "Lorencia", "map_idx": 0, "by": "invalido", "id": 1045, "x": 81, "y": 196, "d": 36, "event": "seen"}
+{"t": "2026-10-17T07:44:56", "map": "Lorencia", "map_idx": 0, "by": "mogulin", "id": 1070, "x": 75, "y": 89, "d": 33, "event": "seen"}
+{"t": "2026-10-17T10:40:15", "map": "Tarkan", "map_idx": 8, "by": "wizzardo", "id": 913, "x": 118, "y": 177, "d": 28, "event": "seen"}
+{"t": "2026-10-17T10:40:16", "map": "Tarkan", "map_idx": 8, "by": "invalido", "id": 913, "x": 118, "y": 177, "d": 29, "event": "seen"}
+{"t": "2026-10-17T10:40:16", "map": "Tarkan", "map_idx": 8, "by": "wizzardo", "id": 913, "x": 118, "y": 177, "event": "broken", "mine": false, "killer": 935}
+{"t": "2026-10-17T10:40:17", "map": "Tarkan", "map_idx": 8, "by": "invalido", "id": 913, "x": 118, "y": 177, "event": "broken", "mine": false, "killer": 935}
+{"t": "2026-10-17T10:42:09", "map": "Tarkan", "map_idx": 8, "by": "mogulin", "id": 887, "x": 170, "y": 203, "d": 33, "event": "seen"}
+{"t": "2026-10-17T10:42:12", "map": "Tarkan", "map_idx": 8, "by": "invalido", "id": 887, "x": 170, "y": 203, "d": 33, "event": "seen"}
+{"t": "2026-10-17T10:42:18", "map": "Tarkan", "map_idx": 8, "by": "invalido", "id": 887, "x": 170, "y": 203, "event": "broken", "mine": false, "killer": 893}
+{"t": "2026-10-17T10:42:18", "map": "Tarkan", "map_idx": 8, "by": "mogulin", "id": 887, "x": 170, "y": 203, "event": "broken", "mine": true}
+{"t": "2026-10-17T10:43:25", "map": "Tarkan", "map_idx": 8, "by": "invalido", "id": 948, "x": 77, "y": 202, "d": 19, "event": "seen"}
+{"t": "2026-10-17T10:43:25", "map": "Tarkan", "map_idx": 8, "by": "mogulin", "id": 948, "x": 77, "y": 202, "d": 12, "event": "seen"}
+{"t": "2026-10-17T10:43:28", "map": "Tarkan", "map_idx": 8, "by": "invalido", "id": 948, "x": 77, "y": 202, "event": "broken", "mine": false, "killer": 893}
+{"t": "2026-10-17T10:43:28", "map": "Tarkan", "map_idx": 8, "by": "mogulin", "id": 948, "x": 77, "y": 202, "event": "broken", "mine": true}
+{"t": "2026-10-17T10:43:32", "map": "Tarkan", "map_idx": 8, "by": "mogulin", "id": 918, "x": 79, "y": 211, "d": 9, "event": "seen"}
+{"t": "2026-10-17T10:43:35", "map": "Tarkan", "map_idx": 8, "by": "mogulin", "id": 918, "x": 79, "y": 211, "event": "broken", "mine": true}
+{"t": "2026-10-17T10:43:52", "map": "Tarkan", "map_idx": 8, "by": "wizzardo", "id": 944, "x": 39, "y": 164, "d": 30, "event": "seen"}
+{"t": "2026-10-17T10:43:53", "map": "Tarkan", "map_idx": 8, "by": "wizzardo", "id": 944, "x": 39, "y": 164, "event": "broken", "mine": false, "killer": 877}
