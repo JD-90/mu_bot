@@ -44,7 +44,7 @@ import mu_group_bot as G
 BB_ENABLED       = True      # code switch; whether it runs is hub.bb_on (BB_AUTO at startup, O key in the console)
 BB_ORDER         = ["wizzardo", "bruto", "cucaracha", "invalido", "mogulin"]   # each one's side of the boss
 BB_END_GRACE     = 10        # panel back to a countdown for this long (boss dead / gone) -> done (after the loot)
-BB_LOOT_SEC      = 3         # after the kill: loot at least this long ...
+BB_LOOT_SEC      = 5         # after the kill: loot at least this long ...
 BB_LOOT_MAX      = 30        # ... and keep looting while anything of the boss's is on the ground, up to this long
 BB_LOOT_EMPTY    = 2         # ... done once the ground around the corpse has been empty this long
 BB_PICK_REPEAT_MS = 80       # ask for the same item again after this long (every item, every loop turn)

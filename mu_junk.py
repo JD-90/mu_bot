@@ -10,8 +10,8 @@ Getting rid of junk (Juan 2026-10-15). Two parts, both per character, only while
          The loot filter's "High level items" is OFF now (mu_group_bot.GAME_OPTIONS), otherwise the
          MU Helper would pick a dropped +7 straight back up.
 
-2. CRYSTALLIZE  after every /reset (Juan 2026-10-15; was: after every Treasure Hunt), a character carrying excellent gear that is NOT end-game
-         top gear (CRYST_KEEP = the server's "best gear of each class") takes it to the Alquimista
+2. CRYSTALLIZE  after every /reset (Juan 2026-10-15; was: after every Treasure Hunt), a character carrying
+         excellent gear takes it to the Alquimista
          (npcType 693, next to the Chaos Goblin in Noria) and crystallizes it ("Cristalizar", up to 8
          items and 500k zen per batch), then takes the Cristales back to the bag.
          Only weapons, shields and set parts (the Alquimista refuses wings, rings, pendants).
@@ -20,9 +20,8 @@ Getting rid of junk (Juan 2026-10-15). Two parts, both per character, only while
          the Cristales off the table (with Cristales on the table it won't crystallize) -> next items.
          (v1 put 8 at once without checking the room -> "There is no room for that item", bruto stuck.) At the end the Cristales are joined into stacks in the bag (they
          don't stack by themselves). Zen is no problem (no zen check).
-         Items at +CRYST_MAX_LVL+1 or higher are kept too (fusion material, see the guide).
-         Juan 2026-10-16: the end-game exception only holds from +CRYST_KEEP_FROM (7) up; excellent
-         end-game gear below +7 is crystallized too. Excellent rings / pendants are always kept.
+         All excellent weapons, shields and set parts are crystallized, including ancient and any level.
+         Excellent rings / pendants are always kept.
 1b. JOIN  right when a character goes (back) to leveling, then every JOIN_EVERY s, small Cristal stacks in
          the bag are joined (picked up and dropped on each other, like a player does).
          The trip waits while an event / trade / Blood Castle is on (mu_auto_bot.trade_quiet) and
@@ -73,10 +72,8 @@ CRYST_TIMEOUT    = 300       # whole trip
 CRYST_ITEM_SEC   = 10        # extra trip time allowed per item to crystallize
 CRYST_BATCH      = 8         # items per Cristalizar (the Alquimista's maxBatch)
 CRYST_STACK_MAX  = 255       # Cristales per stack (the stack size is the item's durability byte)
-CRYST_MAX_LVL    = 12        # +13 and up are kept (fusion material)
-CRYST_KEEP_FROM  = 7         # (Juan 2026-10-16) CRYST_KEEP (end-game gear) is only kept from +7 up: an excellent
-                             # below +7 ("-7") is crystallized even if it's top gear. Excellent rings / pendants
-                             # are always kept (only gear groups 0-11 ever go to the Alquimista).
+# All excellent gear that the Alquimista accepts is crystallized at every level, including ancient gear.
+# Excellent rings and pendants are excluded by the gear-group check below.
 JOIN_ENABLED     = True      # (Juan 2026-10-16) join small Cristal stacks in the bag while leveling
 JOIN_EVERY       = 300       # seconds between looks at the Cristal stacks (one join per tick when joining)
 ALCHEMIST_NPC    = 693       # npcType of the Alquimista
@@ -84,22 +81,11 @@ ALCHEMIST_MAP    = (3, "Noria")
 ALCHEMIST_NEAR   = (180, 102)    # the Chaos Goblin's Chaos Machine (guide); the Alquimista stands next to it
 ALCHEMIST_TALK_R = 3         # walk this close to him before talking
 CRYST_ITEM       = (14, 31)  # Cristal
-# End-game top gear: never crystallized (Juan 2026-10-15: "the server's top gear" = what the Grand Reset
-# shop sells as the best of each class)
-CRYST_KEEP = (
-    {(g, 21) for g in range(7, 12)}          # Great Dragon set (DK)
-    | {(g, 22) for g in range(7, 12)}        # Dark Soul set (DW)
-    | {(g, 24) for g in range(7, 12)}        # Red Spirit set (Elf)
-    | {(g, 23) for g in range(8, 12)}        # Hurricane set (MG, no helm)
-    | {(0, 20), (0, 21), (5, 11), (4, 18), (4, 19)}   # Knight Blade, Dark Reign Blade, Staff of Kundun,
-                                                      # Divine Crossbow of Archangel, Great Reign Crossbow
-    | {(6, 15), (6, 16)}                     # Grand Soul Shield, Elemental Shield
-)
 # ──────────────────────────────────────────────────────────────────
 
 # bag slots by kind: junk to drop / excellent gear to crystallize
 BAG_JS = """
-([never, jewelry, keep, maxLvl, skip, keepFrom, cloak]) => {
+([never, jewelry, skip, cloak]) => {
   const s = window.__store; if (!s || !s.playerData) return null;
   const items = s.playerData.items || [], has = (l, it) => l.some(p => p[0] === it.group && p[1] === it.num);
   const junk = [], cryst = [];
@@ -112,8 +98,7 @@ BAG_JS = """
     const gear = it.group >= 0 && it.group <= 11, jew = has(jewelry, it);
     if (!gear && !jew) continue;
     if (!it.isExcellent && !it.isAncient) { if (!skip.includes(i + ':' + key)) junk.push(d); continue; }
-    if (gear && it.isExcellent && !it.isAncient && !(has(keep, it) && (it.lvl || 0) >= keepFrom)
-        && (it.lvl || 0) <= maxLvl) cryst.push(d);
+    if (gear && it.isExcellent) cryst.push(d);
   }
   return {junk, cryst, money: Number(s.playerData.money) || 0, picked: !!s.pickedItem, pending: !!s.pendingItemMove};
 }
@@ -280,8 +265,7 @@ class Junk:
         now = time.time()
         self.skip = {k: t for k, t in self.skip.items() if t > now}
         cloak = list(B.CLOAK) if JUNK_CLOAKS and getattr(self.a, "bcs", None) is None else None
-        return self.ev(BAG_JS, [sorted(JUNK_NEVER), sorted(JUNK_JEWELRY), sorted(CRYST_KEEP),
-                                CRYST_MAX_LVL, list(self.skip), CRYST_KEEP_FROM, cloak])
+        return self.ev(BAG_JS, [sorted(JUNK_NEVER), sorted(JUNK_JEWELRY), list(self.skip), cloak])
 
     # called by mu_th when a Treasure Hunt ends
     def hunt_over(self):
