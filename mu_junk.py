@@ -20,8 +20,8 @@ Getting rid of junk (Juan 2026-10-15). Two parts, both per character, only while
          the Cristales off the table (with Cristales on the table it won't crystallize) -> next items.
          (v1 put 8 at once without checking the room -> "There is no room for that item", bruto stuck.) At the end the Cristales are joined into stacks in the bag (they
          don't stack by themselves). Zen is no problem (no zen check).
-         All excellent weapons, shields and set parts are crystallized, including ancient and any level.
-         Excellent rings / pendants are always kept.
+         All excellent weapons, shields and set parts are crystallized, including ancient and any level,
+         except Great Dragon and Dark Soul set pieces. Excellent rings / pendants are always kept.
 1b. JOIN  right when a character goes (back) to leveling, then every JOIN_EVERY s, small Cristal stacks in
          the bag are joined (picked up and dropped on each other, like a player does).
          The trip waits while an event / trade / Blood Castle is on (mu_auto_bot.trade_quiet) and
@@ -73,7 +73,10 @@ CRYST_ITEM_SEC   = 10        # extra trip time allowed per item to crystallize
 CRYST_BATCH      = 8         # items per Cristalizar (the Alquimista's maxBatch)
 CRYST_STACK_MAX  = 255       # Cristales per stack (the stack size is the item's durability byte)
 # All excellent gear that the Alquimista accepts is crystallized at every level, including ancient gear.
-# Excellent rings and pendants are excluded by the gear-group check below.
+# Great Dragon and Dark Soul set pieces are retained at every level. Excellent rings and pendants are
+# excluded by the gear-group check below.
+CRYST_KEEP = ({(g, 21) for g in range(7, 12)}   # Great Dragon set (DK)
+              | {(g, 22) for g in range(7, 12)}) # Dark Soul set (DW)
 JOIN_ENABLED     = True      # (Juan 2026-10-16) join small Cristal stacks in the bag while leveling
 JOIN_EVERY       = 300       # seconds between looks at the Cristal stacks (one join per tick when joining)
 ALCHEMIST_NPC    = 693       # npcType of the Alquimista
@@ -85,7 +88,7 @@ CRYST_ITEM       = (14, 31)  # Cristal
 
 # bag slots by kind: junk to drop / excellent gear to crystallize
 BAG_JS = """
-([never, jewelry, skip, cloak]) => {
+([never, jewelry, keep, skip, cloak]) => {
   const s = window.__store; if (!s || !s.playerData) return null;
   const items = s.playerData.items || [], has = (l, it) => l.some(p => p[0] === it.group && p[1] === it.num);
   const junk = [], cryst = [];
@@ -98,7 +101,7 @@ BAG_JS = """
     const gear = it.group >= 0 && it.group <= 11, jew = has(jewelry, it);
     if (!gear && !jew) continue;
     if (!it.isExcellent && !it.isAncient) { if (!skip.includes(i + ':' + key)) junk.push(d); continue; }
-    if (gear && it.isExcellent) cryst.push(d);
+    if (gear && it.isExcellent && !has(keep, it)) cryst.push(d);
   }
   return {junk, cryst, money: Number(s.playerData.money) || 0, picked: !!s.pickedItem, pending: !!s.pendingItemMove};
 }
@@ -265,7 +268,8 @@ class Junk:
         now = time.time()
         self.skip = {k: t for k, t in self.skip.items() if t > now}
         cloak = list(B.CLOAK) if JUNK_CLOAKS and getattr(self.a, "bcs", None) is None else None
-        return self.ev(BAG_JS, [sorted(JUNK_NEVER), sorted(JUNK_JEWELRY), list(self.skip), cloak])
+        return self.ev(BAG_JS, [sorted(JUNK_NEVER), sorted(JUNK_JEWELRY), sorted(CRYST_KEEP),
+                                list(self.skip), cloak])
 
     # called by mu_th when a Treasure Hunt ends
     def hunt_over(self):
